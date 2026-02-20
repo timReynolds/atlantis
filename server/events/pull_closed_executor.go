@@ -17,6 +17,8 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -100,9 +102,12 @@ func (p *PullClosedExecutor) CleanUpPull(logger logging.SimpleLogging, repo mode
 		}
 	}
 
+	p.logPullWorkspaceDiskUsage(logger, repo, pull)
+
 	if err := p.WorkingDir.Delete(logger, repo, pull); err != nil {
 		return fmt.Errorf("cleaning workspace: %w", err)
 	}
+	logger.Info("workspace cleanup complete for pull %d in repo %q", pull.Num, repo.FullName)
 
 	// Finally, delete locks. We do this last because when someone
 	// unlocks a project, right now we don't actually delete the plan
@@ -133,6 +138,43 @@ func (p *PullClosedExecutor) CleanUpPull(logger logging.SimpleLogging, repo mode
 		return fmt.Errorf("rendering template for comment: %w", err)
 	}
 	return p.VCSClient.CreateComment(logger, repo, pull.Num, buf.String(), "")
+}
+
+func (p *PullClosedExecutor) logPullWorkspaceDiskUsage(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest) {
+	pullDir, err := p.WorkingDir.GetPullDir(repo, pull)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			logger.Warn("retrieving pull directory for pull %d in repo %q: %s", pull.Num, repo.FullName, err)
+		}
+		return
+	}
+	if pullDir == "" {
+		return
+	}
+
+	sizeBytes, err := pullDirSizeBytes(pullDir)
+	if err != nil {
+		logger.Warn("calculating pull directory size for %q: %s", pullDir, err)
+		return
+	}
+	logger.Info("pull directory %q using %d bytes before cleanup", pullDir, sizeBytes)
+}
+
+func pullDirSizeBytes(dir string) (int64, error) {
+	var total int64
+	if err := filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		total += info.Size()
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 // buildTemplateData formats the lock data into a slice that can easily be

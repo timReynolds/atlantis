@@ -329,6 +329,9 @@ func (p *DefaultProjectCommandRunner) doApprovePolicies(ctx command.ProjectConte
 	// Acquire internal lock for the directory we're going to operate in.
 	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.ApprovePolicies)
 	if err != nil {
+		if unlockErr := lockAttempt.UnlockFn(); unlockErr != nil {
+			ctx.Log.Err("error unlocking state after approve policies error: %v", unlockErr)
+		}
 		return nil, "", err
 	}
 	defer unlockFn()
@@ -343,6 +346,9 @@ func (p *DefaultProjectCommandRunner) doApprovePolicies(ctx command.ProjectConte
 		userTeams, err := p.VcsClient.GetTeamNamesForUser(p.Logger, ctx.Pull.BaseRepo, ctx.User)
 		if err != nil {
 			ctx.Log.Err("unable to get team membership for user: %s", err)
+			if unlockErr := lockAttempt.UnlockFn(); unlockErr != nil {
+				ctx.Log.Err("error unlocking state after approve policies error: %v", unlockErr)
+			}
 			return nil, "", err
 		}
 		teams = append(teams, userTeams...)
@@ -768,6 +774,9 @@ func (p *DefaultProjectCommandRunner) doImport(ctx command.ProjectContext) (out 
 	// Acquire internal lock for the directory we're going to operate in.
 	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.Import)
 	if err != nil {
+		if unlockErr := lockAttempt.UnlockFn(); unlockErr != nil {
+			ctx.Log.Err("error unlocking state after import error: %v", unlockErr)
+		}
 		return nil, "", err
 	}
 	defer unlockFn()
@@ -809,6 +818,9 @@ func (p *DefaultProjectCommandRunner) doStateRm(ctx command.ProjectContext) (out
 	// Acquire internal lock for the directory we're going to operate in.
 	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.State)
 	if err != nil {
+		if unlockErr := lockAttempt.UnlockFn(); unlockErr != nil {
+			ctx.Log.Err("error unlocking state after state rm error: %v", unlockErr)
+		}
 		return nil, "", err
 	}
 	defer unlockFn()

@@ -1806,3 +1806,236 @@ func TestDefaultProjectCommandRunner_ApprovePolicies(t *testing.T) {
 		})
 	}
 }
+
+// TestDefaultProjectCommandRunner_Import_UnlocksOnDirLockerFailure verifies that
+// when WorkingDirLocker.TryLock fails during doImport, the Atlantis lock is
+// released via UnlockFn so it doesn't leak.
+func TestDefaultProjectCommandRunner_Import_UnlocksOnDirLockerFailure(t *testing.T) {
+	RegisterMockTestingT(t)
+	mockWorkingDir := mocks.NewMockWorkingDir()
+	mockLocker := mocks.NewMockProjectLocker()
+	mockCommandRequirementHandler := mocks.NewMockCommandRequirementHandler()
+	workingDirLocker := events.NewDefaultWorkingDirLocker()
+
+	runner := events.DefaultProjectCommandRunner{
+		Locker:                    mockLocker,
+		LockURLGenerator:          mockURLGenerator{},
+		WorkingDir:                mockWorkingDir,
+		WorkingDirLocker:          workingDirLocker,
+		CommandRequirementHandler: mockCommandRequirementHandler,
+	}
+
+	unlockCalled := false
+
+	modelPull := models.PullRequest{BaseRepo: testdata.GithubRepo, Num: testdata.Pull.Num}
+	ctx := command.ProjectContext{
+		Log:        logging.NewNoopLogger(t),
+		Workspace:  "default",
+		RepoRelDir: ".",
+		Pull:       modelPull,
+	}
+
+	repoDir := t.TempDir()
+	When(mockWorkingDir.Clone(
+		Any[logging.SimpleLogging](),
+		Any[models.Repo](),
+		Any[models.PullRequest](),
+		Any[string](),
+	)).ThenReturn(repoDir, nil)
+	When(mockCommandRequirementHandler.ValidateImportProject(repoDir, ctx)).ThenReturn("", nil)
+	When(mockLocker.TryLock(
+		Any[logging.SimpleLogging](),
+		Any[models.PullRequest](),
+		Any[models.User](),
+		Any[string](),
+		Any[models.Project](),
+		AnyBool(),
+	)).ThenReturn(&events.TryLockResponse{
+		LockAcquired: true,
+		LockKey:      "lock-key",
+		UnlockFn:     func() error { unlockCalled = true; return nil },
+	}, nil)
+
+	// Pre-acquire the working dir lock to force TryLock to fail inside doImport.
+	preRelease, err := workingDirLocker.TryLock(
+		ctx.Pull.BaseRepo.FullName, ctx.Pull.Num,
+		ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.Plan,
+	)
+	Ok(t, err)
+	defer preRelease()
+
+	res := runner.Import(ctx)
+	Assert(t, res.Error != nil, "expected error from locked workspace")
+	Assert(t, unlockCalled, "expected Atlantis lock to be released when WorkingDirLocker.TryLock fails in doImport")
+}
+
+// TestDefaultProjectCommandRunner_StateRm_UnlocksOnDirLockerFailure verifies that
+// when WorkingDirLocker.TryLock fails during doStateRm, the Atlantis lock is
+// released via UnlockFn so it doesn't leak.
+func TestDefaultProjectCommandRunner_StateRm_UnlocksOnDirLockerFailure(t *testing.T) {
+	RegisterMockTestingT(t)
+	mockWorkingDir := mocks.NewMockWorkingDir()
+	mockLocker := mocks.NewMockProjectLocker()
+	workingDirLocker := events.NewDefaultWorkingDirLocker()
+
+	runner := events.DefaultProjectCommandRunner{
+		Locker:           mockLocker,
+		LockURLGenerator: mockURLGenerator{},
+		WorkingDir:       mockWorkingDir,
+		WorkingDirLocker: workingDirLocker,
+	}
+
+	unlockCalled := false
+
+	modelPull := models.PullRequest{BaseRepo: testdata.GithubRepo, Num: testdata.Pull.Num}
+	ctx := command.ProjectContext{
+		Log:        logging.NewNoopLogger(t),
+		Workspace:  "default",
+		RepoRelDir: ".",
+		Pull:       modelPull,
+	}
+
+	repoDir := t.TempDir()
+	When(mockWorkingDir.Clone(
+		Any[logging.SimpleLogging](),
+		Any[models.Repo](),
+		Any[models.PullRequest](),
+		Any[string](),
+	)).ThenReturn(repoDir, nil)
+	When(mockLocker.TryLock(
+		Any[logging.SimpleLogging](),
+		Any[models.PullRequest](),
+		Any[models.User](),
+		Any[string](),
+		Any[models.Project](),
+		AnyBool(),
+	)).ThenReturn(&events.TryLockResponse{
+		LockAcquired: true,
+		LockKey:      "lock-key",
+		UnlockFn:     func() error { unlockCalled = true; return nil },
+	}, nil)
+
+	// Pre-acquire the working dir lock to force TryLock to fail inside doStateRm.
+	preRelease, err := workingDirLocker.TryLock(
+		ctx.Pull.BaseRepo.FullName, ctx.Pull.Num,
+		ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.Plan,
+	)
+	Ok(t, err)
+	defer preRelease()
+
+	res := runner.StateRm(ctx)
+	Assert(t, res.Error != nil, "expected error from locked workspace")
+	Assert(t, unlockCalled, "expected Atlantis lock to be released when WorkingDirLocker.TryLock fails in doStateRm")
+}
+
+// TestDefaultProjectCommandRunner_ApprovePolicies_UnlocksOnDirLockerFailure verifies
+// that when WorkingDirLocker.TryLock fails during doApprovePolicies, the Atlantis
+// lock is released via UnlockFn so it doesn't leak.
+func TestDefaultProjectCommandRunner_ApprovePolicies_UnlocksOnDirLockerFailure(t *testing.T) {
+	RegisterMockTestingT(t)
+	mockLocker := mocks.NewMockProjectLocker()
+	workingDirLocker := events.NewDefaultWorkingDirLocker()
+
+	runner := events.DefaultProjectCommandRunner{
+		Locker:           mockLocker,
+		LockURLGenerator: mockURLGenerator{},
+		WorkingDirLocker: workingDirLocker,
+	}
+
+	unlockCalled := false
+
+	modelPull := models.PullRequest{BaseRepo: testdata.GithubRepo, Num: testdata.Pull.Num}
+	ctx := command.ProjectContext{
+		Log:        logging.NewNoopLogger(t),
+		Workspace:  "default",
+		RepoRelDir: ".",
+		Pull:       modelPull,
+	}
+
+	When(mockLocker.TryLock(
+		Any[logging.SimpleLogging](),
+		Any[models.PullRequest](),
+		Any[models.User](),
+		Any[string](),
+		Any[models.Project](),
+		AnyBool(),
+	)).ThenReturn(&events.TryLockResponse{
+		LockAcquired: true,
+		LockKey:      "lock-key",
+		UnlockFn:     func() error { unlockCalled = true; return nil },
+	}, nil)
+
+	// Pre-acquire the working dir lock to force TryLock to fail inside doApprovePolicies.
+	preRelease, err := workingDirLocker.TryLock(
+		ctx.Pull.BaseRepo.FullName, ctx.Pull.Num,
+		ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.Plan,
+	)
+	Ok(t, err)
+	defer preRelease()
+
+	res := runner.ApprovePolicies(ctx)
+	Assert(t, res.Error != nil, "expected error from locked workspace")
+	Assert(t, unlockCalled, "expected Atlantis lock to be released when WorkingDirLocker.TryLock fails in doApprovePolicies")
+}
+
+// TestDefaultProjectCommandRunner_ApprovePolicies_UnlocksOnTeamMembershipError verifies
+// that when GetTeamNamesForUser fails during doApprovePolicies (after both locks are
+// acquired), the Atlantis lock is released via UnlockFn so it doesn't leak.
+func TestDefaultProjectCommandRunner_ApprovePolicies_UnlocksOnTeamMembershipError(t *testing.T) {
+	RegisterMockTestingT(t)
+	mockVcsClient := vcsmocks.NewMockClient()
+	mockLocker := mocks.NewMockProjectLocker()
+	workingDirLocker := events.NewDefaultWorkingDirLocker()
+
+	runner := events.DefaultProjectCommandRunner{
+		Locker:           mockLocker,
+		VcsClient:        mockVcsClient,
+		LockURLGenerator: mockURLGenerator{},
+		WorkingDirLocker: workingDirLocker,
+	}
+
+	unlockCalled := false
+
+	modelPull := models.PullRequest{BaseRepo: testdata.GithubRepo, Num: testdata.Pull.Num}
+	ctx := command.ProjectContext{
+		Log:        logging.NewNoopLogger(t),
+		Workspace:  "default",
+		RepoRelDir: ".",
+		Pull:       modelPull,
+		// HasTeamOwners() returns true when a policy set has team owners.
+		PolicySets: valid.PolicySets{
+			PolicySets: []valid.PolicySet{
+				{
+					Name:         "policy1",
+					ApproveCount: 1,
+					Owners: valid.PolicyOwners{
+						Teams: []string{"team1"},
+					},
+				},
+			},
+		},
+	}
+
+	When(mockLocker.TryLock(
+		Any[logging.SimpleLogging](),
+		Any[models.PullRequest](),
+		Any[models.User](),
+		Any[string](),
+		Any[models.Project](),
+		AnyBool(),
+	)).ThenReturn(&events.TryLockResponse{
+		LockAcquired: true,
+		LockKey:      "lock-key",
+		UnlockFn:     func() error { unlockCalled = true; return nil },
+	}, nil)
+
+	When(mockVcsClient.GetTeamNamesForUser(
+		Any[logging.SimpleLogging](),
+		Any[models.Repo](),
+		Any[models.User](),
+	)).ThenReturn(nil, errors.New("team API error"))
+
+	res := runner.ApprovePolicies(ctx)
+	Assert(t, res.Error != nil, "expected error from GetTeamNamesForUser failure")
+	Assert(t, unlockCalled, "expected Atlantis lock to be released when GetTeamNamesForUser fails in doApprovePolicies")
+}

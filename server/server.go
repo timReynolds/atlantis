@@ -40,6 +40,7 @@ import (
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/drift"
 	driftpostgres "github.com/runatlantis/atlantis/server/core/drift/postgres"
+	"github.com/runatlantis/atlantis/server/core/ownership"
 	"github.com/runatlantis/atlantis/server/core/redis"
 	"github.com/runatlantis/atlantis/server/core/runs"
 	runspostgres "github.com/runatlantis/atlantis/server/core/runs/postgres"
@@ -120,6 +121,7 @@ type Server struct {
 	APIController                  *controllers.APIController
 	RunHistoryController           *controllers.RunHistoryController
 	DriftHistoryController         *controllers.DriftHistoryController
+	InternalCommandController      *controllers.InternalCommandController `validate:"required_if=EnableReplicaRouting true"`
 	IndexTemplate                  web_templates.TemplateWriter
 	LockDetailTemplate             web_templates.TemplateWriter
 	ProjectJobsTemplate            web_templates.TemplateWriter
@@ -138,6 +140,9 @@ type Server struct {
 	DisableGlobalApplyLock         bool
 	EnableProfilingAPI             bool
 	RunStore                       runs.Store
+	EnableReplicaRouting           bool
+	OwnerStore                     ownership.Store `validate:"required_if=EnableReplicaRouting true"`
+	commandExecutorWaiter          acceptedCommandWaiter
 	database                       db.Database
 	runStoreHealth                 runStorePinger
 	runStoreCloser                 io.Closer
@@ -193,6 +198,18 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	}
 	if err := validateRunStoreConfig(userConfig); err != nil {
 		return nil, err
+	}
+	if err := userConfig.ValidateReplicaRouting(); err != nil {
+		return nil, err
+	}
+	replicaRoutingEnabled := userConfig.replicaRoutingConfigured()
+	replicaID := ""
+	if replicaRoutingEnabled {
+		var err error
+		replicaID, err = userConfig.resolveReplicaID()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	logging.SuppressDefaultLogging()
@@ -535,6 +552,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	var lockingClient locking.Locker
 	var applyLockingClient locking.ApplyLocker
 	var database db.Database
+	var redisDatabase *redis.RedisDB
 
 	switch dbtype := userConfig.LockingDBType; dbtype {
 	case "redis":
@@ -554,7 +572,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		default:
 			logger.Info("Utilizing Redis DB in single-node mode, host: %s, port: %d", userConfig.RedisHost, userConfig.RedisPort)
 		}
-		database, err = redis.NewWithConfig(redis.Config{
+		redisDatabase, err = redis.NewWithConfig(redis.Config{
 			Hostname:           userConfig.RedisHost,
 			Port:               userConfig.RedisPort,
 			Password:           userConfig.RedisPassword,
@@ -567,6 +585,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		if err != nil {
 			return nil, err
 		}
+		database = redisDatabase
 	case "boltdb":
 		logger.Info("Utilizing BoltDB")
 		database, err = boltdb.New(userConfig.DataDir)
@@ -1077,6 +1096,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		VarFileAllowlistChecker:        varFileAllowlistChecker,
 		CommitStatusUpdater:            commitStatusUpdater,
 	}
+
 	repoAllowlist, err := events.NewRepoAllowlistChecker(userConfig.RepoAllowlist)
 	if err != nil {
 		return nil, err
@@ -1185,8 +1205,46 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		apiController.DriftWebhookSender = driftWebhookSender
 	}
 
+	var ownerStore ownership.Store
+	var internalCommandController *controllers.InternalCommandController
+	var commandDispatcher events.CommandDispatcher
+	var commandExecutorWaiter acceptedCommandWaiter
+	if replicaRoutingEnabled {
+		localCommandExecutor := &events.LocalCommandExecutor{
+			Hydrator:    eventParser,
+			Runner:      commandRunner,
+			PullCleaner: pullClosedExecutor,
+			WorkingDir:  workingDir,
+			ClaimGuard:  events.NewLocalClaimGuard(),
+			Logger:      logger,
+		}
+		ownerStore, err = redis.NewOwnerStore(redisDatabase, redis.OwnerStoreConfig{
+			ReplicaID:    replicaID,
+			AdvertiseURL: userConfig.ReplicaAdvertiseURL,
+			TTL:          time.Duration(userConfig.OwnershipTTLSeconds) * time.Second,
+		}, logger)
+		if err != nil {
+			return nil, fmt.Errorf("initializing replica ownership: %w", err)
+		}
+		localCommandExecutor.Owners = ownerStore
+		commandDispatcher = events.NewRoutedCommandDispatcher(
+			replicaID,
+			ownerStore,
+			localCommandExecutor,
+			events.NewHTTPCommandForwarder(userConfig.InternalCommandToken),
+		)
+		internalCommandController = &controllers.InternalCommandController{
+			Token:     userConfig.InternalCommandToken,
+			ReplicaID: replicaID,
+			Owners:    ownerStore,
+			Executor:  localCommandExecutor,
+		}
+		commandExecutorWaiter = localCommandExecutor
+	}
+
 	eventsController := &events_controllers.VCSEventsController{
 		CommandRunner:                   commandRunner,
+		CommandDispatcher:               commandDispatcher,
 		PullCleaner:                     pullClosedExecutor,
 		Parser:                          eventParser,
 		CommentParser:                   commentParser,
@@ -1238,6 +1296,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		APIController:                  apiController,
 		RunHistoryController:           runHistoryController,
 		DriftHistoryController:         driftHistoryController,
+		InternalCommandController:      internalCommandController,
 		IndexTemplate:                  web_templates.IndexTemplate,
 		LockDetailTemplate:             web_templates.LockTemplate,
 		ProjectJobsTemplate:            web_templates.ProjectJobsTemplate,
@@ -1253,6 +1312,9 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		ScheduledExecutorService:       scheduledExecutorService,
 		EnableProfilingAPI:             userConfig.EnableProfilingAPI,
 		RunStore:                       runStore,
+		EnableReplicaRouting:           replicaRoutingEnabled,
+		OwnerStore:                     ownerStore,
+		commandExecutorWaiter:          commandExecutorWaiter,
 		database:                       database,
 		runStoreHealth:                 runStoreHealth,
 		runStoreCloser:                 runStoreCloser,
@@ -1263,6 +1325,9 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 
 	err = validate.Struct(server)
 	if err != nil {
+		if ownerStore != nil {
+			_ = ownerStore.Close()
+		}
 		return nil, err
 	} else {
 		closeRunStoreOnError = false
@@ -1281,6 +1346,11 @@ func (s *Server) SetupRoutes() {
 	s.Router.HandleFunc("/status", s.StatusController.Get).Methods("GET")
 	s.Router.PathPrefix("/static/").Handler(http.FileServer(http.FS(staticAssets)))
 	s.Router.HandleFunc("/events", s.VCSEventsController.Post).Methods("POST")
+	if s.EnableReplicaRouting {
+		s.Router.HandleFunc(events.InternalCommentCommandPath, s.InternalCommandController.Comment).Methods("POST")
+		s.Router.HandleFunc(events.InternalAutoplanCommandPath, s.InternalCommandController.Autoplan).Methods("POST")
+		s.Router.HandleFunc(events.InternalPullClosedCommandPath, s.InternalCommandController.PullClosed).Methods("POST")
+	}
 	s.Router.HandleFunc("/api/plan", s.APIController.Plan).Methods("POST")
 	s.Router.HandleFunc("/api/apply", s.APIController.Apply).Methods("POST")
 	s.Router.HandleFunc("/api/locks", s.APIController.ListLocks).Methods("GET")
@@ -1396,25 +1466,47 @@ func (s *Server) Start() error {
 	}
 
 	s.Logger.Warn("Received interrupt. Waiting for in-progress operations to complete")
-	s.waitForDrain()
+	return s.shutdown(server, 5*time.Second)
+}
 
-	// flush stats before shutdown
-	if err := s.StatsCloser.Close(); err != nil {
-		s.Logger.Err("%s", err.Error())
+type httpShutdowner interface {
+	Shutdown(context.Context) error
+}
+
+type acceptedCommandWaiter interface {
+	Wait()
+}
+
+func (s *Server) shutdown(server httpShutdowner, timeout time.Duration) error {
+	if s.OwnerStore != nil {
+		s.OwnerStore.BeginDrain()
 	}
 
-	// Attempt to close the database
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		return fmt.Errorf("while shutting down HTTP server: %w", err)
+	}
+
+	if s.commandExecutorWaiter != nil {
+		s.commandExecutorWaiter.Wait()
+	}
+	s.waitForDrain()
+	if s.StatsCloser != nil {
+		if err := s.StatsCloser.Close(); err != nil {
+			s.Logger.Err("%s", err.Error())
+		}
+	}
+	if s.OwnerStore != nil {
+		if err := s.OwnerStore.Close(); err != nil {
+			s.Logger.Err("while releasing pull request ownership: %v", err)
+		}
+	}
 	if err := s.closeDatabase(1 * time.Second); err != nil {
 		s.Logger.Err("while closing database: %v", err)
 	}
 	if err := s.closeRunStore(1 * time.Second); err != nil {
 		s.Logger.Err("while closing run store %v", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := server.Shutdown(ctx); err != nil {
-		return fmt.Errorf("while shutting down: %s", err)
 	}
 	return nil
 }
@@ -1584,6 +1676,10 @@ func (s *Server) Healthz(w http.ResponseWriter, _ *http.Request) {
 // dependency is unreachable. Suitable for K8s readiness probes.
 func (s *Server) Readyz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	ctx := context.Background()
+	if r != nil {
+		ctx = r.Context()
+	}
 	if s.database != nil {
 		if err := s.database.Ping(); err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -1592,11 +1688,14 @@ func (s *Server) Readyz(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if s.runStoreHealth != nil {
-		ctx := context.Background()
-		if r != nil {
-			ctx = r.Context()
-		}
 		if err := s.runStoreHealth.Ping(ctx); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write(fmt.Appendf(nil, `{"status":"error","error":%q}`, err.Error())) // nolint: errcheck
+			return
+		}
+	}
+	if s.OwnerStore != nil {
+		if err := s.OwnerStore.Ready(ctx); err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			w.Write(fmt.Appendf(nil, `{"status":"error","error":%q}`, err.Error())) // nolint: errcheck
 			return

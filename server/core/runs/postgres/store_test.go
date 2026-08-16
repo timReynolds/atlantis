@@ -291,6 +291,17 @@ func TestStoreConformance(t *testing.T) {
 	staleProject, err := store.GetProjectRun(ctx, staleProjectID)
 	require.NoError(t, err)
 	require.Equal(t, runs.StatusFailed, staleProject.Status)
+	gracefulRetry, err := store.PrepareAttemptTakeover(ctx, runs.AttemptTakeoverRequest{
+		ConcurrencyKey: "sha256:retry-plan", OwnershipClaimID: "newer-plan-claim",
+		HeartbeatBefore: recoveredAt.Add(-time.Minute), RecoveredAt: recoveredAt.Add(time.Second),
+		Repository: retryRun.Repository, PullNumber: &retryPull, Command: retryRun.Command,
+		Trigger: retryRun.Trigger, Actor: retryRun.Actor, BaseRef: retryRun.BaseRef,
+		HeadRef: retryRun.HeadRef, HeadSHA: retryRun.HeadSHA,
+	})
+	require.NoError(t, err)
+	require.Equal(t, retryRunID, gracefulRetry.RetryRun.ID,
+		"an already interrupted graceful-shutdown plan must retain its logical Run")
+	require.Equal(t, staleAttemptID, gracefulRetry.RecoveredAttempt.ID)
 
 	replacementInstanceID := mustID(t)
 	require.NoError(t, store.RegisterInstance(ctx, runs.ExecutionInstance{

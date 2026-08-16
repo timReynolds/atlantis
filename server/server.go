@@ -143,12 +143,14 @@ type Server struct {
 	EnableReplicaRouting           bool
 	OwnerStore                     ownership.Store `validate:"required_if=EnableReplicaRouting true"`
 	ExecutionInstanceID            runs.ID
+	ShutdownGracePeriod            time.Duration
 	commandExecutorWaiter          acceptedCommandWaiter
 	executionInstance              executionInstanceLifecycle
 	database                       db.Database
 	runStoreHealth                 runStorePinger
 	runStoreCloser                 io.Closer
 	runStoreRetention              *runStoreRetentionService
+	runHistory                     *events.RunHistory
 }
 
 type runStorePinger interface {
@@ -1346,12 +1348,14 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		EnableReplicaRouting:           replicaRoutingEnabled,
 		OwnerStore:                     ownerStore,
 		ExecutionInstanceID:            executionInstanceID,
+		ShutdownGracePeriod:            time.Duration(userConfig.ShutdownGracePeriodSeconds) * time.Second,
 		commandExecutorWaiter:          commandExecutorWaiter,
 		executionInstance:              executionInstance,
 		database:                       database,
 		runStoreHealth:                 runStoreHealth,
 		runStoreCloser:                 runStoreCloser,
 		runStoreRetention:              runStoreRetention,
+		runHistory:                     runHistory,
 	}
 
 	validate := validator.New(validator.WithRequiredStructEnabled())
@@ -1505,7 +1509,11 @@ func (s *Server) Start() error {
 	}
 
 	s.Logger.Warn("Received interrupt. Waiting for in-progress operations to complete")
-	return s.shutdown(server, 5*time.Second)
+	shutdownGracePeriod := s.ShutdownGracePeriod
+	if shutdownGracePeriod <= 0 {
+		shutdownGracePeriod = 5 * time.Second
+	}
+	return s.shutdown(server, shutdownGracePeriod)
 }
 
 type httpShutdowner interface {
@@ -1520,6 +1528,9 @@ func (s *Server) shutdown(server httpShutdowner, timeout time.Duration) error {
 	if s.OwnerStore != nil {
 		s.OwnerStore.BeginDrain()
 	}
+	if s.runHistory != nil {
+		s.runHistory.BeginDrain()
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -1530,18 +1541,29 @@ func (s *Server) shutdown(server httpShutdowner, timeout time.Duration) error {
 		s.Logger.Err("while shutting down HTTP server: %v", err)
 	}
 
-	if s.commandExecutorWaiter != nil {
-		s.commandExecutorWaiter.Wait()
+	commandsDrained := waitForAcceptedCommands(ctx, s.commandExecutorWaiter)
+	operationsDrained := s.waitForDrain(ctx)
+	executionDrained := commandsDrained && operationsDrained
+	if !executionDrained && s.runHistory != nil {
+		interrupted := s.runHistory.InterruptActive("graceful shutdown deadline expired")
+		if interrupted > 0 {
+			s.Logger.Warn("classified %d execution attempts after graceful shutdown deadline", interrupted)
+		}
 	}
-	s.waitForDrain()
 	if s.StatsCloser != nil {
 		if err := s.StatsCloser.Close(); err != nil {
 			s.Logger.Err("%s", err.Error())
 		}
 	}
 	if s.OwnerStore != nil {
-		if err := s.OwnerStore.Close(); err != nil {
-			s.Logger.Err("while releasing pull request ownership: %v", err)
+		var err error
+		if executionDrained {
+			err = s.OwnerStore.Close()
+		} else if abandoner, ok := s.OwnerStore.(interface{ Abandon() error }); ok {
+			err = abandoner.Abandon()
+		}
+		if err != nil {
+			s.Logger.Err("while stopping pull request ownership: %v", err)
 		}
 	}
 	if s.executionInstance != nil {
@@ -1560,19 +1582,43 @@ func (s *Server) shutdown(server httpShutdowner, timeout time.Duration) error {
 	return nil
 }
 
-// waitForDrain blocks until draining is complete.
-func (s *Server) waitForDrain() {
+func waitForAcceptedCommands(ctx context.Context, waiter acceptedCommandWaiter) bool {
+	if waiter == nil {
+		return true
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		waiter.Wait()
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// waitForDrain waits only inside the platform termination budget.
+func (s *Server) waitForDrain(ctx context.Context) bool {
+	if s.Drainer == nil {
+		return true
+	}
 	drainComplete := make(chan bool, 1)
 	go func() {
 		s.Drainer.ShutdownBlocking()
 		drainComplete <- true
 	}()
 	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-drainComplete:
 			s.Logger.Info("All in-progress operations complete, shutting down")
-			return
+			return true
+		case <-ctx.Done():
+			s.Logger.Warn("graceful shutdown deadline expired with %d in-progress operations", s.Drainer.GetStatus().InProgressOps)
+			return false
 		case <-ticker.C:
 			s.Logger.Info("Waiting for in-progress operations to complete, current in-progress ops: %d", s.Drainer.GetStatus().InProgressOps)
 		}

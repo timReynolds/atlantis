@@ -358,6 +358,26 @@ func TestOwnerStore_CloseReleasesOwnedClaims(t *testing.T) {
 	require.False(t, found)
 }
 
+func TestOwnerStore_AbandonLeavesClaimUntilLeaseExpiry(t *testing.T) {
+	mr := miniredis.RunT(t)
+	store := newTestOwnerStoreWithTTL(t, mr, "atlantis-0", testOwnerURL, 30*time.Second)
+	observer := newTestOwnerStoreWithTTL(t, mr, "atlantis-1", "http://atlantis-1.atlantis-headless:4141", 30*time.Second)
+	key := testOwnershipKey(68)
+	claim, err := store.Claim(context.Background(), key)
+	require.NoError(t, err)
+
+	require.NoError(t, store.Abandon())
+	current, found, err := observer.Current(context.Background(), key)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, claim, current)
+
+	mr.FastForward(31 * time.Second)
+	replacement, err := observer.Claim(context.Background(), key)
+	require.NoError(t, err)
+	require.Equal(t, "atlantis-1", replacement.ReplicaID)
+}
+
 func TestOwnerStore_StoredRecordContainsOnlyRoutingMetadata(t *testing.T) {
 	mr := miniredis.RunT(t)
 	store := newTestOwnerStore(t, mr, "atlantis-0", testOwnerURL)

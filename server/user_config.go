@@ -141,6 +141,7 @@ type UserConfig struct {
 	RunStoreOutputRetentionDays     int    `mapstructure:"run-store-output-retention-days"`
 	RunStoreAuditRetentionDays      int    `mapstructure:"run-store-audit-retention-days"`
 	RunStoreDriftRetentionDays      int    `mapstructure:"run-store-drift-retention-days"`
+	ShutdownGracePeriodSeconds      int    `mapstructure:"shutdown-grace-period-seconds"`
 
 	// SilenceNoProjects is whether Atlantis should respond to a PR if no projects are found.
 	SilenceNoProjects   bool `mapstructure:"silence-no-projects"`
@@ -214,6 +215,9 @@ func (u UserConfig) ValidateReplicaRouting() error {
 	}
 	if u.OwnershipTTLSeconds < 10 {
 		return errors.New("--ownership-ttl-seconds must be at least 10")
+	}
+	if u.ShutdownGracePeriodSeconds < 0 {
+		return errors.New("--shutdown-grace-period-seconds cannot be negative")
 	}
 	if u.durableHAConfigured() {
 		if u.RunStoreType != RunStorePostgres {

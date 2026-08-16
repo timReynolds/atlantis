@@ -374,6 +374,62 @@ func TestRunHistoryRecordsRoutedExecutionAttempt(t *testing.T) {
 	require.Equal(t, []string{"apply.requested", "apply.attempt_started", "apply.completed"}, writer.auditTypes())
 }
 
+func TestRunHistoryDrainRejectsNewExecutionAndSideEffectAdmission(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := routedRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerComment)
+	require.True(t, lifecycle.CanExecute())
+
+	history.BeginDrain()
+	require.ErrorIs(t, ctx.SideEffectMarker.MarkSideEffectStarted(context.Background()), errRunHistoryDraining)
+
+	newCtx := routedRunContext(t)
+	newLifecycle := history.Begin(newCtx, runs.CommandPlan, runs.TriggerComment)
+	require.False(t, newLifecycle.CanExecute())
+	require.ErrorIs(t, newLifecycle.AdmissionError(), errRunHistoryDraining)
+	require.True(t, newCtx.CommandHasErrors)
+	require.Empty(t, newCtx.RunID)
+	lifecycle.Finish()
+}
+
+func TestRunHistoryInterruptsPlanForAnotherAttemptUnderSameRun(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := routedRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+	projectCtx := history.beginProject(command.ProjectContext{
+		RunID: ctx.RunID, ProjectName: "network", RepoRelDir: "terraform/network",
+		Workspace: "production", Log: ctx.Log,
+	})
+	require.NotEmpty(t, projectCtx.ProjectRunID)
+
+	require.Equal(t, 1, history.InterruptActive("graceful shutdown deadline expired"))
+	lifecycle.Finish()
+
+	require.Empty(t, writer.runsCompleted, "logical plan Run remains open for a replacement attempt")
+	require.Len(t, writer.attemptsCompleted, 1)
+	require.Equal(t, runs.AttemptInterrupted, writer.attemptsCompleted[0].Status)
+	require.Contains(t, writer.attemptsCompleted[0].FailureReason, "before an infrastructure side effect")
+	require.Equal(t, runs.StatusFailed, writer.projectsCompleted[0].Status)
+	require.Equal(t, []string{"plan.requested", "plan.attempt_started", "plan.interrupted"}, writer.auditTypes())
+}
+
+func TestRunHistoryInterruptsApplyAfterSideEffectAsUnknown(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := routedRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerComment)
+	require.NoError(t, ctx.SideEffectMarker.MarkSideEffectStarted(context.Background()))
+
+	require.Equal(t, 1, history.InterruptActive("graceful shutdown deadline expired"))
+	lifecycle.Finish()
+
+	require.Equal(t, runs.StatusUnknown, writer.runsCompleted[0].Status)
+	require.Equal(t, runs.AttemptUnknown, writer.attemptsCompleted[0].Status)
+	require.Contains(t, writer.attemptsCompleted[0].FailureReason, "may have completed")
+}
+
 func TestRunHistoryFailsClosedWhenAttemptAdmissionIsNotDurable(t *testing.T) {
 	writer := &recordingRunWriter{createAttemptErr: errors.New("database unavailable")}
 	history := newTestRunHistory(t, writer)
@@ -565,6 +621,13 @@ func enableHAContext(ctx *command.Context) {
 	ctx.ExecutionDeploymentID = "prod-eu"
 	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
 	ctx.OwnershipClaimID = "claim-1"
+}
+
+func routedRunContext(t *testing.T) *command.Context {
+	t.Helper()
+	ctx := testRunContext(t)
+	enableHAContext(ctx)
+	return ctx
 }
 
 type recordingRunWriter struct {

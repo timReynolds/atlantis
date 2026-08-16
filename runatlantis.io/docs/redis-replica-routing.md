@@ -37,6 +37,7 @@ ATLANTIS_REDIS_HOST=redis-primary.redis.svc.cluster.local
 ATLANTIS_REDIS_PORT=6379
 ATLANTIS_REPLICA_ADVERTISE_URL=http://atlantis-0.atlantis-headless.atlantis.svc.cluster.local:4141
 ATLANTIS_OWNERSHIP_TTL_SECONDS=30
+ATLANTIS_SHUTDOWN_GRACE_PERIOD_SECONDS=540
 ATLANTIS_INTERNAL_COMMAND_TOKEN=<shared-secret>
 ```
 
@@ -48,7 +49,7 @@ For the fork's durable HA mode, also set the same `--replica-deployment-id` on e
 
 Durable HA adds a `RunAttempt` for each process that tries to execute a logical Run. Attempts record the process instance, Redis ownership claim, concurrency key, heartbeats, terminal classification, and the point at which an infrastructure mutation may have begun. A retried plan keeps its original Run ID and appends a new attempt and attempt-scoped project results; replica identity never becomes part of the external Run ID.
 
-The ownership TTL defaults to 30 seconds and must be at least 10 seconds. Use a TTL long enough to tolerate routine scheduling and Redis latency, but short enough for the desired failover time.
+The ownership TTL defaults to 30 seconds and must be at least 10 seconds. Use a TTL long enough to tolerate routine scheduling and Redis latency, but short enough for the desired failover time. The shutdown grace period defaults to the upstream-compatible five seconds; set it below the platform termination grace period with enough reserve for final PostgreSQL and Redis cleanup. The Kubernetes example uses 540 seconds inside a 600-second pod grace period.
 
 ## Plan Storage
 
@@ -77,7 +78,9 @@ Atlantis fails closed when it cannot resolve or reach the owner:
 - With external plan storage, a new owner may restore and apply a plan only when its stored head commit matches the pull request.
 - Shared project locks are retained. A lock held by the same PR does not prevent the new owner from re-planning.
 
-Graceful shutdown marks the owner store as draining, stops HTTP traffic, waits for active commands, releases exact claims, and then closes Redis. If HTTP shutdown times out, Atlantis logs the error and still drains active commands, releases claims, and closes Redis; in-progress work is tracked independently of open HTTP connections, so a lingering jobs or SSE stream does not abort the rest of the shutdown sequence.
+Graceful shutdown marks both execution admission and the owner store as draining before stopping HTTP traffic. An admitted command may finish inside the termination window, but a command that has not yet crossed the durable infrastructure-side-effect marker cannot begin a mutation after draining starts. Fully drained commands release their exact Redis claims.
+
+If execution misses the termination deadline, Atlantis stops lease renewal without deleting the Redis claim, so a replacement cannot claim the pull request until the TTL expires. It durably classifies an incomplete plan attempt as `interrupted` and leaves the logical Run open for a replacement attempt. An incomplete apply, import, state removal, or drift remediation with a recorded mutation marker becomes `unknown`; it is never made retryable by shutdown. The process instance records its final stopped state before PostgreSQL closes. SIGKILL does not run this path, so takeover still relies on lease and heartbeat expiry and produces the same classifications.
 
 Internal forwarding is at-least-once. A timeout can leave the ingress replica unsure whether the owner accepted a command, so a provider or manual redelivery can execute it again. Atlantis does not claim exactly-once execution. Ownership or forwarding failures return HTTP 503; monitor failed VCS deliveries and redeliver them when the provider does not retry automatically.
 

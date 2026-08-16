@@ -112,6 +112,16 @@ func prepareAttemptTakeover(ctx context.Context, tx *sql.Tx, request runs.Attemp
 			}
 		}
 	}
+	if result.RetryRun == nil && request.Command == runs.CommandPlan {
+		interrupted, retryRun, err := retryableInterruptedPlan(ctx, tx, request)
+		if err != nil {
+			return result, err
+		}
+		if retryRun != nil {
+			result.RecoveredAttempt = interrupted
+			result.RetryRun = retryRun
+		}
+	}
 
 	unknown, err := latestUnreconciledUnknown(ctx, tx, request.ConcurrencyKey)
 	if err != nil {
@@ -162,6 +172,40 @@ func completeRecoveredAttempt(
 		return fmt.Errorf("classifying stale execution attempt %s: %w", attempt.ID, runs.ErrConflict)
 	}
 	return nil
+}
+
+func retryableInterruptedPlan(
+	ctx context.Context,
+	tx *sql.Tx,
+	request runs.AttemptTakeoverRequest,
+) (*runs.RunAttempt, *runs.Run, error) {
+	var attemptID, runID runs.ID
+	err := tx.QueryRowContext(ctx, `SELECT a.id, a.run_id
+        FROM run_attempts a JOIN runs r ON r.id = a.run_id
+        WHERE a.concurrency_key = $1 AND a.status = $2 AND r.status = $3
+        ORDER BY a.completed_at DESC, a.id DESC LIMIT 1 FOR UPDATE OF r`,
+		request.ConcurrencyKey, runs.AttemptInterrupted, runs.StatusRunning,
+	).Scan(&attemptID, &runID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("locking interrupted plan attempt: %w", err)
+	}
+	attempt, err := scanRunAttempt(tx.QueryRowContext(ctx,
+		"SELECT "+runAttemptColumns+" FROM run_attempts WHERE id = $1", attemptID))
+	if err != nil {
+		return nil, nil, err
+	}
+	run, err := scanRun(tx.QueryRowContext(ctx,
+		"SELECT "+runColumns+" FROM runs WHERE id = $1", runID))
+	if err != nil {
+		return nil, nil, err
+	}
+	if !runMatchesPlanRetry(run, request) {
+		return nil, nil, nil
+	}
+	return &attempt, &run, nil
 }
 
 func attemptIsLive(attempt runs.RunAttempt, instance runs.ExecutionInstance, request runs.AttemptTakeoverRequest) bool {

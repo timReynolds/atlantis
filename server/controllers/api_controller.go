@@ -296,6 +296,10 @@ func (a *APIController) Plan(w http.ResponseWriter, r *http.Request) {
 	}
 	lifecycle := a.RunHistory.Begin(ctx, runs.CommandPlan, runs.TriggerAPI)
 	defer lifecycle.FinishRecovering()
+	if !lifecycle.CanExecute() {
+		a.apiReportLegacyError(w, http.StatusServiceUnavailable, lifecycle.AdmissionError())
+		return
+	}
 
 	err = a.apiSetup(ctx, command.Plan)
 	if err != nil {
@@ -336,6 +340,10 @@ func (a *APIController) Apply(w http.ResponseWriter, r *http.Request) {
 	}
 	lifecycle := a.RunHistory.Begin(ctx, runs.CommandApply, runs.TriggerAPI)
 	defer lifecycle.FinishRecovering()
+	if !lifecycle.CanExecute() {
+		a.apiReportLegacyError(w, http.StatusServiceUnavailable, lifecycle.AdmissionError())
+		return
+	}
 
 	err = a.apiSetup(ctx, command.Apply)
 	if err != nil {
@@ -1223,6 +1231,10 @@ func (a *APIController) Remediate(w http.ResponseWriter, r *http.Request) {
 	}
 	lifecycle := a.RunHistory.Begin(historyCtx, runs.CommandDriftRemediation, runs.TriggerAPI)
 	defer lifecycle.FinishRecovering()
+	if !lifecycle.CanExecute() {
+		responder.ServiceUnavailable(w, r, lifecycle.AdmissionError().Error())
+		return
+	}
 	request.RunID = string(historyCtx.RunID)
 
 	// Create executor that bridges to existing plan/apply infrastructure
@@ -2293,6 +2305,10 @@ func (a *APIController) DetectDrift(w http.ResponseWriter, r *http.Request) {
 	}
 	lifecycle := a.RunHistory.Begin(ctx, runs.CommandDriftDetection, runs.TriggerAPI)
 	defer lifecycle.FinishRecovering()
+	if !lifecycle.CanExecute() {
+		responder.ServiceUnavailable(w, r, lifecycle.AdmissionError().Error())
+		return
+	}
 	detectionResult := models.NewDriftDetectionResult(request.Repository)
 	if ctx.RunID != "" {
 		detectionResult.ID = string(ctx.RunID)

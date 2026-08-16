@@ -61,6 +61,24 @@ func TestServer_ShutdownCompletesCleanupAfterHTTPTimeout(t *testing.T) {
 	assert.Equal(t, []string{"begin-drain", "http-shutdown", "command-wait", "owner-close"}, calls)
 }
 
+func TestServer_ShutdownAbandonsClaimsWhenAcceptedCommandMissesDeadline(t *testing.T) {
+	var calls []string
+	owners := &shutdownOwnerStore{calls: &calls}
+	waiter := &blockingCommandWaiter{started: make(chan struct{}), release: make(chan struct{})}
+	s := &Server{
+		OwnerStore:            owners,
+		commandExecutorWaiter: waiter,
+		executionInstance:     &recordingExecutionInstanceLifecycle{calls: &calls},
+		Drainer:               &events.Drainer{},
+		Logger:                logging.NewNoopLogger(t),
+	}
+
+	assert.NoError(t, s.shutdown(&recordingHTTPShutdowner{calls: &calls}, 10*time.Millisecond))
+	<-waiter.started
+	close(waiter.release)
+	assert.Equal(t, []string{"begin-drain", "http-shutdown", "owner-abandon", "instance-stop"}, calls)
+}
+
 type recordingHTTPShutdowner struct {
 	calls *[]string
 	err   error
@@ -72,6 +90,16 @@ type recordingCommandWaiter struct {
 
 type recordingExecutionInstanceLifecycle struct {
 	calls *[]string
+}
+
+type blockingCommandWaiter struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (w *blockingCommandWaiter) Wait() {
+	close(w.started)
+	<-w.release
 }
 
 func (s *recordingExecutionInstanceLifecycle) Start(context.Context) error { return nil }
@@ -113,6 +141,10 @@ func (s *shutdownOwnerStore) BeginDrain() {
 func (s *shutdownOwnerStore) Ready(context.Context) error { return nil }
 func (s *shutdownOwnerStore) Close() error {
 	*s.calls = append(*s.calls, "owner-close")
+	return nil
+}
+func (s *shutdownOwnerStore) Abandon() error {
+	*s.calls = append(*s.calls, "owner-abandon")
 	return nil
 }
 

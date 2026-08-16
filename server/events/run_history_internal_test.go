@@ -426,6 +426,104 @@ func TestRunHistoryMarksPanicAfterSideEffectUnknown(t *testing.T) {
 	require.Contains(t, writer.attemptsCompleted[0].FailureReason, "side effect")
 }
 
+func TestRunHistoryReusesLogicalRunForInterruptedPlan(t *testing.T) {
+	retryID := runs.ID("0198a0df-85f1-7d83-a60b-2e57b725c620")
+	oldAttemptID := runs.ID("0198a0df-85f1-7d83-a60b-2e57b725c621")
+	oldInstanceID := runs.ID("0198a0df-85f1-7d83-a60b-2e57b725c622")
+	startedAt := testHistoryTime.Add(-time.Minute)
+	retryRun := runs.Run{
+		ID: retryID, Repository: "org/repo", PullNumber: intPointer(42),
+		Command: runs.CommandPlan, Trigger: runs.TriggerComment, Actor: "operator",
+		BaseRef: "main", HeadRef: "feature", HeadSHA: "abc123",
+		Status: runs.StatusRunning, CreatedAt: startedAt, StartedAt: &startedAt,
+	}
+	recovered := runs.RunAttempt{
+		ID: oldAttemptID, RunID: retryID, InstanceID: oldInstanceID,
+		ConcurrencyKey: "sha256:pull-ownership-key", OwnershipClaimID: "claim-old",
+		Status: runs.AttemptInterrupted, ClaimedAt: startedAt, StartedAt: &startedAt,
+		HeartbeatAt: testHistoryTime, CompletedAt: &testHistoryTime,
+		FailureReason: "replica disappeared",
+	}
+	writer := &recordingRunWriter{takeoverResult: runs.AttemptTakeoverResult{
+		RecoveredAttempt: &recovered, RetryRun: &retryRun,
+	}}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
+	ctx.OwnershipClaimID = "claim-new"
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+
+	require.True(t, lifecycle.CanExecute())
+	require.Equal(t, retryID, ctx.RunID)
+	require.Empty(t, writer.runsCreated)
+	require.Len(t, writer.attemptsCreated, 1)
+	require.Equal(t, retryID, writer.attemptsCreated[0].RunID)
+	require.Equal(t, "claim-new", writer.attemptsCreated[0].OwnershipClaimID)
+	lifecycle.Finish()
+	require.Equal(t, runs.StatusSucceeded, writer.runsCompleted[0].Status)
+}
+
+func TestRunHistoryBlocksMutationWithUnreconciledUnknownAttempt(t *testing.T) {
+	unknown := claimedAttemptForHistory(t)
+	unknown.Status = runs.AttemptUnknown
+	unknown.StartedAt = &testHistoryTime
+	unknown.SideEffectStartedAt = &testHistoryTime
+	unknown.CompletedAt = &testHistoryTime
+	unknown.FailureReason = "apply outcome is unknown"
+	writer := &recordingRunWriter{takeoverResult: runs.AttemptTakeoverResult{
+		UnreconciledUnknown: &unknown,
+	}}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
+	ctx.OwnershipClaimID = "claim-new"
+	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerComment)
+
+	require.False(t, lifecycle.CanExecute())
+	require.True(t, ctx.CommandHasErrors)
+	require.Empty(t, writer.attemptsCreated)
+	lifecycle.Finish()
+	require.Equal(t, runs.StatusFailed, writer.runsCompleted[0].Status)
+	require.Contains(t, writer.auditTypes(), "apply.admission_blocked")
+}
+
+func TestRunHistoryAllowsFreshPlanWithUnreconciledUnknownAttempt(t *testing.T) {
+	unknown := claimedAttemptForHistory(t)
+	unknown.Status = runs.AttemptUnknown
+	unknown.StartedAt = &testHistoryTime
+	unknown.SideEffectStartedAt = &testHistoryTime
+	unknown.CompletedAt = &testHistoryTime
+	unknown.FailureReason = "apply outcome is unknown"
+	writer := &recordingRunWriter{takeoverResult: runs.AttemptTakeoverResult{
+		UnreconciledUnknown: &unknown,
+	}}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
+	ctx.OwnershipClaimID = "claim-new"
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+
+	require.True(t, lifecycle.CanExecute())
+	require.Len(t, writer.attemptsCreated, 1)
+	lifecycle.Finish()
+}
+
+func claimedAttemptForHistory(t *testing.T) runs.RunAttempt {
+	t.Helper()
+	return runs.RunAttempt{
+		ID:             "0198a0df-85f1-7d83-a60b-2e57b725c62c",
+		RunID:          "0198a0df-85f1-7d83-a60b-2e57b725c620",
+		InstanceID:     "0198a0df-85f1-7d83-a60b-2e57b725c622",
+		ConcurrencyKey: "sha256:pull-ownership-key", OwnershipClaimID: "claim-old",
+		Status: runs.AttemptClaimed, ClaimedAt: testHistoryTime, HeartbeatAt: testHistoryTime,
+	}
+}
+
+func intPointer(value int) *int { return &value }
+
 var testHistoryTime = time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
 
 func newTestRunHistory(t *testing.T, writer runs.Writer) *RunHistory {
@@ -478,6 +576,9 @@ type recordingRunWriter struct {
 	attemptHeartbeats    []runs.ID
 	sideEffectsStarted   []runs.ID
 	attemptsCompleted    []runs.AttemptCompletion
+	takeoverRequests     []runs.AttemptTakeoverRequest
+	takeoverResult       runs.AttemptTakeoverResult
+	takeoverErr          error
 }
 
 func (w *recordingRunWriter) CreateRun(_ context.Context, run runs.Run) error {
@@ -610,6 +711,13 @@ func (w *recordingRunWriter) CompleteAttempt(_ context.Context, completion runs.
 
 func (w *recordingRunWriter) ReconcileAttempt(context.Context, runs.AttemptReconciliation) error {
 	return nil
+}
+
+func (w *recordingRunWriter) PrepareAttemptTakeover(_ context.Context, request runs.AttemptTakeoverRequest) (runs.AttemptTakeoverResult, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.takeoverRequests = append(w.takeoverRequests, request)
+	return w.takeoverResult, w.takeoverErr
 }
 
 type recordingCommentCommandRunner struct {

@@ -179,6 +179,73 @@ type AttemptPage struct {
 	NextCursor string
 }
 
+// AttemptTakeoverRequest asks the durable store to classify any attempt left
+// active under an older Redis ownership claim. Redis remains authoritative for
+// live ownership; PostgreSQL supplies history and a second admission fence.
+type AttemptTakeoverRequest struct {
+	ConcurrencyKey   string
+	OwnershipClaimID string
+	HeartbeatBefore  time.Time
+	RecoveredAt      time.Time
+	Repository       string
+	PullNumber       *int
+	Command          Command
+	Trigger          Trigger
+	Actor            string
+	BaseRef          string
+	HeadRef          string
+	HeadSHA          string
+}
+
+// Validate checks the fencing and logical-operation identity used for a
+// takeover decision.
+func (r AttemptTakeoverRequest) Validate() error {
+	if strings.TrimSpace(r.ConcurrencyKey) == "" {
+		return fmt.Errorf("takeover concurrency key is required")
+	}
+	if strings.ContainsRune(r.ConcurrencyKey, '\x00') {
+		return fmt.Errorf("takeover concurrency key cannot contain NUL bytes")
+	}
+	if strings.TrimSpace(r.OwnershipClaimID) == "" {
+		return fmt.Errorf("takeover ownership claim ID is required")
+	}
+	if r.HeartbeatBefore.IsZero() || r.RecoveredAt.IsZero() || r.RecoveredAt.Before(r.HeartbeatBefore) {
+		return fmt.Errorf("takeover recovery window is invalid")
+	}
+	if strings.TrimSpace(r.Repository) == "" {
+		return fmt.Errorf("takeover repository is required")
+	}
+	if r.PullNumber == nil || *r.PullNumber <= 0 {
+		return fmt.Errorf("takeover pull number must be positive")
+	}
+	if !r.Command.valid() {
+		return fmt.Errorf("invalid takeover command %q", r.Command)
+	}
+	if !r.Trigger.valid() {
+		return fmt.Errorf("invalid takeover trigger %q", r.Trigger)
+	}
+	if strings.TrimSpace(r.HeadSHA) == "" {
+		return fmt.Errorf("takeover head SHA is required")
+	}
+	return nil
+}
+
+// AttemptTakeoverResult reports a durable classification made before a new
+// attempt is admitted. At most one ActiveAttempt or RetryRun is returned.
+// UnreconciledUnknown is populated independently so mutating commands can be
+// blocked until an operator resolves an earlier ambiguous apply.
+type AttemptTakeoverResult struct {
+	RecoveredAttempt    *RunAttempt
+	ActiveAttempt       *RunAttempt
+	RetryRun            *Run
+	UnreconciledUnknown *RunAttempt
+}
+
+// ExecutionRecovery atomically classifies stale attempts before admission.
+type ExecutionRecovery interface {
+	PrepareAttemptTakeover(ctx context.Context, request AttemptTakeoverRequest) (AttemptTakeoverResult, error)
+}
+
 // ExecutionWriter is the execution-facing seam for instance and attempt state.
 // Unlike Phase 1's observational Writer, HA callers may require these writes
 // to succeed before starting side-effecting work.
@@ -205,6 +272,7 @@ type ExecutionReader interface {
 type ExecutionStore interface {
 	ExecutionWriter
 	ExecutionReader
+	ExecutionRecovery
 }
 
 func validateAttemptLifecycle(a RunAttempt) error {

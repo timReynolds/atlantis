@@ -26,7 +26,7 @@ const (
 const runColumns = `id, repository, pull_number, command, trigger, actor, base_ref,
     head_ref, head_sha, status, created_at, started_at, completed_at, metadata`
 
-const projectRunColumns = `id, run_id, project_name, directory, workspace, status,
+const projectRunColumns = `id, run_id, attempt_id, project_name, directory, workspace, status,
     additions, changes, destructions, imports, forgets, started_at, completed_at,
     error_summary, plan_artifact_key, plan_artifact_checksum,
     plan_artifact_created_at, plan_artifact_expires_at, metadata`
@@ -415,12 +415,13 @@ func scanRun(row rowScanner) (runs.Run, error) {
 
 func scanProjectRun(row rowScanner) (runs.ProjectRun, error) {
 	var projectRun runs.ProjectRun
+	var attemptID sql.NullString
 	var startedAt, completedAt sql.NullTime
 	var artifactKey, artifactChecksum sql.NullString
 	var artifactCreatedAt, artifactExpiresAt sql.NullTime
 	var metadata []byte
 	if err := row.Scan(
-		&projectRun.ID, &projectRun.RunID, &projectRun.ProjectName, &projectRun.Directory,
+		&projectRun.ID, &projectRun.RunID, &attemptID, &projectRun.ProjectName, &projectRun.Directory,
 		&projectRun.Workspace, &projectRun.Status, &projectRun.Additions, &projectRun.Changes,
 		&projectRun.Destructions, &projectRun.Imports, &projectRun.Forgets, &startedAt,
 		&completedAt, &projectRun.ErrorSummary, &artifactKey, &artifactChecksum,
@@ -431,6 +432,10 @@ func scanProjectRun(row rowScanner) (runs.ProjectRun, error) {
 	projectRun.StartedAt = timeFromNull(startedAt)
 	projectRun.CompletedAt = timeFromNull(completedAt)
 	projectRun.Metadata = normalizeMetadata(metadata)
+	if attemptID.Valid {
+		id := runs.ID(attemptID.String)
+		projectRun.AttemptID = &id
+	}
 	if artifactKey.Valid {
 		projectRun.PlanArtifact = &runs.ArtifactReference{
 			Key: artifactKey.String, Checksum: artifactChecksum.String,

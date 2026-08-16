@@ -28,6 +28,7 @@ const (
 	resultOutputWriteBatch   = 32
 	runHistoryWriteTimeout   = 5 * time.Second
 	defaultAttemptHeartbeat  = 10 * time.Second
+	defaultAttemptStaleAfter = 30 * time.Second
 )
 
 // RunOutputFinalizer flushes and releases buffered output for a logical Run.
@@ -40,28 +41,41 @@ type RunOutputFinalizer interface {
 // Observation-only writes remain fail-open. Owner-routed attempt admission and
 // side-effect markers fail closed because recovery depends on those records.
 type RunHistory struct {
-	writer           runs.Writer
-	executionWriter  runs.ExecutionWriter
-	logger           logging.SimpleLogging
-	now              func() time.Time
-	newID            func() (runs.ID, error)
-	sessions         sync.Map
-	outputFinalizer  RunOutputFinalizer
-	attemptHeartbeat time.Duration
+	writer            runs.Writer
+	executionWriter   runs.ExecutionWriter
+	executionRecovery runs.ExecutionRecovery
+	logger            logging.SimpleLogging
+	now               func() time.Time
+	newID             func() (runs.ID, error)
+	sessions          sync.Map
+	outputFinalizer   RunOutputFinalizer
+	attemptHeartbeat  time.Duration
+	attemptStaleAfter time.Duration
 }
 
 // NewRunHistory returns a lifecycle observer for a configured durable store.
 func NewRunHistory(writer runs.Writer, logger logging.SimpleLogging) *RunHistory {
 	executionWriter, _ := writer.(runs.ExecutionWriter)
+	executionRecovery, _ := writer.(runs.ExecutionRecovery)
 	return &RunHistory{
-		writer: writer, executionWriter: executionWriter, logger: logger,
-		now: time.Now, newID: runs.NewID, attemptHeartbeat: defaultAttemptHeartbeat,
+		writer: writer, executionWriter: executionWriter, executionRecovery: executionRecovery,
+		logger: logger, now: time.Now, newID: runs.NewID,
+		attemptHeartbeat: defaultAttemptHeartbeat, attemptStaleAfter: defaultAttemptStaleAfter,
 	}
 }
 
 // SetOutputFinalizer connects the output batching decorator to Run completion.
 func (h *RunHistory) SetOutputFinalizer(finalizer RunOutputFinalizer) {
 	h.outputFinalizer = finalizer
+}
+
+// SetAttemptRecoveryTimeout aligns PostgreSQL stale-attempt classification
+// with the Redis ownership lease. A fresh process or attempt heartbeat still
+// blocks takeover even after Redis issues a new claim.
+func (h *RunHistory) SetAttemptRecoveryTimeout(timeout time.Duration) {
+	if h != nil && timeout > 0 {
+		h.attemptStaleAfter = timeout
+	}
 }
 
 // IsRunHistoryComplete reports whether all persistence attempted so far for a
@@ -96,12 +110,12 @@ func (h *RunHistory) Begin(ctx *command.Context, runCommand runs.Command, trigge
 	if h == nil || ctx == nil || h.writer == nil || ctx.RunID != "" {
 		return lifecycle
 	}
+	now := h.now().UTC()
 	runID, err := h.newID()
 	if err != nil {
 		h.logError(ctx.Log, "generating run history ID", err)
 		return lifecycle
 	}
-	now := h.now().UTC()
 	pullNumber := positivePullNumber(ctx.Pull.Num)
 	run := runs.Run{
 		ID: runID, Repository: ctx.Pull.BaseRepo.ID(), PullNumber: pullNumber,
@@ -110,19 +124,124 @@ func (h *RunHistory) Begin(ctx *command.Context, runCommand runs.Command, trigge
 		Status: runs.StatusRunning, CreatedAt: now, StartedAt: &now,
 		Metadata: runMetadata(ctx),
 	}
-	if err := writeRunHistory(func(writeCtx context.Context) error {
-		return h.writer.CreateRun(writeCtx, run)
-	}); err != nil {
-		h.logError(ctx.Log, "creating run history", err)
-		return lifecycle
+	recovery := h.prepareAttemptRecovery(ctx, run, now)
+	if recovery.retryRun != nil {
+		run = *recovery.retryRun
+		runID = run.ID
+	} else {
+		if err := writeRunHistory(func(writeCtx context.Context) error {
+			return h.writer.CreateRun(writeCtx, run)
+		}); err != nil {
+			h.logError(ctx.Log, "creating run history", err)
+			if ctx.ExecutionInstanceID != "" {
+				lifecycle.canExecute = false
+				ctx.CommandHasErrors = true
+			}
+			return lifecycle
+		}
 	}
 	ctx.RunID = runID
 	session := &runSession{run: run, projects: sync.Map{}}
 	h.sessions.Store(runID, session)
 	lifecycle.runID = runID
-	h.appendAudit(ctx.Log, session, string(run.Command)+".requested", nil, now)
+	auditMetadata := recovery.auditMetadata()
+	h.appendAudit(ctx.Log, session, string(run.Command)+".requested", auditMetadata, now)
+	if recovery.err != nil || recovery.blockReason != "" {
+		lifecycle.canExecute = false
+		lifecycle.Fail()
+		ctx.CommandHasErrors = true
+		if recovery.err != nil {
+			h.markPersistenceFailed(ctx.Log, session, "preparing execution attempt takeover", recovery.err)
+		} else {
+			h.logError(ctx.Log, "admitting execution attempt", errors.New(recovery.blockReason))
+		}
+		h.appendAudit(ctx.Log, session, string(run.Command)+".admission_blocked", map[string]any{
+			"reason": recovery.reason(),
+		}, now)
+		return lifecycle
+	}
 	h.beginAttempt(lifecycle, session, now)
 	return lifecycle
+}
+
+type attemptRecoveryDecision struct {
+	retryRun    *runs.Run
+	recovered   *runs.RunAttempt
+	active      *runs.RunAttempt
+	unknown     *runs.RunAttempt
+	blockReason string
+	err         error
+}
+
+func (h *RunHistory) prepareAttemptRecovery(ctx *command.Context, run runs.Run, now time.Time) attemptRecoveryDecision {
+	if ctx.ExecutionInstanceID == "" {
+		return attemptRecoveryDecision{}
+	}
+	if h.executionRecovery == nil {
+		return attemptRecoveryDecision{err: errors.New("execution recovery store is required")}
+	}
+	if ctx.ConcurrencyKey == "" || ctx.OwnershipClaimID == "" {
+		return attemptRecoveryDecision{err: errors.New("routed execution identity is incomplete")}
+	}
+	result, err := h.executionRecovery.PrepareAttemptTakeover(context.Background(), runs.AttemptTakeoverRequest{
+		ConcurrencyKey: ctx.ConcurrencyKey, OwnershipClaimID: ctx.OwnershipClaimID,
+		HeartbeatBefore: now.Add(-h.attemptStaleAfter), RecoveredAt: now,
+		Repository: run.Repository, PullNumber: run.PullNumber, Command: run.Command,
+		Trigger: run.Trigger, Actor: run.Actor, BaseRef: run.BaseRef, HeadRef: run.HeadRef,
+		HeadSHA: run.HeadSHA,
+	})
+	decision := attemptRecoveryDecision{
+		retryRun: result.RetryRun, recovered: result.RecoveredAttempt,
+		active: result.ActiveAttempt, unknown: result.UnreconciledUnknown, err: err,
+	}
+	if err != nil {
+		return decision
+	}
+	if result.ActiveAttempt != nil {
+		decision.blockReason = "another execution attempt remains active for this pull request"
+		return decision
+	}
+	if result.UnreconciledUnknown != nil && commandMayMutateInfrastructure(run.Command) {
+		decision.blockReason = "an earlier infrastructure mutation has an unknown outcome and requires reconciliation"
+	}
+	return decision
+}
+
+func commandMayMutateInfrastructure(runCommand runs.Command) bool {
+	switch runCommand {
+	case runs.CommandApply, runs.CommandImport, runs.CommandStateRemove, runs.CommandDriftRemediation:
+		return true
+	default:
+		return false
+	}
+}
+
+func (d attemptRecoveryDecision) reason() string {
+	if d.err != nil {
+		return d.err.Error()
+	}
+	return d.blockReason
+}
+
+func (d attemptRecoveryDecision) auditMetadata() map[string]any {
+	metadata := map[string]any{}
+	if d.recovered != nil {
+		metadata["recovered_attempt_id"] = d.recovered.ID
+		metadata["recovered_attempt_status"] = d.recovered.Status
+	}
+	if d.retryRun != nil {
+		metadata["retried_run_id"] = d.retryRun.ID
+	}
+	if d.active != nil {
+		metadata["active_attempt_id"] = d.active.ID
+	}
+	if d.unknown != nil {
+		metadata["unreconciled_attempt_id"] = d.unknown.ID
+	}
+	if len(metadata) == 0 {
+		return nil
+	}
+	return metadata
 }
 
 // RunLifecycle controls one logical Run's terminal outcome.
@@ -530,7 +649,7 @@ func (h *RunHistory) beginProject(ctx command.ProjectContext) command.ProjectCon
 	now := h.now().UTC()
 	if err := writeRunHistory(func(writeCtx context.Context) error {
 		return h.writer.CreateProjectRun(writeCtx, runs.ProjectRun{
-			ID: project.id, RunID: ctx.RunID, ProjectName: ctx.ProjectName,
+			ID: project.id, RunID: ctx.RunID, AttemptID: idPointer(ctx.AttemptID), ProjectName: ctx.ProjectName,
 			Directory: ctx.RepoRelDir, Workspace: ctx.Workspace,
 			Status: runs.StatusRunning, StartedAt: &now,
 		})
@@ -538,6 +657,13 @@ func (h *RunHistory) beginProject(ctx command.ProjectContext) command.ProjectCon
 		h.blockRunCompletion(ctx.Log, session, "creating project run history", err)
 	}
 	return ctx
+}
+
+func idPointer(id runs.ID) *runs.ID {
+	if id == "" {
+		return nil
+	}
+	return &id
 }
 
 func (h *RunHistory) recordProject(ctx command.ProjectContext, phase command.Name, output command.ProjectCommandOutput) {

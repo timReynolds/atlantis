@@ -1,0 +1,206 @@
+// Copyright 2026 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/runatlantis/atlantis/server/core/runs"
+)
+
+// PrepareAttemptTakeover classifies an attempt left active by an older Redis
+// ownership claim. Both the attempt and its process heartbeat must be stale;
+// this intentionally prevents a Redis partition alone from authorizing
+// overlapping Terraform execution.
+func (s *Store) PrepareAttemptTakeover(ctx context.Context, request runs.AttemptTakeoverRequest) (runs.AttemptTakeoverResult, error) {
+	if err := request.Validate(); err != nil {
+		return runs.AttemptTakeoverResult{}, fmt.Errorf("validating attempt takeover: %w", err)
+	}
+	request.HeartbeatBefore = normalizeTime(request.HeartbeatBefore)
+	request.RecoveredAt = normalizeTime(request.RecoveredAt)
+	opCtx, cancel := s.operationContext(ctx)
+	defer cancel()
+
+	tx, err := s.db.BeginTx(opCtx, nil)
+	if err != nil {
+		return runs.AttemptTakeoverResult{}, fmt.Errorf("beginning attempt takeover: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := prepareAttemptTakeover(opCtx, tx, request)
+	if err != nil {
+		return runs.AttemptTakeoverResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return runs.AttemptTakeoverResult{}, fmt.Errorf("committing attempt takeover: %w", err)
+	}
+	return result, nil
+}
+
+func prepareAttemptTakeover(ctx context.Context, tx *sql.Tx, request runs.AttemptTakeoverRequest) (runs.AttemptTakeoverResult, error) {
+	var result runs.AttemptTakeoverResult
+	var activeID runs.ID
+	err := tx.QueryRowContext(ctx, `SELECT id FROM run_attempts
+        WHERE concurrency_key = $1 AND status IN ($2, $3)
+        ORDER BY claimed_at DESC, id DESC LIMIT 1 FOR UPDATE`,
+		request.ConcurrencyKey, runs.AttemptClaimed, runs.AttemptRunning,
+	).Scan(&activeID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return result, fmt.Errorf("locking active execution attempt: %w", err)
+	}
+	if err == nil {
+		attempt, err := scanRunAttempt(tx.QueryRowContext(ctx,
+			"SELECT "+runAttemptColumns+" FROM run_attempts WHERE id = $1", activeID))
+		if err != nil {
+			return result, err
+		}
+		instance, err := scanExecutionInstance(tx.QueryRowContext(ctx,
+			"SELECT "+executionInstanceColumns+" FROM execution_instances WHERE id = $1", attempt.InstanceID))
+		if err != nil {
+			return result, err
+		}
+		if attempt.OwnershipClaimID == request.OwnershipClaimID || attemptIsLive(attempt, instance, request) {
+			result.ActiveAttempt = &attempt
+			return result, nil
+		}
+
+		run, err := scanRun(tx.QueryRowContext(ctx,
+			"SELECT "+runColumns+" FROM runs WHERE id = $1 FOR UPDATE", attempt.RunID))
+		if err != nil {
+			return result, err
+		}
+		status, reason := takeoverClassification(attempt, request.OwnershipClaimID)
+		updated, err := tx.ExecContext(ctx, `UPDATE run_attempts
+            SET status = $2, completed_at = $3, heartbeat_at = GREATEST(heartbeat_at, $3),
+                failure_reason = $4
+            WHERE id = $1 AND status IN ($5, $6) AND completed_at IS NULL`,
+			attempt.ID, status, request.RecoveredAt, reason,
+			runs.AttemptClaimed, runs.AttemptRunning)
+		if err != nil {
+			return result, fmt.Errorf("classifying stale execution attempt: %w", err)
+		}
+		count, err := rowsAffected(updated)
+		if err != nil {
+			return result, fmt.Errorf("checking stale execution attempt classification: %w", err)
+		}
+		if count != 1 {
+			return result, fmt.Errorf("classifying stale execution attempt %s: %w", attempt.ID, runs.ErrConflict)
+		}
+		if err := completeRecoveredProjects(ctx, tx, attempt.ID, request.RecoveredAt, reason); err != nil {
+			return result, err
+		}
+
+		attempt.Status = status
+		attempt.CompletedAt = &request.RecoveredAt
+		attempt.HeartbeatAt = maxTime(attempt.HeartbeatAt, request.RecoveredAt)
+		attempt.FailureReason = reason
+		result.RecoveredAttempt = &attempt
+		if status == runs.AttemptInterrupted && runMatchesPlanRetry(run, request) {
+			result.RetryRun = &run
+		} else {
+			runStatus := runs.StatusFailed
+			if status == runs.AttemptUnknown {
+				runStatus = runs.StatusUnknown
+			}
+			if err := completeRecoveredRun(ctx, tx, run, runStatus, request.RecoveredAt); err != nil {
+				return result, err
+			}
+		}
+	}
+
+	unknown, err := latestUnreconciledUnknown(ctx, tx, request.ConcurrencyKey)
+	if err != nil {
+		return result, err
+	}
+	result.UnreconciledUnknown = unknown
+	return result, nil
+}
+
+func attemptIsLive(attempt runs.RunAttempt, instance runs.ExecutionInstance, request runs.AttemptTakeoverRequest) bool {
+	if !attempt.HeartbeatAt.Before(request.HeartbeatBefore) {
+		return true
+	}
+	return instance.StoppedAt == nil && !instance.HeartbeatAt.Before(request.HeartbeatBefore)
+}
+
+func takeoverClassification(attempt runs.RunAttempt, newClaimID string) (runs.AttemptStatus, string) {
+	if attempt.SideEffectStartedAt != nil {
+		return runs.AttemptUnknown, fmt.Sprintf(
+			"ownership moved to claim %q after attempt and instance heartbeats expired; infrastructure side effect may have completed",
+			newClaimID,
+		)
+	}
+	return runs.AttemptInterrupted, fmt.Sprintf(
+		"ownership moved to claim %q after attempt and instance heartbeats expired before an infrastructure side effect",
+		newClaimID,
+	)
+}
+
+func completeRecoveredProjects(ctx context.Context, tx *sql.Tx, attemptID runs.ID, completedAt time.Time, reason string) error {
+	_, err := tx.ExecContext(ctx, `UPDATE project_runs
+        SET status = $2, started_at = COALESCE(started_at, $3), completed_at = $3,
+            error_summary = CASE WHEN error_summary = '' THEN $4 ELSE error_summary END
+        WHERE attempt_id = $1 AND status IN ($5, $6)`,
+		attemptID, runs.StatusFailed, completedAt, reason,
+		runs.StatusPending, runs.StatusRunning)
+	if err != nil {
+		return fmt.Errorf("completing project results for stale attempt: %w", err)
+	}
+	return nil
+}
+
+func runMatchesPlanRetry(run runs.Run, request runs.AttemptTakeoverRequest) bool {
+	if run.Command != runs.CommandPlan || request.Command != runs.CommandPlan {
+		return false
+	}
+	return run.Repository == request.Repository && equalPullNumber(run.PullNumber, request.PullNumber) &&
+		run.Trigger == request.Trigger && run.Actor == request.Actor && run.BaseRef == request.BaseRef &&
+		run.HeadRef == request.HeadRef && run.HeadSHA == request.HeadSHA
+}
+
+func equalPullNumber(left, right *int) bool {
+	return left != nil && right != nil && *left == *right
+}
+
+func completeRecoveredRun(ctx context.Context, tx *sql.Tx, run runs.Run, status runs.Status, completedAt time.Time) error {
+	result, err := tx.ExecContext(ctx, `UPDATE runs
+        SET status = $2, completed_at = $3
+        WHERE id = $1 AND status = $4 AND completed_at IS NULL`,
+		run.ID, status, completedAt, runs.StatusRunning)
+	if err != nil {
+		return fmt.Errorf("completing run for stale attempt: %w", err)
+	}
+	updated, err := rowsAffected(result)
+	if err != nil {
+		return fmt.Errorf("checking completed run for stale attempt: %w", err)
+	}
+	if updated != 1 {
+		return fmt.Errorf("completing run %s for stale attempt from status %q: %w", run.ID, run.Status, runs.ErrConflict)
+	}
+	return nil
+}
+
+func latestUnreconciledUnknown(ctx context.Context, tx *sql.Tx, concurrencyKey string) (*runs.RunAttempt, error) {
+	attempt, err := scanRunAttempt(tx.QueryRowContext(ctx, `SELECT `+runAttemptColumns+` FROM run_attempts
+        WHERE concurrency_key = $1 AND status = $2 AND reconciled_at IS NULL
+        ORDER BY completed_at DESC, id DESC LIMIT 1`, concurrencyKey, runs.AttemptUnknown))
+	if errors.Is(err, runs.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading unreconciled unknown attempt: %w", err)
+	}
+	return &attempt, nil
+}
+
+func maxTime(left, right time.Time) time.Time {
+	if right.After(left) {
+		return right
+	}
+	return left
+}

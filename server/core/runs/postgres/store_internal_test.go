@@ -37,9 +37,11 @@ func TestLoadMigrations(t *testing.T) {
 	require.Contains(t, migrations[3].sql, "run_attempts_one_active_concurrency_key_idx")
 	require.Contains(t, migrations[3].sql, "ON run_attempts (deployment_id, concurrency_key)")
 	require.Contains(t, migrations[3].sql, "status = 'unknown' AND reconciled_at IS NULL")
-	require.Equal(t, int64(5), migrations[len(migrations)-1].version)
-	require.Contains(t, migrations[len(migrations)-1].sql, "'unknown'")
-	require.Contains(t, migrations[len(migrations)-1].sql, "ALTER TABLE project_runs")
+	require.Equal(t, int64(5), migrations[4].version)
+	require.Contains(t, migrations[4].sql, "'unknown'")
+	require.Contains(t, migrations[4].sql, "ALTER TABLE project_runs")
+	require.Equal(t, int64(6), migrations[len(migrations)-1].version)
+	require.Contains(t, migrations[len(migrations)-1].sql, "attempt_id")
 }
 
 func TestRegisterExecutionInstance(t *testing.T) {

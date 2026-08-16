@@ -517,6 +517,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	var runHistory *events.RunHistory
 	if userConfig.RunStoreType == RunStorePostgres {
 		runHistory = events.NewRunHistory(runStore, logger)
+		runHistory.SetAttemptRecoveryTimeout(time.Duration(userConfig.OwnershipTTLSeconds) * time.Second)
 	}
 
 	var projectCmdOutputHandler jobs.ProjectCommandOutputHandler

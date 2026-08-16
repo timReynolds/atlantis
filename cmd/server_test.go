@@ -289,6 +289,13 @@ func TestExecute_ReplicaRoutingValidation(t *testing.T) {
 			expected: "--ownership-ttl-seconds must be at least 10",
 		},
 		{
+			name: "rejects blank deployment ID",
+			configure: func(flags map[string]any) {
+				flags[ReplicaDeploymentIDFlag] = "   "
+			},
+			expected: "--replica-deployment-id must not be blank",
+		},
+		{
 			name: "durable HA requires PostgreSQL history",
 			configure: func(flags map[string]any) {
 				flags[ReplicaDeploymentIDFlag] = "prod-eu"

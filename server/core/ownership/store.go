@@ -45,9 +45,9 @@ func (k Key) Canonical() (string, error) {
 	return fmt.Sprintf("%s\x00%s\x00%d", hostname, repoFullName, k.PullNum), nil
 }
 
-// ConcurrencyKey returns a PostgreSQL-safe digest of the same whole-pull
-// ownership boundary used by Redis. deploymentID namespaces independent
-// Atlantis installations that intentionally share infrastructure.
+// ConcurrencyKey returns a PostgreSQL-safe digest of the whole-pull ownership
+// boundary. deploymentID namespaces durable attempt admission; Redis keeps its
+// unscoped v1 key during rolling upgrades.
 func (k Key) ConcurrencyKey(deploymentID string) (string, error) {
 	canonical, err := k.Canonical()
 	if err != nil {

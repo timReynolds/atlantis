@@ -1407,7 +1407,7 @@ atlantis server --replica-deployment-id="prod-eu"
 ATLANTIS_REPLICA_DEPLOYMENT_ID=prod-eu
 ```
 
-Stable identifier shared by every replica in one durable HA deployment. Setting it enables durable process identity and namespaces Redis ownership keys so independent Atlantis deployments can share Redis without claiming each other's pull requests.
+Stable identifier shared by every replica in one durable HA deployment. Setting it enables durable process identity and namespaces PostgreSQL attempt admission. Redis keeps the upstream v1 ownership key for safe rolling upgrades, so independent deployments must use separate Redis databases.
 
 Durable HA also requires `--run-store-type=postgres`, `--enable-external-stores`, and an S3 `external_stores.plan_store`. Atlantis records a new process-lifetime `instance_id` at startup and persists replica, deployment, version, commit, heartbeat, and graceful-stop information. The `instance_id` is operational history and never changes a logical run ID.
 

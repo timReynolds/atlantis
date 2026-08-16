@@ -193,6 +193,9 @@ func (u UserConfig) ValidateReplicaRouting() error {
 	if !u.replicaRoutingConfigured() {
 		return nil
 	}
+	if u.ReplicaDeploymentID != "" && strings.TrimSpace(u.ReplicaDeploymentID) == "" {
+		return errors.New("--replica-deployment-id must not be blank")
+	}
 	if u.LockingDBType != "redis" {
 		return errors.New("replica routing requires --locking-db-type=redis")
 	}

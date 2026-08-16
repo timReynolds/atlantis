@@ -262,7 +262,45 @@ func TestOwnerStore_UsesProvidedProcessIdentityAndDeploymentNamespace(t *testing
 	require.NoError(t, err)
 	deploymentKey, err := redisOwnershipKey("prod-eu", testOwnershipKey(67))
 	require.NoError(t, err)
-	require.NotEqual(t, defaultKey, deploymentKey)
+	require.Equal(t, defaultKey, deploymentKey, "rolling upgrades must share one ownership fence")
+}
+
+func TestOwnerStore_RejectsNonDurableProvidedProcessIdentity(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redislib.NewClient(&redislib.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+
+	_, err := NewOwnerStoreWithClient(client, OwnerStoreConfig{
+		ReplicaID: "atlantis-0", InstanceID: "process-instance-1",
+		AdvertiseURL: testOwnerURL, TTL: 30 * time.Second,
+	}, logging.NewNoopLogger(t))
+	require.ErrorContains(t, err, "ownership instance ID")
+}
+
+func TestOwnerStore_DeploymentMismatchFailsClosedOnSharedOwnershipKey(t *testing.T) {
+	mr := miniredis.RunT(t)
+	storeA := newTestOwnerStoreForDeployment(t, mr, "prod-eu")
+	storeB := newTestOwnerStoreForDeployment(t, mr, "staging-eu")
+	key := testOwnershipKey(68)
+
+	_, err := storeA.Claim(context.Background(), key)
+	require.NoError(t, err)
+	_, err = storeB.Claim(context.Background(), key)
+	require.ErrorContains(t, err, `ownership belongs to deployment "prod-eu"`)
+}
+
+func TestOwnerStore_DurableReplicaObservesLegacyOwnerDuringRollingUpgrade(t *testing.T) {
+	mr := miniredis.RunT(t)
+	legacy := newTestOwnerStore(t, mr, "legacy-0", testOwnerURL)
+	durable := newTestOwnerStoreForDeployment(t, mr, "prod-eu")
+	key := testOwnershipKey(69)
+
+	legacyRecord, err := legacy.Claim(context.Background(), key)
+	require.NoError(t, err)
+	observed, err := durable.Claim(context.Background(), key)
+	require.NoError(t, err)
+	require.Equal(t, legacyRecord, observed)
+	require.False(t, durable.Owns(key, observed.ClaimID))
 }
 
 func TestOwnerStore_StaleClaimCannotRenewOrReleaseReplacement(t *testing.T) {
@@ -369,6 +407,21 @@ func TestOwnerStore_ReadyFailsAfterPersistentRenewalErrors(t *testing.T) {
 
 func newTestOwnerStore(t *testing.T, mr *miniredis.Miniredis, replicaID, advertiseURL string) *OwnerStore {
 	return newTestOwnerStoreWithTTL(t, mr, replicaID, advertiseURL, 30*time.Second)
+}
+
+func newTestOwnerStoreForDeployment(t *testing.T, mr *miniredis.Miniredis, deploymentID string) *OwnerStore {
+	t.Helper()
+	client := redislib.NewClient(&redislib.Options{Addr: mr.Addr()})
+	store, err := NewOwnerStoreWithClient(client, OwnerStoreConfig{
+		ReplicaID: deploymentID + "-0", DeploymentID: deploymentID,
+		AdvertiseURL: testOwnerURL, TTL: 30 * time.Second,
+	}, logging.NewNoopLogger(t))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = store.Close()
+		_ = client.Close()
+	})
+	return store
 }
 
 func newTestOwnerStoreWithTTL(

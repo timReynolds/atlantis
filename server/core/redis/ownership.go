@@ -165,6 +165,11 @@ func (s *OwnerStore) Claim(ctx context.Context, key ownership.Key) (ownership.Re
 	if err != nil {
 		return ownership.Record{}, err
 	}
+	deploymentID := strings.TrimSpace(s.config.DeploymentID)
+	currentDeploymentID := strings.TrimSpace(current.DeploymentID)
+	if deploymentID != "" && currentDeploymentID != "" && currentDeploymentID != deploymentID {
+		return ownership.Record{}, fmt.Errorf("PR ownership belongs to deployment %q", currentDeploymentID)
+	}
 	if current.InstanceID == s.instanceID {
 		s.mu.Lock()
 		s.owned[redisKey] = ownedRecord{key: key, record: current, serialized: currentSerialized}
@@ -413,16 +418,15 @@ func (s *OwnerStore) clearRenewalFailure() {
 	s.healthMu.Unlock()
 }
 
-func redisOwnershipKey(deploymentID string, key ownership.Key) (string, error) {
-	concurrencyKey, err := key.ConcurrencyKey(deploymentID)
+func redisOwnershipKey(_ string, key ownership.Key) (string, error) {
+	// Keep the upstream v1 Redis key stable across rolling upgrades. The
+	// deployment namespace belongs in durable attempt admission; changing this
+	// key while older replicas are live would create two independent owners.
+	concurrencyKey, err := key.ConcurrencyKey("")
 	if err != nil {
 		return "", err
 	}
-	version := "v1"
-	if strings.TrimSpace(deploymentID) != "" {
-		version = "v2"
-	}
-	return "atlantis:ha:ownership:" + version + ":" + strings.TrimPrefix(concurrencyKey, "sha256:"), nil
+	return "atlantis:ha:ownership:v1:" + strings.TrimPrefix(concurrencyKey, "sha256:"), nil
 }
 
 func decodeOwnerRecord(serialized string) (ownership.Record, error) {

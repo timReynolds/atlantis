@@ -31,6 +31,11 @@ const (
 	runHistoryOutputLimit  = 100
 	runHistoryTimeFormat   = "2006-01-02 15:04:05 UTC"
 	maxReconciliationBytes = 4096
+	// JSON can encode one input byte as a six-byte escape; form encoding can
+	// percent-encode one byte as three. Keep the decoded summary limit
+	// authoritative while still bounding transport overhead.
+	maxReconciliationJSONRequestBytes = maxReconciliationBytes*6 + 512
+	maxReconciliationFormRequestBytes = maxReconciliationBytes*3 + 1024
 )
 
 type runHistoryStore interface {
@@ -93,7 +98,7 @@ func (c *RunHistoryController) ReconcileAttempt(w http.ResponseWriter, r *http.R
 	summary := ""
 	switch mediaType {
 	case "application/json":
-		r.Body = http.MaxBytesReader(w, r.Body, maxReconciliationBytes+512)
+		r.Body = http.MaxBytesReader(w, r.Body, maxReconciliationJSONRequestBytes)
 		decoder := json.NewDecoder(r.Body)
 		decoder.DisallowUnknownFields()
 		var request struct {
@@ -109,7 +114,7 @@ func (c *RunHistoryController) ReconcileAttempt(w http.ResponseWriter, r *http.R
 		}
 		summary = request.Summary
 	case "application/x-www-form-urlencoded":
-		r.Body = http.MaxBytesReader(w, r.Body, maxReconciliationBytes+1024)
+		r.Body = http.MaxBytesReader(w, r.Body, maxReconciliationFormRequestBytes)
 		if err := r.ParseForm(); err != nil {
 			c.respondError(w, r, http.StatusBadRequest, fmt.Errorf("parsing reconciliation form: %w", err))
 			return
@@ -230,11 +235,16 @@ func (c *RunHistoryController) GetRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	attemptItems := make([]web_templates.RunHistoryAttempt, 0, len(attemptPage.Attempts))
+	instances := make(map[runs.ID]runs.ExecutionInstance)
 	for _, attempt := range attemptPage.Attempts {
-		instance, err := c.Store.GetInstance(r.Context(), attempt.InstanceID)
-		if err != nil {
-			c.respondStoreError(w, r, err)
-			return
+		instance, ok := instances[attempt.InstanceID]
+		if !ok {
+			instance, err = c.Store.GetInstance(r.Context(), attempt.InstanceID)
+			if err != nil {
+				c.respondStoreError(w, r, err)
+				return
+			}
+			instances[attempt.InstanceID] = instance
 		}
 		attemptItems = append(attemptItems, c.presentAttempt(attempt, instance))
 	}

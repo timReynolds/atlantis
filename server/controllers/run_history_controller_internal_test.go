@@ -5,6 +5,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -148,6 +149,84 @@ func TestRunHistoryControllerReconcilesUnknownAttemptThroughConfirmedAPI(t *test
 	require.Contains(t, recorder.Body.String(), `"status":"reconciled"`)
 }
 
+func TestRunHistoryControllerAllowsMaximumDecodedSummaryAfterTransportEncoding(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		summary     string
+		contentType string
+		body        func(*RunHistoryController, runs.ID, runs.ID, string) string
+		wantStatus  int
+	}{
+		{
+			name: "JSON escapes", summary: strings.Repeat("\"", maxReconciliationBytes),
+			contentType: "application/json", wantStatus: http.StatusOK,
+			body: func(_ *RunHistoryController, _, _ runs.ID, summary string) string {
+				encoded, err := json.Marshal(map[string]string{"summary": summary})
+				require.NoError(t, err)
+				return string(encoded)
+			},
+		},
+		{
+			name: "form percent encoding", summary: strings.Repeat("é", maxReconciliationBytes/2),
+			contentType: "application/x-www-form-urlencoded", wantStatus: http.StatusSeeOther,
+			body: func(controller *RunHistoryController, runID, attemptID runs.ID, summary string) string {
+				return url.Values{
+					"csrf_token": {controller.reconciliationToken(runID, attemptID)},
+					"summary":    {summary},
+				}.Encode()
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			runID := mustRunHistoryID(t)
+			attemptID := mustRunHistoryID(t)
+			reader := &recordingRunReader{attemptResult: runs.RunAttempt{
+				ID: attemptID, RunID: runID, Status: runs.AttemptUnknown,
+			}}
+			controller := testRunHistoryController(t, reader, &recordingHistoryTemplate{})
+			controller.WebAuthentication = true
+			request := mux.SetURLVars(httptest.NewRequest(http.MethodPost,
+				"/runs/x/attempts/y/reconcile",
+				strings.NewReader(testCase.body(controller, runID, attemptID, testCase.summary))),
+				map[string]string{"run-id": string(runID), "attempt-id": string(attemptID)})
+			request.SetBasicAuth("operator", "password")
+			request.Header.Set("Content-Type", testCase.contentType)
+			request.Header.Set("X-Atlantis-Reconcile-Unknown", "true")
+			recorder := httptest.NewRecorder()
+
+			controller.ReconcileAttempt(recorder, request)
+
+			require.Equal(t, testCase.wantStatus, recorder.Code)
+			require.Equal(t, maxReconciliationBytes, len([]byte(reader.reconciliation.Summary)))
+			require.Equal(t, testCase.summary, reader.reconciliation.Summary)
+		})
+	}
+}
+
+func TestRunHistoryControllerRejectsSummaryOverDecodedLimit(t *testing.T) {
+	runID := mustRunHistoryID(t)
+	attemptID := mustRunHistoryID(t)
+	reader := &recordingRunReader{attemptResult: runs.RunAttempt{
+		ID: attemptID, RunID: runID, Status: runs.AttemptUnknown,
+	}}
+	controller := testRunHistoryController(t, reader, &recordingHistoryTemplate{})
+	controller.WebAuthentication = true
+	encoded, err := json.Marshal(map[string]string{"summary": strings.Repeat("a", maxReconciliationBytes+1)})
+	require.NoError(t, err)
+	request := mux.SetURLVars(httptest.NewRequest(http.MethodPost,
+		"/runs/x/attempts/y/reconcile", strings.NewReader(string(encoded))),
+		map[string]string{"run-id": string(runID), "attempt-id": string(attemptID)})
+	request.SetBasicAuth("operator", "password")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Atlantis-Reconcile-Unknown", "true")
+	recorder := httptest.NewRecorder()
+
+	controller.ReconcileAttempt(recorder, request)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Empty(t, reader.reconciliation.ID)
+}
+
 func TestRunHistoryControllerReconciliationRequiresConfirmationHeader(t *testing.T) {
 	reader := &recordingRunReader{}
 	controller := testRunHistoryController(t, reader, &recordingHistoryTemplate{})
@@ -226,11 +305,18 @@ func TestRunHistoryControllerPresentsAttemptReplicaIdentity(t *testing.T) {
 	reader := &recordingRunReader{
 		getRunResult: runs.Run{ID: runID, Repository: "org/repo", Command: runs.CommandPlan,
 			Trigger: runs.TriggerComment, Status: runs.StatusRunning, CreatedAt: startedAt, StartedAt: &startedAt},
-		attemptPage: runs.AttemptPage{Attempts: []runs.RunAttempt{{
-			ID: attemptID, RunID: runID, InstanceID: instanceID,
-			ConcurrencyKey: "sha256:key", OwnershipClaimID: "claim-2",
-			Status: runs.AttemptRunning, ClaimedAt: startedAt, StartedAt: &startedAt, HeartbeatAt: startedAt,
-		}}, NextCursor: "next-attempt"},
+		attemptPage: runs.AttemptPage{Attempts: []runs.RunAttempt{
+			{
+				ID: attemptID, RunID: runID, InstanceID: instanceID,
+				ConcurrencyKey: "sha256:key", OwnershipClaimID: "claim-2",
+				Status: runs.AttemptRunning, ClaimedAt: startedAt, StartedAt: &startedAt, HeartbeatAt: startedAt,
+			},
+			{
+				ID: mustRunHistoryID(t), RunID: runID, InstanceID: instanceID,
+				ConcurrencyKey: "sha256:key", OwnershipClaimID: "claim-1",
+				Status: runs.AttemptInterrupted, ClaimedAt: startedAt, HeartbeatAt: startedAt,
+			},
+		}, NextCursor: "next-attempt"},
 		instanceResult: runs.ExecutionInstance{
 			ID: instanceID, ReplicaID: "atlantis-2", DeploymentID: "production",
 			StartedAt: startedAt, HeartbeatAt: startedAt, Version: "1.2.3", Commit: "abc123",
@@ -250,10 +336,11 @@ func TestRunHistoryControllerPresentsAttemptReplicaIdentity(t *testing.T) {
 	require.Equal(t, http.StatusOK, recorder.Code)
 	data, ok := template.data.(web_templates.RunHistoryDetailData)
 	require.True(t, ok)
-	require.Len(t, data.Attempts, 1)
+	require.Len(t, data.Attempts, 2)
 	require.Equal(t, "atlantis-2", data.Attempts[0].ReplicaID)
 	require.Equal(t, "production", data.Attempts[0].DeploymentID)
 	require.Equal(t, "abc123", data.Attempts[0].Commit)
+	require.Equal(t, 1, reader.instanceReads)
 	require.Equal(t, "current-attempt", reader.attemptPageRequest.Cursor)
 	require.Contains(t, data.AttemptNextPath, "attempt_cursor=next-attempt")
 }
@@ -356,6 +443,7 @@ type recordingRunReader struct {
 	attemptPageRequest runs.PageRequest
 	attemptResult      runs.RunAttempt
 	instanceResult     runs.ExecutionInstance
+	instanceReads      int
 	reconciliation     runs.AttemptReconciliation
 }
 
@@ -408,6 +496,7 @@ func (r *recordingRunReader) ListAuditEvents(_ context.Context, filter runs.Audi
 
 func (r *recordingRunReader) GetInstance(context.Context, runs.ID) (runs.ExecutionInstance, error) {
 	r.markRead()
+	r.instanceReads++
 	return r.instanceResult, nil
 }
 

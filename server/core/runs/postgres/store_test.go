@@ -120,6 +120,15 @@ func TestStoreConformance(t *testing.T) {
 	attemptPage, err := store.ListRunAttempts(ctx, runID, runs.PageRequest{Limit: 1})
 	require.NoError(t, err)
 	require.Len(t, attemptPage.Attempts, 1)
+	replacementStartedAt := startedAt.Add(901 * time.Millisecond)
+	replacementSideEffectAt := startedAt.Add(925 * time.Millisecond)
+	replacementCompletedAt := startedAt.Add(950 * time.Millisecond)
+	require.NoError(t, store.StartAttempt(ctx, replacementAttempt.ID, replacementStartedAt))
+	require.NoError(t, store.MarkAttemptSideEffectStarted(ctx, replacementAttempt.ID, replacementSideEffectAt))
+	require.NoError(t, store.CompleteAttempt(ctx, runs.AttemptCompletion{
+		ID: replacementAttempt.ID, Status: runs.AttemptUnknown, CompletedAt: replacementCompletedAt,
+		FailureReason: "simulated second process loss after apply started",
+	}))
 
 	projectRun := runs.ProjectRun{
 		ID: projectRunID, RunID: runID, ProjectName: "network",
@@ -203,6 +212,18 @@ func TestStoreConformance(t *testing.T) {
 
 	retentionCutoff := completedAt.Add(time.Second)
 	retention, err := store.ApplyRetention(ctx, runs.RetentionPolicy{
+		RunMetadataBefore: &retentionCutoff,
+	})
+	require.NoError(t, err)
+	require.Equal(t, runs.RetentionResult{}, retention,
+		"unreconciled unknown attempts must retain their run, project output, and admission fence")
+	_, err = store.GetRun(ctx, runID)
+	require.NoError(t, err)
+	require.NoError(t, store.ReconcileAttempt(ctx, runs.AttemptReconciliation{
+		ID: replacementAttempt.ID, At: completedAt.Add(time.Millisecond), Actor: "operator",
+		Summary: "state inspected after retention protection test",
+	}))
+	retention, err = store.ApplyRetention(ctx, runs.RetentionPolicy{
 		RunMetadataBefore: &retentionCutoff,
 	})
 	require.NoError(t, err)

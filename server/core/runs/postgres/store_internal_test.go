@@ -202,16 +202,16 @@ func TestApplyRetentionKeepsCutoffsIndependent(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta("WHERE drift_status.identity_hash = retained_drift.identity_hash\n          AND drift_status.last_checked < $1")).
 		WithArgs(driftBefore, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 6))
 	runArgs := []driver.Value{runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, retentionBatchSize}
-	mock.ExpectExec("WITH retained_output AS").
+	mock.ExpectExec("(?s)WITH retained_output AS.*run_attempts.*reconciled_at IS NULL").
 		WithArgs(runArgs...).WillReturnResult(sqlmock.NewResult(0, 8))
-	mock.ExpectExec("WITH retained_projects AS").
+	mock.ExpectExec("(?s)WITH retained_projects AS.*run_attempts.*reconciled_at IS NULL").
 		WithArgs(runArgs...).WillReturnResult(sqlmock.NewResult(0, 5))
-	mock.ExpectExec("WITH retained_events AS").
+	mock.ExpectExec("(?s)WITH retained_events AS.*run_attempts.*reconciled_at IS NULL").
 		WithArgs(runArgs...).WillReturnResult(sqlmock.NewResult(0, 2))
-	mock.ExpectExec("WITH retained_runs AS").
+	mock.ExpectExec("(?s)WITH retained_runs AS.*run_attempts.*reconciled_at IS NULL").
 		WithArgs(runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, retentionBatchSize).
 		WillReturnResult(sqlmock.NewResult(0, retentionBatchSize))
-	mock.ExpectExec("WITH retained_runs AS").
+	mock.ExpectExec("(?s)WITH retained_runs AS.*run_attempts.*reconciled_at IS NULL").
 		WithArgs(runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, retentionBatchSize).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 

@@ -82,6 +82,27 @@ func TestRunHistoryPlanStoreRecordsPlanInsideAPIApplyLifecycle(t *testing.T) {
 	require.Len(t, writer.artifactUpdates, 1)
 }
 
+func TestRunHistoryPlanStoreRecordsPlanInsideDriftRemediationLifecycle(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	runCtx := testRunContext(t)
+	runCtx.API = true
+	lifecycle := history.Begin(runCtx, runs.CommandDriftRemediation, runs.TriggerAPI)
+	defer lifecycle.Finish()
+	projectCtx := history.beginProject(command.ProjectContext{
+		RunID: runCtx.RunID, ProjectName: "network", RepoRelDir: "terraform/network",
+		Workspace: "production", WorkflowIdentity: testWorkflowIdentity, Log: runCtx.Log,
+	})
+	planPath := filepath.Join(t.TempDir(), "network.tfplan")
+	require.NoError(t, os.WriteFile(planPath, []byte("drift remediation plan"), 0o600))
+	delegate := &externalPlanStore{key: "plans/drift-remediation/network.tfplan"}
+	store := NewRunHistoryPlanStore(delegate, history, logging.NewNoopLogger(t))
+
+	require.NoError(t, store.Save(projectCtx, planPath))
+	require.True(t, delegate.saved)
+	require.Len(t, writer.artifactUpdates, 1)
+}
+
 func TestRunHistoryPlanStoreLeavesLocalStoreUnwrapped(t *testing.T) {
 	local := &runtime.LocalPlanStore{}
 	store := NewRunHistoryPlanStore(local, NewRunHistory(&recordingRunWriter{}, logging.NewNoopLogger(t)), logging.NewNoopLogger(t))

@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -128,7 +129,7 @@ func BenchmarkReplicaRoutingConcurrentPRs(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for iteration := 0; iteration < b.N; iteration++ {
-				basePull := iteration*1000 + 1000
+				basePull := int(haBenchmarkPullNumber.Add(int64(pullCount))) - pullCount + 1
 				dispatchConcurrentPullCommands(b, h, basePull, pullCount, command.Plan, false)
 				dispatchConcurrentPullCommands(b, h, basePull, pullCount, command.Apply, true)
 			}
@@ -138,6 +139,8 @@ func BenchmarkReplicaRoutingConcurrentPRs(b *testing.B) {
 		})
 	}
 }
+
+var haBenchmarkPullNumber atomic.Int64
 
 func dispatchConcurrentPullCommands(
 	b *testing.B,

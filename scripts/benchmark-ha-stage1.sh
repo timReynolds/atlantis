@@ -18,11 +18,12 @@ docker run --rm -d \
   -e POSTGRES_PASSWORD=atlantis_test \
   -e POSTGRES_DB=atlantis_test \
   -p 127.0.0.1::5432 \
-  postgres:16-alpine >/dev/null
+  postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685 >/dev/null
 docker run --rm -d \
   --name "${benchmark_redis}" \
   -p 127.0.0.1::6379 \
-  redis:7-alpine redis-server --save '' --appendonly no >/dev/null
+  redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2 \
+  redis-server --save '' --appendonly no >/dev/null
 
 for attempt in $(seq 1 30); do
   if docker exec "${benchmark_postgres}" pg_isready -U postgres -d atlantis_test >/dev/null 2>&1 && \

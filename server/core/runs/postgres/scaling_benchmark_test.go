@@ -15,8 +15,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// BenchmarkStoreProjectHistoryFanout measures the durable metadata path shared
-// by Phase 1 and Stage 1. It deliberately excludes Git checkout, Terraform,
+// BenchmarkStoreProjectHistoryFanout measures the Stage 1 attempt-scoped
+// durable metadata path. It deliberately excludes Git checkout, Terraform,
 // providers, S3, Redis, and VCS APIs so those bottlenecks remain visible in the
 // deployment benchmark rather than being hidden inside a synthetic score.
 func BenchmarkStoreProjectHistoryFanout(b *testing.B) {
@@ -26,12 +26,18 @@ func BenchmarkStoreProjectHistoryFanout(b *testing.B) {
 	}
 	for _, projectCount := range []int{10, 50, 100, 300, 600} {
 		b.Run(fmt.Sprintf("projects-%03d", projectCount), func(b *testing.B) {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			defer cancel()
+			ctx := context.Background()
 			store, cleanup := newIsolatedStore(b, ctx, rawURL)
 			defer cleanup()
 			store.Database().SetMaxOpenConns(10)
 			store.Database().SetMaxIdleConns(5)
+			instanceID, err := runs.NewID()
+			require.NoError(b, err)
+			instanceStartedAt := time.Now().UTC()
+			require.NoError(b, store.RegisterInstance(ctx, runs.ExecutionInstance{
+				ID: instanceID, ReplicaID: "benchmark-replica", DeploymentID: "benchmark",
+				StartedAt: instanceStartedAt, HeartbeatAt: instanceStartedAt,
+			}))
 			b.ReportAllocs()
 			b.ResetTimer()
 
@@ -47,6 +53,15 @@ func BenchmarkStoreProjectHistoryFanout(b *testing.B) {
 					HeadSHA: fmt.Sprintf("%040x", iteration+1), Status: runs.StatusRunning,
 					CreatedAt: startedAt, StartedAt: &startedAt,
 				}))
+				attemptID, err := runs.NewID()
+				require.NoError(b, err)
+				require.NoError(b, store.CreateAttempt(ctx, runs.RunAttempt{
+					ID: attemptID, RunID: runID, InstanceID: instanceID, DeploymentID: "benchmark",
+					ConcurrencyKey:   fmt.Sprintf("benchmark/pull/%d", pullNumber),
+					OwnershipClaimID: fmt.Sprintf("benchmark-claim-%d", iteration),
+					Status:           runs.AttemptClaimed, ClaimedAt: startedAt, HeartbeatAt: startedAt,
+				}))
+				require.NoError(b, store.StartAttempt(ctx, attemptID, startedAt))
 
 				errors := make(chan error, projectCount)
 				var group sync.WaitGroup
@@ -60,8 +75,9 @@ func BenchmarkStoreProjectHistoryFanout(b *testing.B) {
 							return
 						}
 						project := runs.ProjectRun{
-							ID: projectID, RunID: runID, ProjectName: fmt.Sprintf("project-%03d", index),
-							Directory: fmt.Sprintf("terraform/project-%03d", index), Workspace: "default",
+							ID: projectID, RunID: runID, AttemptID: &attemptID,
+							ProjectName: fmt.Sprintf("project-%03d", index),
+							Directory:   fmt.Sprintf("terraform/project-%03d", index), Workspace: "default",
 							Status: runs.StatusRunning, StartedAt: &startedAt,
 						}
 						if err := store.CreateProjectRun(ctx, project); err != nil {
@@ -80,12 +96,16 @@ func BenchmarkStoreProjectHistoryFanout(b *testing.B) {
 				for err := range errors {
 					require.NoError(b, err)
 				}
+				completedAt := time.Now().UTC()
+				require.NoError(b, store.CompleteAttempt(ctx, runs.AttemptCompletion{
+					ID: attemptID, Status: runs.AttemptSucceeded, CompletedAt: completedAt,
+				}))
 				require.NoError(b, store.CompleteRun(ctx, runs.RunCompletion{
-					ID: runID, Status: runs.StatusSucceeded, CompletedAt: time.Now().UTC(),
+					ID: runID, Status: runs.StatusSucceeded, CompletedAt: completedAt,
 				}))
 			}
 			b.ReportMetric(float64(projectCount), "projects/op")
-			b.ReportMetric(float64(projectCount*2+2), "postgres_writes/op")
+			b.ReportMetric(float64(projectCount*2+5), "postgres_writes/op")
 		})
 	}
 }

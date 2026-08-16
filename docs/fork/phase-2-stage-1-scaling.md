@@ -12,23 +12,23 @@ Run:
 make benchmark-ha-stage1
 ```
 
-The target provisions disposable PostgreSQL 16 and Redis 7 containers. Override `ATLANTIS_HA_BENCHTIME` and `ATLANTIS_HA_BENCH_COUNT` for longer samples. The default is a quick developer signal; the results below used five operations and five repetitions for PostgreSQL, and three operations and three repetitions for Redis routing.
+The target provisions digest-pinned disposable PostgreSQL 16 and Redis 7 containers. Override `ATLANTIS_HA_BENCHTIME` and `ATLANTIS_HA_BENCH_COUNT` for longer samples. Store calls have their normal per-operation timeout rather than a benchmark-wide deadline, so samples longer than ten minutes remain valid. The default is a quick developer signal; the PostgreSQL results below used five operations and five repetitions, while the Redis routing results used three operations and three repetitions.
 
 Environment: Apple M4, macOS arm64, Go 1.26.5, Docker Desktop, PostgreSQL 16, Redis 7. PostgreSQL used Atlantis's production default of 10 open and 5 idle connections.
 
 ## PostgreSQL durable project history
 
-The identical benchmark was run on the Phase 1 tip `a914b957` and the Stage 1 code. Each operation creates one Run and concurrently creates and completes every ProjectRun. It excludes attempts so the comparison isolates whether the Stage 1 schema and attempt-scoped project identity regress the existing Phase 1 workload.
+The Phase 1 baseline on tip `a914b957` created one Run and concurrently created and completed every ProjectRun. The Stage 1 measurement adds the production HA lifecycle: it registers one process identity outside the timed loop, then creates, starts, and completes one RunAttempt per operation and attaches every ProjectRun to that attempt. The comparison therefore measures the total durable HA lifecycle overhead rather than only the schema change.
 
-| Projects | Writes per operation | Phase 1 median | Stage 1 median | Change | Stage 1 allocated |
+| Projects | Stage 1 writes per operation | Phase 1 legacy median | Stage 1 HA median | HA lifecycle overhead | Stage 1 allocated |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10 | 22 | 15.0 ms | 16.1 ms | +7.4% | 0.62 MiB |
-| 50 | 102 | 21.5 ms | 23.1 ms | +7.5% | 0.86 MiB |
-| 100 | 202 | 32.6 ms | 32.5 ms | -0.6% | 1.15 MiB |
-| 300 | 602 | 71.0 ms | 70.1 ms | -1.2% | 2.35 MiB |
-| 600 | 1,202 | 131.3 ms | 139.0 ms | +5.9% | 4.13 MiB |
+| 10 | 25 | 15.0 ms | 22.5 ms | +49.9% | 0.61 MiB |
+| 50 | 105 | 21.5 ms | 27.2 ms | +26.5% | 0.87 MiB |
+| 100 | 205 | 32.6 ms | 38.8 ms | +19.0% | 1.18 MiB |
+| 300 | 605 | 71.0 ms | 83.2 ms | +17.2% | 2.44 MiB |
+| 600 | 1,205 | 131.3 ms | 153.9 ms | +17.2% | 4.31 MiB |
 
-The cost remains approximately linear. At 600 projects the local database accepted roughly 8,650 metadata writes per second. The Stage 1 median is within 8% of Phase 1 at every size; this sample is too small to claim a statistically significant improvement or regression.
+The cost remains approximately linear. At 600 projects the local database accepted roughly 7,830 metadata writes per second. The fixed three-write attempt lifecycle is most visible at 10 projects; from 100 through 600 projects, total Stage 1 durable-history wall time was 17–19% above the pre-attempt Phase 1 path. This sample is too small to establish a production capacity target, but it now covers the foreign key, attempt index, and attempt state writes used by every routed execution.
 
 An initial benchmark with an unlimited `database/sql` pool failed at 100 projects because PostgreSQL's default 100-client limit was exhausted. Pinning the benchmark to Atlantis's configured 10-connection production default removed the failure through 600 projects. Connection-pool bounds are therefore a release requirement, not a tuning afterthought.
 

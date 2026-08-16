@@ -1,0 +1,183 @@
+// Copyright 2026 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package postgres_test
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"net/url"
+	"os"
+	"testing"
+	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/runatlantis/atlantis/server/core/runs"
+	"github.com/runatlantis/atlantis/server/core/runs/postgres"
+	"github.com/stretchr/testify/require"
+)
+
+// TestStoreConformance exercises the complete adapter against a real
+// PostgreSQL server. It is opt-in so unit-test environments do not require a
+// database. Example:
+//
+//	ATLANTIS_POSTGRES_TEST_URL=postgres://localhost/atlantis_test go test ./server/core/runs/postgres
+func TestStoreConformance(t *testing.T) {
+	if testing.Short() {
+		t.Skip("PostgreSQL conformance test is disabled in short mode")
+	}
+	testURL := os.Getenv("ATLANTIS_POSTGRES_TEST_URL")
+	if testURL == "" {
+		t.Skip("ATLANTIS_POSTGRES_TEST_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	store, cleanup := newIsolatedStore(t, ctx, testURL)
+	defer cleanup()
+
+	createdAt := time.Now().UTC().Truncate(time.Microsecond)
+	runID := mustID(t)
+	projectRunID := mustID(t)
+	auditID := mustID(t)
+	pull := 17
+	run := runs.Run{
+		ID: runID, Repository: "example/infrastructure", PullNumber: &pull,
+		Command: runs.CommandPlan, Trigger: runs.TriggerComment, Actor: "operator",
+		BaseRef: "main", HeadRef: "feature", HeadSHA: "deadbeef",
+		Status: runs.StatusPending, CreatedAt: createdAt,
+		Metadata: runs.Metadata(`{"source":"conformance"}`),
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+	require.NoError(t, store.CreateRun(ctx, run), "create replay must be idempotent")
+
+	startedAt := createdAt.Add(time.Second)
+	require.NoError(t, store.StartRun(ctx, runID, startedAt))
+	require.NoError(t, store.StartRun(ctx, runID, startedAt), "start replay must be idempotent")
+	projectRun := runs.ProjectRun{
+		ID: projectRunID, RunID: runID, ProjectName: "network",
+		Directory: "terraform/network", Workspace: "production",
+		Status: runs.StatusPending,
+	}
+	require.NoError(t, store.CreateProjectRun(ctx, projectRun))
+	require.NoError(t, store.StartProjectRun(ctx, projectRunID, startedAt))
+
+	chunks := []runs.OutputChunk{
+		{ProjectRunID: projectRunID, Sequence: 0, Stream: runs.OutputStdout, Content: "Terraform will perform the following actions:\n", CreatedAt: startedAt},
+		{ProjectRunID: projectRunID, Sequence: 1, Stream: runs.OutputStderr, Content: "warning\n", CreatedAt: startedAt.Add(time.Millisecond)},
+	}
+	require.NoError(t, store.AppendOutput(ctx, chunks))
+	require.NoError(t, store.AppendOutput(ctx, chunks), "output replay must be idempotent")
+
+	completedAt := startedAt.Add(time.Second)
+	artifactCreatedAt := startedAt
+	artifactExpiresAt := completedAt.Add(24 * time.Hour)
+	projectCompletion := runs.ProjectRunCompletion{
+		ID: projectRunID, Status: runs.StatusSucceeded, Additions: 1, Changes: 2,
+		CompletedAt: completedAt,
+		PlanArtifact: &runs.ArtifactReference{
+			Key: "plans/example/17/network.tfplan", Checksum: "sha256:abc",
+			CreatedAt: artifactCreatedAt, ExpiresAt: &artifactExpiresAt,
+		},
+	}
+	require.NoError(t, store.CompleteProjectRun(ctx, projectCompletion))
+	require.NoError(t, store.CompleteProjectRun(ctx, projectCompletion), "completion replay must be idempotent")
+	require.NoError(t, store.CompleteRun(ctx, runs.RunCompletion{
+		ID: runID, Status: runs.StatusSucceeded, CompletedAt: completedAt,
+	}))
+
+	event := runs.AuditEvent{
+		ID: auditID, Repository: run.Repository, PullNumber: &pull, RunID: &runID,
+		Actor: "operator", EventType: "plan.completed",
+		Metadata: runs.Metadata(`{"result":"succeeded"}`), CreatedAt: completedAt,
+	}
+	require.NoError(t, store.AppendAuditEvent(ctx, event))
+	require.NoError(t, store.AppendAuditEvent(ctx, event), "audit replay must be idempotent")
+
+	storedRun, err := store.GetRun(ctx, runID)
+	require.NoError(t, err)
+	require.Equal(t, runs.StatusSucceeded, storedRun.Status)
+	require.Equal(t, run.HeadSHA, storedRun.HeadSHA)
+	storedProject, err := store.GetProjectRun(ctx, projectRunID)
+	require.NoError(t, err)
+	require.Equal(t, projectCompletion.Additions, storedProject.Additions)
+	require.Equal(t, projectCompletion.PlanArtifact, storedProject.PlanArtifact)
+
+	runPage, err := store.ListRuns(ctx, runs.RunFilter{
+		Repository: run.Repository, PullNumber: &pull,
+		Commands: []runs.Command{runs.CommandPlan}, Statuses: []runs.Status{runs.StatusSucceeded},
+	}, runs.PageRequest{Limit: 1})
+	require.NoError(t, err)
+	require.Len(t, runPage.Runs, 1)
+	projectPage, err := store.ListProjectRuns(ctx, runID, runs.ProjectRunFilter{
+		Directory: projectRun.Directory, Statuses: []runs.Status{runs.StatusSucceeded},
+	}, runs.PageRequest{Limit: 1})
+	require.NoError(t, err)
+	require.Len(t, projectPage.ProjectRuns, 1)
+	outputPage, err := store.GetOutput(ctx, projectRunID, -1, 1)
+	require.NoError(t, err)
+	require.Len(t, outputPage.Chunks, 1)
+	require.NotNil(t, outputPage.NextSequence)
+	secondOutputPage, err := store.GetOutput(ctx, projectRunID, *outputPage.NextSequence, 1)
+	require.NoError(t, err)
+	require.Len(t, secondOutputPage.Chunks, 1)
+	require.Equal(t, int64(1), secondOutputPage.Chunks[0].Sequence)
+	auditPage, err := store.ListAuditEvents(ctx, runs.AuditFilter{
+		Repository: run.Repository, RunID: &runID, EventTypes: []string{"plan.completed"},
+	}, runs.PageRequest{Limit: 1})
+	require.NoError(t, err)
+	require.Len(t, auditPage.Events, 1)
+
+	retentionCutoff := completedAt.Add(time.Second)
+	retention, err := store.ApplyRetention(ctx, runs.RetentionPolicy{
+		RunMetadataBefore: &retentionCutoff,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), retention.RunsDeleted)
+	require.Equal(t, int64(1), retention.ProjectRunsDeleted)
+	require.Equal(t, int64(2), retention.OutputChunksDeleted)
+	_, err = store.GetRun(ctx, runID)
+	require.ErrorIs(t, err, runs.ErrNotFound)
+}
+
+func newIsolatedStore(t *testing.T, ctx context.Context, rawURL string) (*postgres.Store, func()) {
+	t.Helper()
+	parsed, err := url.Parse(rawURL)
+	require.NoError(t, err)
+	require.NotEmpty(t, parsed.Scheme, "ATLANTIS_POSTGRES_TEST_URL must be a PostgreSQL URL")
+	schema := fmt.Sprintf("atlantis_runs_test_%d", time.Now().UnixNano())
+
+	admin, err := sql.Open("pgx", rawURL)
+	require.NoError(t, err)
+	require.NoError(t, admin.PingContext(ctx))
+	_, err = admin.ExecContext(ctx, "CREATE SCHEMA "+schema)
+	require.NoError(t, err)
+
+	query := parsed.Query()
+	query.Set("search_path", schema)
+	parsed.RawQuery = query.Encode()
+	store, err := postgres.New(ctx, postgres.Config{URL: parsed.String(), OperationTimeout: 5 * time.Second})
+	if err != nil {
+		_, _ = admin.ExecContext(context.Background(), "DROP SCHEMA "+schema+" CASCADE")
+		_ = admin.Close()
+	}
+	require.NoError(t, err)
+
+	cleanup := func() {
+		require.NoError(t, store.Close())
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, err := admin.ExecContext(cleanupCtx, "DROP SCHEMA "+schema+" CASCADE")
+		require.NoError(t, err)
+		require.NoError(t, admin.Close())
+	}
+	return store, cleanup
+}
+
+func mustID(t *testing.T) runs.ID {
+	t.Helper()
+	id, err := runs.NewID()
+	require.NoError(t, err)
+	return id
+}

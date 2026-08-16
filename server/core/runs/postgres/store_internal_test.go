@@ -135,7 +135,7 @@ func TestApplyRetentionKeepsCutoffsIndependent(t *testing.T) {
 		WithArgs(outputBefore, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 4))
 	mock.ExpectExec("WITH retained_events AS").
 		WithArgs(auditBefore, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 2))
-	mock.ExpectExec("WITH retained_drift AS").
+	mock.ExpectExec(regexp.QuoteMeta("WHERE drift_status.identity_hash = retained_drift.identity_hash\n          AND drift_status.last_checked < $1")).
 		WithArgs(driftBefore, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 6))
 	runArgs := []driver.Value{runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, retentionBatchSize}
 	mock.ExpectExec("WITH retained_output AS").

@@ -61,7 +61,8 @@ func (s *Store) ApplyRetention(ctx context.Context, policy runs.RetentionPolicy)
         )
         DELETE FROM drift_status
         USING retained_drift
-        WHERE drift_status.identity_hash = retained_drift.identity_hash`,
+        WHERE drift_status.identity_hash = retained_drift.identity_hash
+          AND drift_status.last_checked < $1`,
 			normalizeTime(*policy.DriftStatusBefore),
 		)
 		if err != nil {

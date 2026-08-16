@@ -108,6 +108,11 @@ type Context struct {
 	// Set true if the command was intentionally skipped without executing work.
 	CommandSkipped bool
 
+	// CommandOutcomeSkipped records a skipped durable outcome without changing
+	// workflow-hook dispatch. Use CommandSkipped only when the command pipeline
+	// itself must stop before post-workflow hooks.
+	CommandOutcomeSkipped bool
+
 	// PreferLocalRepoCfgForTargetedIgnore makes targeted ignore checks read a
 	// cloned repo config before falling back to VCS content. This is used after
 	// pre-workflow hooks may have generated or updated atlantis.yaml.

@@ -207,7 +207,7 @@ func (l *RunLifecycle) terminalStatus(succeeded, failed int) runs.Status {
 		return forced
 	}
 	if l.ctx != nil {
-		if l.ctx.CommandSkipped {
+		if l.ctx.CommandSkipped || l.ctx.CommandOutcomeSkipped {
 			return runs.StatusSkipped
 		}
 		if l.ctx.CommandHasErrors {

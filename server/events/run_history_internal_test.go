@@ -140,6 +140,18 @@ func TestRunHistoryRecordsSkippedRunWithoutProjects(t *testing.T) {
 	require.Equal(t, runs.StatusSkipped, writer.runsCompleted[0].Status)
 }
 
+func TestRunHistoryRecordsSkippedOutcomeWithoutSuppressingHooks(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerComment)
+	ctx.CommandOutcomeSkipped = true
+	lifecycle.Finish()
+
+	require.False(t, ctx.CommandSkipped)
+	require.Equal(t, runs.StatusSkipped, writer.runsCompleted[0].Status)
+}
+
 func TestRunHistoryRetainsVCSDeliveryID(t *testing.T) {
 	writer := &recordingRunWriter{}
 	history := newTestRunHistory(t, writer)

@@ -92,7 +92,8 @@ func TestApplyCommandRunner_IsLocked(t *testing.T) {
 
 			applyCommandRunner.Run(ctx, &events.CommentCommand{Name: command.Apply})
 			Equals(t, c.ExpHasErrors, ctx.CommandHasErrors)
-			Equals(t, c.ExpSkipped, ctx.CommandSkipped)
+			Equals(t, c.ExpSkipped, ctx.CommandOutcomeSkipped)
+			Assert(t, !ctx.CommandSkipped, "durable skipped outcome must not suppress post-workflow hooks")
 
 			vcsClient.VerifyWasCalledOnce().CreateComment(
 				Any[logging.SimpleLogging](), Eq(testdata.GithubRepo), Eq(modelPull.Num), Eq(c.ExpComment), Eq("apply"))
@@ -117,7 +118,7 @@ func TestApplyCommandRunner_IsLocked(t *testing.T) {
 	}
 }
 
-func TestApplyCommandRunner_DisableApplyAllMarksCommandSkipped(t *testing.T) {
+func TestApplyCommandRunner_DisableApplyAllRecordsSkippedOutcome(t *testing.T) {
 	RegisterMockTestingT(t)
 	setup(t)
 	applyCommandRunner.DisableApplyAll = true
@@ -130,7 +131,8 @@ func TestApplyCommandRunner_DisableApplyAllMarksCommandSkipped(t *testing.T) {
 
 	applyCommandRunner.Run(ctx, &events.CommentCommand{Name: command.Apply})
 
-	Assert(t, ctx.CommandSkipped, "expected disabled apply-all to mark the command skipped")
+	Assert(t, ctx.CommandOutcomeSkipped, "expected disabled apply-all to record a skipped outcome")
+	Assert(t, !ctx.CommandSkipped, "disabled apply-all must not suppress post-workflow hooks")
 }
 
 func TestApplyCommandRunner_IsSilenced(t *testing.T) {

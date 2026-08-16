@@ -427,11 +427,15 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 	}
 	now := h.now().UTC()
 	succeeded, failed := 0, 0
+	unknownPhase := lifecycle.unknownMutationPhase(session.run.Command)
 	session.projects.Range(func(_, value any) bool {
 		project := value.(*projectObservation)
 		project.mu.Lock()
 		status := project.status
-		if status == runs.StatusRunning || status == "" {
+		if unknownPhase != "" && !project.phases[unknownPhase] {
+			status = runs.StatusUnknown
+			project.errorSummary = "infrastructure outcome is unknown because execution stopped after a side effect started"
+		} else if status == runs.StatusRunning || status == "" {
 			status = runs.StatusFailed
 			if project.errorSummary == "" {
 				project.errorSummary = "project execution did not complete"
@@ -451,7 +455,7 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 			h.blockRunCompletion(lifecycle.ctx.Log, session, "completing project run history", err)
 			return false
 		}
-		if status == runs.StatusFailed || status == runs.StatusPartial || status == runs.StatusCancelled {
+		if status == runs.StatusFailed || status == runs.StatusPartial || status == runs.StatusCancelled || status == runs.StatusUnknown {
 			failed++
 		} else {
 			succeeded++
@@ -485,6 +489,28 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 	h.appendAudit(lifecycle.ctx.Log, session, eventType, map[string]any{
 		"status": status, "projects_succeeded": succeeded, "projects_failed": failed,
 	}, now)
+}
+
+func (l *RunLifecycle) unknownMutationPhase(runCommand runs.Command) string {
+	if l == nil {
+		return ""
+	}
+	l.mu.Lock()
+	unknown := l.attemptUnknownReason != ""
+	l.mu.Unlock()
+	if !unknown {
+		return ""
+	}
+	switch runCommand {
+	case runs.CommandApply, runs.CommandDriftRemediation:
+		return command.Apply.String()
+	case runs.CommandImport:
+		return command.Import.String()
+	case runs.CommandStateRemove:
+		return command.State.String()
+	default:
+		return ""
+	}
 }
 
 func (h *RunHistory) beginAttempt(lifecycle *RunLifecycle, session *runSession, now time.Time) {

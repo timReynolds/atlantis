@@ -458,6 +458,30 @@ func TestRunHistoryInterruptsApplyAfterSideEffectAsUnknown(t *testing.T) {
 	require.Contains(t, writer.attemptsCompleted[0].FailureReason, "may have completed")
 }
 
+func TestRunHistoryInterruptsAPIApplyAfterSideEffectAsUnknown(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := routedRunContext(t)
+	ctx.API = true
+	ctx.Pull.Num = -1
+	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerAPI)
+	require.True(t, lifecycle.CanExecute())
+	projectCtx := history.beginProject(command.ProjectContext{
+		RunID: ctx.RunID, AttemptID: ctx.AttemptID, ProjectName: "network",
+		RepoRelDir: "terraform/network", Workspace: "production", Log: ctx.Log,
+	})
+	require.NotEmpty(t, projectCtx.ProjectRunID)
+	require.NoError(t, ctx.SideEffectMarker.MarkSideEffectStarted(context.Background()))
+
+	require.Equal(t, 1, history.InterruptActive("graceful shutdown deadline expired"))
+	lifecycle.Finish()
+
+	require.Equal(t, runs.StatusUnknown, writer.runsCompleted[0].Status)
+	require.Equal(t, runs.AttemptUnknown, writer.attemptsCompleted[0].Status)
+	require.Equal(t, runs.StatusUnknown, writer.projectsCompleted[0].Status)
+	require.NotEmpty(t, writer.attemptsCompleted[0].FailureReason)
+}
+
 func TestRunHistoryFailsClosedWhenAttemptAdmissionIsNotDurable(t *testing.T) {
 	writer := &recordingRunWriter{createAttemptErr: errors.New("database unavailable")}
 	history := newTestRunHistory(t, writer)

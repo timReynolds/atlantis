@@ -28,6 +28,7 @@ import (
 	"github.com/runatlantis/atlantis/server/core/drift"
 	driftmocks "github.com/runatlantis/atlantis/server/core/drift/mocks"
 	. "github.com/runatlantis/atlantis/server/core/locking/mocks"
+	"github.com/runatlantis/atlantis/server/core/ownership"
 	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/command"
@@ -57,8 +58,11 @@ type recordingDetectionHistory struct {
 }
 
 type recordingAPIHistoryWriter struct {
-	runsCreated   []runs.Run
-	runsCompleted []runs.RunCompletion
+	runsCreated        []runs.Run
+	runsCompleted      []runs.RunCompletion
+	attemptsCreated    []runs.RunAttempt
+	attemptsCompleted  []runs.AttemptCompletion
+	sideEffectsStarted []runs.ID
 }
 
 func (w *recordingAPIHistoryWriter) CreateRun(_ context.Context, run runs.Run) error {
@@ -93,6 +97,49 @@ func (*recordingAPIHistoryWriter) AppendOutput(context.Context, []runs.OutputChu
 
 func (*recordingAPIHistoryWriter) AppendAuditEvent(context.Context, runs.AuditEvent) error {
 	return nil
+}
+
+func (*recordingAPIHistoryWriter) RegisterInstance(context.Context, runs.ExecutionInstance) error {
+	return nil
+}
+
+func (*recordingAPIHistoryWriter) HeartbeatInstance(context.Context, runs.ID, time.Time) error {
+	return nil
+}
+
+func (*recordingAPIHistoryWriter) StopInstance(context.Context, runs.ID, time.Time) error {
+	return nil
+}
+
+func (w *recordingAPIHistoryWriter) CreateAttempt(_ context.Context, attempt runs.RunAttempt) error {
+	w.attemptsCreated = append(w.attemptsCreated, attempt)
+	return nil
+}
+
+func (*recordingAPIHistoryWriter) StartAttempt(context.Context, runs.ID, time.Time) error {
+	return nil
+}
+
+func (*recordingAPIHistoryWriter) HeartbeatAttempt(context.Context, runs.ID, time.Time) error {
+	return nil
+}
+
+func (w *recordingAPIHistoryWriter) MarkAttemptSideEffectStarted(_ context.Context, id runs.ID, _ time.Time) error {
+	w.sideEffectsStarted = append(w.sideEffectsStarted, id)
+	return nil
+}
+
+func (w *recordingAPIHistoryWriter) CompleteAttempt(_ context.Context, completion runs.AttemptCompletion) error {
+	w.attemptsCompleted = append(w.attemptsCompleted, completion)
+	return nil
+}
+
+func (*recordingAPIHistoryWriter) ReconcileAttempt(context.Context, runs.AttemptReconciliation) error {
+	return nil
+}
+
+func (*recordingAPIHistoryWriter) PrepareAttemptTakeover(context.Context, runs.AttemptTakeoverRequest) (runs.AttemptTakeoverResult, error) {
+	return runs.AttemptTakeoverResult{}, nil
 }
 
 func (r *recordingDetectionHistory) RecordDetection(ctx context.Context, record drift.DetectionRecord) error {
@@ -916,6 +963,39 @@ func TestAPIController_Apply(t *testing.T) {
 	projectCommandBuilder.VerifyWasCalled(Times(expectedCalls)).BuildApplyCommands(Any[*command.Context](), Any[*events.CommentCommand]())
 	projectCommandRunner.VerifyWasCalled(Times(expectedCalls)).Plan(Any[command.ProjectContext]())
 	projectCommandRunner.VerifyWasCalled(Times(expectedCalls)).Apply(Any[command.ProjectContext]())
+}
+
+func TestAPIController_ApplyCreatesDurableAttemptOnHAReplica(t *testing.T) {
+	ac, _, _ := setup(t)
+	writer := &recordingAPIHistoryWriter{}
+	ac.RunHistory = events.NewRunHistory(writer, logging.NewNoopLogger(t))
+	ac.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ac.ExecutionDeploymentID = "prod-eu"
+
+	body, err := json.Marshal(controllers.APIRequest{
+		Repository: "Repo", Ref: "main", Type: "Gitlab", PR: 42, Projects: []string{"default"},
+	})
+	Ok(t, err)
+	req, err := http.NewRequest(http.MethodPost, "", bytes.NewReader(body))
+	Ok(t, err)
+	req.Header.Set(atlantisTokenHeader, atlantisToken)
+	w := httptest.NewRecorder()
+
+	ac.Apply(w, req)
+
+	Equals(t, http.StatusOK, w.Code)
+	Equals(t, 1, len(writer.attemptsCreated))
+	attempt := writer.attemptsCreated[0]
+	Equals(t, ac.ExecutionInstanceID, attempt.InstanceID)
+	Equals(t, ac.ExecutionDeploymentID, attempt.DeploymentID)
+	Assert(t, strings.HasPrefix(attempt.OwnershipClaimID, "api:"), "expected API admission token, got %q", attempt.OwnershipClaimID)
+	expectedKey, err := ownership.NewKey(models.Repo{
+		FullName: "Repo", VCSHost: models.VCSHost{Hostname: "gitlab.com", Type: models.Gitlab},
+	}, 42).ConcurrencyKey("prod-eu")
+	Ok(t, err)
+	Equals(t, expectedKey, attempt.ConcurrencyKey)
+	Equals(t, 1, len(writer.attemptsCompleted))
+	Equals(t, runs.AttemptSucceeded, writer.attemptsCompleted[0].Status)
 }
 
 func TestAPIController_ApplySortsByExecutionOrder(t *testing.T) {

@@ -191,6 +191,9 @@ func (u UserConfig) durableHAConfigured() bool {
 // ValidateReplicaRouting validates the multi-replica routing contract when any
 // routing-only setting is configured.
 func (u UserConfig) ValidateReplicaRouting() error {
+	if u.ShutdownGracePeriodSeconds < 0 {
+		return errors.New("--shutdown-grace-period-seconds cannot be negative")
+	}
 	if !u.replicaRoutingConfigured() {
 		return nil
 	}
@@ -215,9 +218,6 @@ func (u UserConfig) ValidateReplicaRouting() error {
 	}
 	if u.OwnershipTTLSeconds < 10 {
 		return errors.New("--ownership-ttl-seconds must be at least 10")
-	}
-	if u.ShutdownGracePeriodSeconds < 0 {
-		return errors.New("--shutdown-grace-period-seconds cannot be negative")
 	}
 	if u.durableHAConfigured() {
 		if u.RunStoreType != RunStorePostgres {

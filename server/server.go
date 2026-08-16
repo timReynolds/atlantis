@@ -1202,6 +1202,8 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		LivePullHeadFetcher:             livePullHeadFetcher,
 		SilenceVCSStatusNoProjects:      userConfig.SilenceVCSStatusNoProjects,
 		RunHistory:                      runHistory,
+		ExecutionInstanceID:             executionInstanceID,
+		ExecutionDeploymentID:           strings.TrimSpace(userConfig.ReplicaDeploymentID),
 	}
 
 	var driftHistoryController *controllers.DriftHistoryController

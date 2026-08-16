@@ -264,7 +264,10 @@ func runMatchesPlanRetry(run runs.Run, request runs.AttemptTakeoverRequest) bool
 }
 
 func equalPullNumber(left, right *int) bool {
-	return left != nil && right != nil && *left == *right
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func completeRecoveredRun(ctx context.Context, tx *sql.Tx, run runs.Run, status runs.Status, completedAt time.Time) error {

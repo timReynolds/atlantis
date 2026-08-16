@@ -219,8 +219,11 @@ func (r AttemptTakeoverRequest) Validate() error {
 	if strings.TrimSpace(r.Repository) == "" {
 		return fmt.Errorf("takeover repository is required")
 	}
-	if r.PullNumber == nil || *r.PullNumber <= 0 {
+	if r.PullNumber != nil && *r.PullNumber <= 0 {
 		return fmt.Errorf("takeover pull number must be positive")
+	}
+	if r.PullNumber == nil && r.Trigger != TriggerAPI {
+		return fmt.Errorf("takeover pull number is required outside API execution")
 	}
 	if !r.Command.valid() {
 		return fmt.Errorf("invalid takeover command %q", r.Command)

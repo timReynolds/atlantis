@@ -101,11 +101,18 @@ func TestStoreConformance(t *testing.T) {
 		ID: attemptID, Status: runs.AttemptUnknown, CompletedAt: attemptCompletedAt,
 		FailureReason: "simulated process loss after apply started",
 	}))
+	replacementAttempt := attempt
+	replacementAttempt.ID = mustID(t)
+	replacementAttempt.OwnershipClaimID = "claim-2"
+	require.ErrorIs(t, store.CreateAttempt(ctx, replacementAttempt), runs.ErrConflict,
+		"unreconciled unknown apply must retain the durable admission fence")
 	reconciledAt := startedAt.Add(900 * time.Millisecond)
 	require.NoError(t, store.ReconcileAttempt(ctx, runs.AttemptReconciliation{
 		ID: attemptID, At: reconciledAt, Actor: "operator",
 		Summary: "state inspected; fresh plan required",
 	}))
+	require.NoError(t, store.CreateAttempt(ctx, replacementAttempt),
+		"operator reconciliation must release the durable admission fence")
 	storedAttempt, err := store.GetAttempt(ctx, attemptID)
 	require.NoError(t, err)
 	require.Equal(t, runs.AttemptUnknown, storedAttempt.Status)

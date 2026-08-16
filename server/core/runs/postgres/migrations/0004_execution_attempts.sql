@@ -87,7 +87,9 @@ CREATE INDEX run_attempts_unknown_unreconciled_idx
     ON run_attempts (completed_at, id) WHERE status = 'unknown' AND reconciled_at IS NULL;
 
 -- Redis remains the ownership and lease authority. This unique index is a
--- durable admission fence: takeover code must first classify the prior attempt
--- as interrupted or unknown before admitting another process for the same key.
+-- durable admission fence: takeover code must first classify a safe prior
+-- attempt as interrupted. An unknown attempt remains fenced until an operator
+-- records explicit reconciliation.
 CREATE UNIQUE INDEX run_attempts_one_active_concurrency_key_idx
-    ON run_attempts (deployment_id, concurrency_key) WHERE status IN ('claimed', 'running');
+    ON run_attempts (deployment_id, concurrency_key)
+    WHERE status IN ('claimed', 'running') OR (status = 'unknown' AND reconciled_at IS NULL);

@@ -75,6 +75,10 @@ test-all: test-nested-modules ## Run tests including integration
 test-ha-failure-gates: ## Run HA failure gates against disposable PostgreSQL, Redis, and S3-compatible dependencies
 	./scripts/test-ha-failure-gates.sh
 
+.PHONY: benchmark-ha-stage1
+benchmark-ha-stage1: ## Benchmark Stage 1 PostgreSQL history and Redis replica routing with disposable dependencies
+	./scripts/benchmark-ha-stage1.sh
+
 .PHONY: docker/test-all
 docker/test-all: ## Run all tests in docker
 	docker run -it -v $(PWD):/atlantis ghcr.io/runatlantis/testing-env:latest sh -c "cd /atlantis && make test-all"

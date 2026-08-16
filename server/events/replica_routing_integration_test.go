@@ -6,7 +6,9 @@ package events_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"testing"
@@ -119,6 +121,57 @@ func TestReplicaRouting_OwnerLossRequiresReplanAndKeepsSamePRLockUsable(t *testi
 	require.Equal(t, 1, h.diskB.deleteCount(pullNum), "one ownership claim must reset local state only once")
 }
 
+func BenchmarkReplicaRoutingConcurrentPRs(b *testing.B) {
+	for _, pullCount := range []int{10, 50, 100, 300, 600} {
+		b.Run(fmt.Sprintf("pulls-%03d", pullCount), func(b *testing.B) {
+			h := newHABenchmarkHarness(b)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				basePull := iteration*1000 + 1000
+				dispatchConcurrentPullCommands(b, h, basePull, pullCount, command.Plan, false)
+				dispatchConcurrentPullCommands(b, h, basePull, pullCount, command.Apply, true)
+			}
+			b.ReportMetric(float64(pullCount*2), "commands/op")
+			b.StopTimer()
+			require.Equal(b, b.N*pullCount*2, len(h.runnerA.snapshot())+len(h.runnerB.snapshot()))
+		})
+	}
+}
+
+func dispatchConcurrentPullCommands(
+	b *testing.B,
+	h *haHarness,
+	basePull int,
+	pullCount int,
+	name command.Name,
+	throughOppositeIngress bool,
+) {
+	b.Helper()
+	errors := make(chan error, pullCount)
+	dispatches := make([]events.CommentDispatch, pullCount)
+	for index := range dispatches {
+		dispatches[index] = haCommentDispatch(b, basePull+index, "default", name)
+	}
+	var group sync.WaitGroup
+	for index := 0; index < pullCount; index++ {
+		group.Add(1)
+		go func(offset int) {
+			defer group.Done()
+			dispatcher := h.dispatcherA
+			if (offset%2 == 1) != throughOppositeIngress {
+				dispatcher = h.dispatcherB
+			}
+			errors <- dispatcher.DispatchComment(dispatches[offset])
+		}(index)
+	}
+	group.Wait()
+	close(errors)
+	for err := range errors {
+		require.NoError(b, err)
+	}
+}
+
 type haHarness struct {
 	redis       *miniredis.Miniredis
 	database    *redisdb.RedisDB
@@ -132,7 +185,7 @@ type haHarness struct {
 	runnerB     *haCommandRunner
 }
 
-func newHAHarness(t *testing.T) *haHarness {
+func newHAHarness(t testing.TB) *haHarness {
 	t.Helper()
 	redisServer := miniredis.RunT(t)
 	host, portString, err := net.SplitHostPort(redisServer.Addr())
@@ -141,13 +194,36 @@ func newHAHarness(t *testing.T) *haHarness {
 	require.NoError(t, err)
 	database, err := redisdb.NewWithConfig(redisdb.Config{Hostname: host, Port: port})
 	require.NoError(t, err)
+	return newHAHarnessWithDatabase(t, redisServer, database)
+}
+
+func newHABenchmarkHarness(t testing.TB) *haHarness {
+	t.Helper()
+	address := os.Getenv("ATLANTIS_REDIS_BENCHMARK_ADDR")
+	if address == "" {
+		return newHAHarness(t)
+	}
+	host, portString, err := net.SplitHostPort(address)
+	require.NoError(t, err)
+	port, err := strconv.Atoi(portString)
+	require.NoError(t, err)
+	database, err := redisdb.NewWithConfig(redisdb.Config{Hostname: host, Port: port})
+	require.NoError(t, err)
+	return newHAHarnessWithDatabase(t, nil, database)
+}
+
+func newHAHarnessWithDatabase(t testing.TB, redisServer *miniredis.Miniredis, database *redisdb.RedisDB) *haHarness {
+	t.Helper()
 	logger := logging.NewNoopLogger(t)
+	deploymentID := fmt.Sprintf("ha-harness-%d", time.Now().UnixNano())
 	storeA, err := redisdb.NewOwnerStore(database, redisdb.OwnerStoreConfig{
-		ReplicaID: "replica-a", AdvertiseURL: "http://replica-a", TTL: 30 * time.Second,
+		ReplicaID: "replica-a", DeploymentID: deploymentID,
+		AdvertiseURL: "http://replica-a", TTL: 30 * time.Second,
 	}, logger)
 	require.NoError(t, err)
 	storeB, err := redisdb.NewOwnerStore(database, redisdb.OwnerStoreConfig{
-		ReplicaID: "replica-b", AdvertiseURL: "http://replica-b", TTL: 30 * time.Second,
+		ReplicaID: "replica-b", DeploymentID: deploymentID,
+		AdvertiseURL: "http://replica-b", TTL: 30 * time.Second,
 	}, logger)
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -179,7 +255,7 @@ func newHAHarness(t *testing.T) *haHarness {
 	}
 }
 
-func haCommentDispatch(t *testing.T, pullNum int, workspace string, name command.Name) events.CommentDispatch {
+func haCommentDispatch(t testing.TB, pullNum int, workspace string, name command.Name) events.CommentDispatch {
 	t.Helper()
 	repo, err := models.NewRepo(models.Github, "owner/repo", "https://github.com/owner/repo", "receiver", "receiver-token", "")
 	require.NoError(t, err)

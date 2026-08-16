@@ -5,6 +5,7 @@
 package events
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -169,6 +170,9 @@ func (c *DefaultCommandRunner) runAutoplanCommand(baseRepo models.Repo, headRepo
 
 	log := c.buildLogger(baseRepo.FullName, pull.Num)
 	defer c.logPanics(baseRepo, pull.Num, log)
+	if !admitRoutedCommand(log, routing.Lease, "loading pull request state") {
+		return
+	}
 	status, err := c.PullStatusFetcher.GetPullStatus(pull)
 
 	if err != nil {
@@ -232,10 +236,16 @@ func (c *DefaultCommandRunner) runAutoplanCommand(baseRepo models.Repo, headRepo
 	}
 
 	cmdRunner := buildCommentCommandRunner(c, command.Plan)
+	if !admitRoutedCommand(ctx.Log, routing.Lease, "selecting projects") {
+		return
+	}
 	if shouldSkipPreWorkflowHooks(ctx, cmdRunner, cmd) {
 		return
 	}
 
+	if !admitRoutedCommand(ctx.Log, routing.Lease, "running pre-workflow hooks") {
+		return
+	}
 	preWorkflowHooksErr := c.PreWorkflowHooksCommandRunner.RunPreHooks(ctx, cmd)
 
 	if preWorkflowHooksErr != nil {
@@ -260,8 +270,14 @@ func (c *DefaultCommandRunner) runAutoplanCommand(baseRepo models.Repo, headRepo
 
 	autoPlanRunner := buildCommentCommandRunner(c, command.Plan)
 
+	if !admitRoutedCommand(ctx.Log, routing.Lease, "building and executing projects") {
+		return
+	}
 	autoPlanRunner.Run(ctx, nil)
 
+	if !admitRoutedCommand(ctx.Log, routing.Lease, "running post-workflow hooks") {
+		return
+	}
 	c.PostWorkflowHooksCommandRunner.RunPostHooks(ctx, cmd) // nolint: errcheck
 }
 
@@ -499,6 +515,9 @@ func (c *DefaultCommandRunner) runCommentCommand(baseRepo models.Repo, maybeHead
 
 	log := c.buildLogger(baseRepo.FullName, pullNum)
 	defer c.logPanics(baseRepo, pullNum, log)
+	if !admitRoutedCommand(log, routing.Lease, "loading pull request metadata") {
+		return
+	}
 
 	scope := c.StatsScope.SubScope("comment")
 
@@ -540,6 +559,9 @@ func (c *DefaultCommandRunner) runCommentCommand(baseRepo models.Repo, maybeHead
 	}
 
 	cmdRunner := buildCommentCommandRunner(c, cmd.CommandName())
+	if !admitRoutedCommand(ctx.Log, routing.Lease, "selecting projects") {
+		return
+	}
 	targetInitiallyIgnored := shouldSkipPreWorkflowHooks(ctx, cmdRunner, cmd)
 	if targetInitiallyIgnored {
 		ctx.CommandSkipped = false
@@ -549,6 +571,9 @@ func (c *DefaultCommandRunner) runCommentCommand(baseRepo models.Repo, maybeHead
 		return
 	}
 
+	if !admitRoutedCommand(ctx.Log, routing.Lease, "running pre-workflow hooks") {
+		return
+	}
 	preWorkflowHooksMayUpdateRepo := preWorkflowHooksConfigured(c.PreWorkflowHooksCommandRunner, ctx)
 	preWorkflowHooksErr := c.PreWorkflowHooksCommandRunner.RunPreHooks(ctx, cmd)
 	if targetInitiallyIgnored {
@@ -557,6 +582,9 @@ func (c *DefaultCommandRunner) runCommentCommand(baseRepo models.Repo, maybeHead
 			return
 		}
 		ctx.PreferLocalRepoCfgForTargetedIgnore = true
+		if !admitRoutedCommand(ctx.Log, routing.Lease, "reselecting projects") {
+			return
+		}
 		if shouldSkipPreWorkflowHooks(ctx, cmdRunner, cmd) {
 			return
 		}
@@ -589,12 +617,29 @@ func (c *DefaultCommandRunner) runCommentCommand(baseRepo models.Repo, maybeHead
 		ctx.Log.Err("'fail-on-pre-workflow-hook-error' not set so running %s command.", cmd.Name.String())
 	}
 
+	if !admitRoutedCommand(ctx.Log, routing.Lease, "building and executing projects") {
+		return
+	}
 	cmdRunner.Run(ctx, cmd)
 	if ctx.CommandSkipped {
 		return
 	}
 
+	if !admitRoutedCommand(ctx.Log, routing.Lease, "running post-workflow hooks") {
+		return
+	}
 	c.PostWorkflowHooksCommandRunner.RunPostHooks(ctx, cmd) // nolint: errcheck
+}
+
+func admitRoutedCommand(log logging.SimpleLogging, lease command.ExecutionLease, stage string) bool {
+	if lease == nil {
+		return true
+	}
+	if err := lease.Admit(context.Background()); err != nil {
+		log.Err("admitting routed command before %s %v", stage, err)
+		return false
+	}
+	return true
 }
 
 func (c *DefaultCommandRunner) getGithubData(logger logging.SimpleLogging, baseRepo models.Repo, pullNum int) (models.PullRequest, models.Repo, error) {

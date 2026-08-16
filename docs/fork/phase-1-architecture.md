@@ -63,7 +63,7 @@ Output writers preserve order per Project Run, distinguish stdout, stderr, and s
 The read-only, server-rendered history surface follows existing Atlantis UI conventions:
 
 - `/runs` provides global repository, pull request, commit, actor, command, and status filters.
-- `/repos/{owner}/{repo}` and `/repos/{owner}/{repo}/pulls/{number}` provide scoped run history.
+- `/repos/{repository}` provides repository-scoped run history, including nested group paths, and `/repos/{repository}?pull={number}` adds the pull-request filter.
 - `/runs/{run-id}` provides aggregate status counts, project filters, pagination, and related pull-request runs.
 - `/runs/{run-id}/projects/{project-id}` provides summary counts, artifact metadata, and paginated typed output.
 - `/audit` provides repository, pull request, actor, event, and date-range filters.

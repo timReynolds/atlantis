@@ -350,13 +350,6 @@ func TestParseAtlantisURL(t *testing.T) {
 		})
 	}
 
-	req, err := http.NewRequest(http.MethodGet, "/repos/group/pulls/42", nil)
-	Ok(t, err)
-	var match mux.RouteMatch
-	Assert(t, s.Router.Match(req, &match), "repository route should match")
-	Equals(t, "group/pulls/42", match.Vars["repository"])
-	_, hasPullNumber := match.Vars["pull-number"]
-	Assert(t, !hasPullNumber, "repository suffix must not be interpreted as a pull number")
 }
 
 func TestSetupRoutes_APIRoutesRegistered(t *testing.T) {
@@ -375,6 +368,13 @@ func TestSetupRoutes_APIRoutesRegistered(t *testing.T) {
 	}
 
 	s.SetupRoutes()
+	repositorySuffixRequest, err := http.NewRequest(http.MethodGet, "/repos/group/pulls/42", nil)
+	Ok(t, err)
+	var repositorySuffixMatch mux.RouteMatch
+	Assert(t, s.Router.Match(repositorySuffixRequest, &repositorySuffixMatch), "repository route should match")
+	Equals(t, "group/pulls/42", repositorySuffixMatch.Vars["repository"])
+	_, hasPullNumber := repositorySuffixMatch.Vars["pull-number"]
+	Assert(t, !hasPullNumber, "repository suffix must not be interpreted as a pull number")
 
 	cases := []struct {
 		method string

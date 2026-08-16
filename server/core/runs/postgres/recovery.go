@@ -64,51 +64,51 @@ func prepareAttemptTakeover(ctx context.Context, tx *sql.Tx, request runs.Attemp
 		if err != nil {
 			return result, err
 		}
-		if attempt.OwnershipClaimID == request.OwnershipClaimID || attemptIsLive(attempt, instance, request) {
-			result.ActiveAttempt = &attempt
-			return result, nil
-		}
-
 		run, err := scanRun(tx.QueryRowContext(ctx,
 			"SELECT "+runColumns+" FROM runs WHERE id = $1 FOR UPDATE", attempt.RunID))
 		if err != nil {
 			return result, err
 		}
-		status, reason := takeoverClassification(attempt, request.OwnershipClaimID)
-		updated, err := tx.ExecContext(ctx, `UPDATE run_attempts
-            SET status = $2, completed_at = $3, heartbeat_at = GREATEST(heartbeat_at, $3),
-                failure_reason = $4
-            WHERE id = $1 AND status IN ($5, $6) AND completed_at IS NULL`,
-			attempt.ID, status, request.RecoveredAt, reason,
-			runs.AttemptClaimed, runs.AttemptRunning)
-		if err != nil {
-			return result, fmt.Errorf("classifying stale execution attempt: %w", err)
-		}
-		count, err := rowsAffected(updated)
-		if err != nil {
-			return result, fmt.Errorf("checking stale execution attempt classification: %w", err)
-		}
-		if count != 1 {
-			return result, fmt.Errorf("classifying stale execution attempt %s: %w", attempt.ID, runs.ErrConflict)
-		}
-		if err := completeRecoveredProjects(ctx, tx, attempt.ID, request.RecoveredAt, reason); err != nil {
-			return result, err
-		}
-
-		attempt.Status = status
-		attempt.CompletedAt = &request.RecoveredAt
-		attempt.HeartbeatAt = maxTime(attempt.HeartbeatAt, request.RecoveredAt)
-		attempt.FailureReason = reason
-		result.RecoveredAttempt = &attempt
-		if status == runs.AttemptInterrupted && runMatchesPlanRetry(run, request) {
-			result.RetryRun = &run
-		} else {
-			runStatus := runs.StatusFailed
-			if status == runs.AttemptUnknown {
-				runStatus = runs.StatusUnknown
-			}
-			if err := completeRecoveredRun(ctx, tx, run, runStatus, request.RecoveredAt); err != nil {
+		if run.CompletedAt != nil {
+			status, reason := terminalRunAttemptClassification(attempt, run)
+			if err := completeRecoveredAttempt(ctx, tx, attempt, status, request.RecoveredAt, reason); err != nil {
 				return result, err
+			}
+			if err := completeRecoveredProjects(ctx, tx, attempt.ID, request.RecoveredAt, reason); err != nil {
+				return result, err
+			}
+			attempt.Status = status
+			attempt.CompletedAt = &request.RecoveredAt
+			attempt.HeartbeatAt = maxTime(attempt.HeartbeatAt, request.RecoveredAt)
+			attempt.FailureReason = reason
+			result.RecoveredAttempt = &attempt
+		} else if attempt.OwnershipClaimID == request.OwnershipClaimID || attemptIsLive(attempt, instance, request) {
+			result.ActiveAttempt = &attempt
+			return result, nil
+		} else {
+			status, reason := takeoverClassification(attempt, request.OwnershipClaimID)
+			if err := completeRecoveredAttempt(ctx, tx, attempt, status, request.RecoveredAt, reason); err != nil {
+				return result, err
+			}
+			if err := completeRecoveredProjects(ctx, tx, attempt.ID, request.RecoveredAt, reason); err != nil {
+				return result, err
+			}
+
+			attempt.Status = status
+			attempt.CompletedAt = &request.RecoveredAt
+			attempt.HeartbeatAt = maxTime(attempt.HeartbeatAt, request.RecoveredAt)
+			attempt.FailureReason = reason
+			result.RecoveredAttempt = &attempt
+			if status == runs.AttemptInterrupted && runMatchesPlanRetry(run, request) {
+				result.RetryRun = &run
+			} else {
+				runStatus := runs.StatusFailed
+				if status == runs.AttemptUnknown {
+					runStatus = runs.StatusUnknown
+				}
+				if err := completeRecoveredRun(ctx, tx, run, runStatus, request.RecoveredAt); err != nil {
+					return result, err
+				}
 			}
 		}
 	}
@@ -119,6 +119,49 @@ func prepareAttemptTakeover(ctx context.Context, tx *sql.Tx, request runs.Attemp
 	}
 	result.UnreconciledUnknown = unknown
 	return result, nil
+}
+
+func terminalRunAttemptClassification(attempt runs.RunAttempt, run runs.Run) (runs.AttemptStatus, string) {
+	if attempt.StartedAt == nil {
+		return runs.AttemptInterrupted, "logical run completed before the execution attempt started"
+	}
+	switch run.Status {
+	case runs.StatusSucceeded, runs.StatusSkipped:
+		return runs.AttemptSucceeded, ""
+	case runs.StatusUnknown:
+		if attempt.SideEffectStartedAt != nil {
+			return runs.AttemptUnknown, "logical run completed with an unknown infrastructure outcome"
+		}
+		return runs.AttemptInterrupted, "logical run completed as unknown before an infrastructure side effect was recorded"
+	default:
+		return runs.AttemptFailed, "logical run completed with status " + string(run.Status)
+	}
+}
+
+func completeRecoveredAttempt(
+	ctx context.Context,
+	tx *sql.Tx,
+	attempt runs.RunAttempt,
+	status runs.AttemptStatus,
+	completedAt time.Time,
+	reason string,
+) error {
+	updated, err := tx.ExecContext(ctx, `UPDATE run_attempts
+        SET status = $2, completed_at = $3, heartbeat_at = GREATEST(heartbeat_at, $3),
+            failure_reason = $4
+        WHERE id = $1 AND status IN ($5, $6) AND completed_at IS NULL`,
+		attempt.ID, status, completedAt, reason, runs.AttemptClaimed, runs.AttemptRunning)
+	if err != nil {
+		return fmt.Errorf("classifying stale execution attempt: %w", err)
+	}
+	count, err := rowsAffected(updated)
+	if err != nil {
+		return fmt.Errorf("checking stale execution attempt classification: %w", err)
+	}
+	if count != 1 {
+		return fmt.Errorf("classifying stale execution attempt %s: %w", attempt.ID, runs.ErrConflict)
+	}
+	return nil
 }
 
 func attemptIsLive(attempt runs.RunAttempt, instance runs.ExecutionInstance, request runs.AttemptTakeoverRequest) bool {

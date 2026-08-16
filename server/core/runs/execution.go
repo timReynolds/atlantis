@@ -150,16 +150,20 @@ func (c AttemptCompletion) Validate() error {
 // AttemptReconciliation records an operator's resolution of an unknown apply.
 // The attempt remains unknown history; reconciliation is an explicit overlay.
 type AttemptReconciliation struct {
-	ID      ID
-	At      time.Time
-	Actor   string
-	Summary string
+	ID           ID
+	AuditEventID ID
+	At           time.Time
+	Actor        string
+	Summary      string
 }
 
 // Validate checks reconciliation audit fields.
 func (r AttemptReconciliation) Validate() error {
 	if _, err := ParseID(string(r.ID)); err != nil {
 		return fmt.Errorf("validating run attempt ID: %w", err)
+	}
+	if _, err := ParseID(string(r.AuditEventID)); err != nil {
+		return fmt.Errorf("validating reconciliation audit event ID: %w", err)
 	}
 	if r.At.IsZero() {
 		return fmt.Errorf("reconciliation time is required")

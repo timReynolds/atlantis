@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -119,6 +120,51 @@ func TestRunHistoryControllerDoesNotExposeProjectOutputWithoutAuthentication(t *
 	require.False(t, reader.readCalled)
 }
 
+func TestRunHistoryControllerReconcilesUnknownAttemptThroughConfirmedAPI(t *testing.T) {
+	runID := mustRunHistoryID(t)
+	attemptID := mustRunHistoryID(t)
+	reconciler := &recordingAttemptReconciler{attempt: runs.RunAttempt{
+		ID: attemptID, RunID: runID, Status: runs.AttemptUnknown,
+	}}
+	controller := testRunHistoryController(t, &recordingRunReader{}, &recordingHistoryTemplate{})
+	controller.WebAuthentication = true
+	controller.AttemptReconciler = reconciler
+	request := mux.SetURLVars(httptest.NewRequest(http.MethodPost,
+		"/runs/x/attempts/y/reconcile", strings.NewReader(`{"summary":"state inspected; fresh plan required"}`)),
+		map[string]string{"run-id": string(runID), "attempt-id": string(attemptID)})
+	request.SetBasicAuth("operator", "password")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Atlantis-Reconcile-Unknown", "true")
+	recorder := httptest.NewRecorder()
+
+	controller.ReconcileAttempt(recorder, request)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Equal(t, attemptID, reconciler.reconciliation.ID)
+	require.Equal(t, "operator", reconciler.reconciliation.Actor)
+	require.Equal(t, "state inspected; fresh plan required", reconciler.reconciliation.Summary)
+	require.NotEmpty(t, reconciler.reconciliation.AuditEventID)
+	_, err := runs.ParseID(string(reconciler.reconciliation.AuditEventID))
+	require.NoError(t, err)
+	require.Contains(t, recorder.Body.String(), `"status":"reconciled"`)
+}
+
+func TestRunHistoryControllerReconciliationRequiresConfirmationHeader(t *testing.T) {
+	controller := testRunHistoryController(t, &recordingRunReader{}, &recordingHistoryTemplate{})
+	controller.WebAuthentication = true
+	reconciler := &recordingAttemptReconciler{}
+	controller.AttemptReconciler = reconciler
+	request := httptest.NewRequest(http.MethodPost, "/runs/x/attempts/y/reconcile", strings.NewReader(`{"summary":"checked"}`))
+	request.SetBasicAuth("operator", "password")
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	controller.ReconcileAttempt(recorder, request)
+
+	require.Equal(t, http.StatusForbidden, recorder.Code)
+	require.False(t, reconciler.readCalled)
+}
+
 func TestRunHistoryControllerReturnsTypedProjectOutputPage(t *testing.T) {
 	runID := mustRunHistoryID(t)
 	projectID := mustRunHistoryID(t)
@@ -194,6 +240,24 @@ func mustRunHistoryID(t *testing.T) runs.ID {
 
 type recordingHistoryTemplate struct {
 	data any
+}
+
+type recordingAttemptReconciler struct {
+	attempt        runs.RunAttempt
+	getErr         error
+	reconcileErr   error
+	readCalled     bool
+	reconciliation runs.AttemptReconciliation
+}
+
+func (r *recordingAttemptReconciler) GetAttempt(context.Context, runs.ID) (runs.RunAttempt, error) {
+	r.readCalled = true
+	return r.attempt, r.getErr
+}
+
+func (r *recordingAttemptReconciler) ReconcileAttempt(_ context.Context, reconciliation runs.AttemptReconciliation) error {
+	r.reconciliation = reconciliation
+	return r.reconcileErr
 }
 
 func (t *recordingHistoryTemplate) Execute(_ io.Writer, data any) error {

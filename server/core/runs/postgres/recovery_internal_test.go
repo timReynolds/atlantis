@@ -40,6 +40,31 @@ func TestTakeoverClassificationSeparatesPlanFromPossibleSideEffect(t *testing.T)
 	require.Contains(t, reason, "may have completed")
 }
 
+func TestTerminalRunAttemptClassificationRepairsOldCompletionOrdering(t *testing.T) {
+	startedAt := testTime
+	completedAt := startedAt.Add(time.Minute)
+	attempt := claimedAttempt()
+	attempt.Status = runs.AttemptRunning
+	attempt.StartedAt = &startedAt
+	run := runs.Run{Status: runs.StatusSucceeded, CompletedAt: &completedAt}
+
+	status, reason := terminalRunAttemptClassification(attempt, run)
+	require.Equal(t, runs.AttemptSucceeded, status)
+	require.Empty(t, reason)
+
+	run.Status = runs.StatusUnknown
+	attempt.SideEffectStartedAt = &startedAt
+	status, reason = terminalRunAttemptClassification(attempt, run)
+	require.Equal(t, runs.AttemptUnknown, status)
+	require.Contains(t, reason, "unknown infrastructure outcome")
+
+	attempt.StartedAt = nil
+	attempt.SideEffectStartedAt = nil
+	status, reason = terminalRunAttemptClassification(attempt, run)
+	require.Equal(t, runs.AttemptInterrupted, status)
+	require.Contains(t, reason, "before the execution attempt started")
+}
+
 func TestRunMatchesPlanRetryRequiresExactLogicalOperation(t *testing.T) {
 	pull := 42
 	startedAt := testTime

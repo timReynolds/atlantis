@@ -403,7 +403,13 @@ func (s *Store) ReconcileAttempt(ctx context.Context, reconciliation runs.Attemp
 	opCtx, cancel := s.operationContext(ctx)
 	defer cancel()
 
-	result, err := s.db.ExecContext(opCtx, `UPDATE run_attempts
+	tx, err := s.db.BeginTx(opCtx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning run attempt reconciliation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.ExecContext(opCtx, `UPDATE run_attempts
         SET reconciled_at = $2, reconciled_by = $3, reconciliation_summary = $4
         WHERE id = $1 AND status = $5 AND reconciled_at IS NULL`,
 		reconciliation.ID, reconciliation.At, reconciliation.Actor,
@@ -416,9 +422,26 @@ func (s *Store) ReconcileAttempt(ctx context.Context, reconciliation runs.Attemp
 		return fmt.Errorf("checking reconciled run attempt: %w", err)
 	}
 	if updated == 1 {
+		if _, err := tx.ExecContext(opCtx, `INSERT INTO audit_events (
+                id, repository, pull_number, run_id, actor, event_type, metadata, created_at
+            )
+            SELECT $2, r.repository, r.pull_number, a.run_id, $3,
+                'execution_attempt.reconciled',
+                jsonb_build_object('attempt_id', a.id, 'summary', $4::text), $5
+            FROM run_attempts a JOIN runs r ON r.id = a.run_id
+            WHERE a.id = $1`,
+			reconciliation.ID, reconciliation.AuditEventID, reconciliation.Actor,
+			reconciliation.Summary, reconciliation.At,
+		); err != nil {
+			return fmt.Errorf("auditing run attempt reconciliation: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("committing run attempt reconciliation: %w", err)
+		}
 		return nil
 	}
-	existing, err := s.getAttempt(opCtx, reconciliation.ID)
+	existing, err := scanRunAttempt(tx.QueryRowContext(opCtx,
+		"SELECT "+runAttemptColumns+" FROM run_attempts WHERE id = $1", reconciliation.ID))
 	if err != nil {
 		return err
 	}
@@ -426,6 +449,9 @@ func (s *Store) ReconcileAttempt(ctx context.Context, reconciliation runs.Attemp
 		existing.ReconciledAt.Equal(reconciliation.At) &&
 		existing.ReconciledBy == reconciliation.Actor &&
 		existing.ReconciliationSummary == reconciliation.Summary {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("committing replayed run attempt reconciliation: %w", err)
+		}
 		return nil
 	}
 	return fmt.Errorf("reconciling run attempt %s in status %q: %w", reconciliation.ID, existing.Status, runs.ErrConflict)

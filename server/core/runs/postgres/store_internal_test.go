@@ -22,6 +22,7 @@ const (
 	testProjectRunID = runs.ID("0198a0df-85f1-7d83-a60b-2e57b725c62b")
 	testAttemptID    = runs.ID("0198a0df-85f1-7d83-a60b-2e57b725c62c")
 	testInstanceID   = runs.ID("0198a0df-85f1-7d83-a60b-2e57b725c62d")
+	testAuditID      = runs.ID("0198a0df-85f1-7d83-a60b-2e57b725c62e")
 )
 
 var testTime = time.Date(2026, 8, 16, 10, 0, 0, 123456000, time.UTC)
@@ -107,6 +108,27 @@ func TestCompleteAttemptUnknownRequiresRecordedSideEffect(t *testing.T) {
 		ID: testAttemptID, Status: runs.AttemptUnknown, CompletedAt: completedAt,
 		FailureReason: "worker heartbeat lost",
 	}))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestReconcileAttemptWritesAuditAtomically(t *testing.T) {
+	store, mock := newMockStore(t)
+	reconciliation := runs.AttemptReconciliation{
+		ID: testAttemptID, AuditEventID: testAuditID, At: testTime.Add(time.Minute),
+		Actor: "operator", Summary: "state inspected; fresh plan required",
+	}
+	mock.ExpectBegin()
+	mock.ExpectExec("UPDATE run_attempts").WithArgs(
+		reconciliation.ID, reconciliation.At, reconciliation.Actor,
+		reconciliation.Summary, runs.AttemptUnknown,
+	).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO audit_events").WithArgs(
+		reconciliation.ID, reconciliation.AuditEventID, reconciliation.Actor,
+		reconciliation.Summary, reconciliation.At,
+	).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	require.NoError(t, store.ReconcileAttempt(context.Background(), reconciliation))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

@@ -1165,7 +1165,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	if userConfig.RunStoreType == RunStorePostgres {
 		runHistoryController = &controllers.RunHistoryController{
 			AtlantisVersion: config.AtlantisVersion, AtlantisURL: parsedURL,
-			Logger: logger, Store: runStore,
+			Logger: logger, Store: runStore, AttemptReconciler: runStore,
 			RunListTemplate:       web_templates.RunHistoryListTemplate,
 			RunDetailTemplate:     web_templates.RunHistoryDetailTemplate,
 			ProjectDetailTemplate: web_templates.RunProjectDetailTemplate,
@@ -1404,6 +1404,7 @@ func (s *Server) SetupRoutes() {
 		s.Router.HandleFunc("/repos/{repository:.+}", s.RunHistoryController.ListRuns).Methods("GET")
 		s.Router.HandleFunc("/runs/{run-id}", s.RunHistoryController.GetRun).Methods("GET").Name(RunHistoryViewRouteName)
 		s.Router.HandleFunc("/runs/{run-id}/projects/{project-id}", s.RunHistoryController.GetProject).Methods("GET")
+		s.Router.HandleFunc("/runs/{run-id}/attempts/{attempt-id}/reconcile", s.RunHistoryController.ReconcileAttempt).Methods("POST")
 		s.Router.HandleFunc("/audit", s.RunHistoryController.ListAudit).Methods("GET")
 	}
 	if s.DriftHistoryController != nil {

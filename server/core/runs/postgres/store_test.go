@@ -120,7 +120,7 @@ func TestStoreConformance(t *testing.T) {
 		"unreconciled unknown apply must retain the durable admission fence")
 	reconciledAt := startedAt.Add(900 * time.Millisecond)
 	require.NoError(t, store.ReconcileAttempt(ctx, runs.AttemptReconciliation{
-		ID: attemptID, At: reconciledAt, Actor: "operator",
+		ID: attemptID, AuditEventID: mustID(t), At: reconciledAt, Actor: "operator",
 		Summary: "state inspected; fresh plan required",
 	}))
 	require.NoError(t, store.CreateAttempt(ctx, replacementAttempt),
@@ -244,6 +244,7 @@ func TestStoreConformance(t *testing.T) {
 	staleAttemptID := mustID(t)
 	require.NoError(t, store.CreateAttempt(ctx, runs.RunAttempt{
 		ID: staleAttemptID, RunID: retryRunID, InstanceID: staleInstanceID,
+		DeploymentID:   "conformance",
 		ConcurrencyKey: "sha256:retry-plan", OwnershipClaimID: "old-plan-claim",
 		Status: runs.AttemptClaimed, ClaimedAt: retryCreatedAt, HeartbeatAt: retryCreatedAt,
 	}))
@@ -279,6 +280,7 @@ func TestStoreConformance(t *testing.T) {
 	replacementAttemptID := mustID(t)
 	require.NoError(t, store.CreateAttempt(ctx, runs.RunAttempt{
 		ID: replacementAttemptID, RunID: retryRunID, InstanceID: replacementInstanceID,
+		DeploymentID:   "conformance",
 		ConcurrencyKey: "sha256:retry-plan", OwnershipClaimID: "new-plan-claim",
 		Status: runs.AttemptClaimed, ClaimedAt: recoveredAt, HeartbeatAt: recoveredAt,
 	}))
@@ -306,6 +308,51 @@ func TestStoreConformance(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, retryProjects.ProjectRuns, 2)
 
+	// Older releases completed the Run before terminalizing its attempt. A
+	// takeover repairs that ordering idempotently instead of blocking forever.
+	terminalCreatedAt := retryCompletedAt.Add(time.Second)
+	terminalRunID := mustID(t)
+	terminalPull := 28
+	terminalRun := runs.Run{
+		ID: terminalRunID, Repository: "example/infrastructure", PullNumber: &terminalPull,
+		Command: runs.CommandPlan, Trigger: runs.TriggerComment, Actor: "operator",
+		BaseRef: "main", HeadRef: "terminal-parent", HeadSHA: "cab004e",
+		Status: runs.StatusRunning, CreatedAt: terminalCreatedAt, StartedAt: &terminalCreatedAt,
+	}
+	require.NoError(t, store.CreateRun(ctx, terminalRun))
+	terminalInstanceID := mustID(t)
+	require.NoError(t, store.RegisterInstance(ctx, runs.ExecutionInstance{
+		ID: terminalInstanceID, ReplicaID: "atlantis-terminal", DeploymentID: "conformance",
+		StartedAt: terminalCreatedAt, HeartbeatAt: terminalCreatedAt,
+	}))
+	terminalAttemptID := mustID(t)
+	require.NoError(t, store.CreateAttempt(ctx, runs.RunAttempt{
+		ID: terminalAttemptID, RunID: terminalRunID, InstanceID: terminalInstanceID,
+		DeploymentID: "conformance", ConcurrencyKey: "sha256:terminal-parent",
+		OwnershipClaimID: "old-terminal-claim", Status: runs.AttemptClaimed,
+		ClaimedAt: terminalCreatedAt, HeartbeatAt: terminalCreatedAt,
+	}))
+	require.NoError(t, store.StartAttempt(ctx, terminalAttemptID, terminalCreatedAt))
+	terminalCompletedAt := terminalCreatedAt.Add(time.Minute)
+	require.NoError(t, store.CompleteRun(ctx, runs.RunCompletion{
+		ID: terminalRunID, Status: runs.StatusSucceeded, CompletedAt: terminalCompletedAt,
+	}))
+	terminalRecoveredAt := terminalCompletedAt.Add(time.Minute)
+	terminalTakeover, err := store.PrepareAttemptTakeover(ctx, runs.AttemptTakeoverRequest{
+		ConcurrencyKey: "sha256:terminal-parent", OwnershipClaimID: "new-terminal-claim",
+		HeartbeatBefore: terminalRecoveredAt.Add(-time.Minute), RecoveredAt: terminalRecoveredAt,
+		Repository: terminalRun.Repository, PullNumber: &terminalPull, Command: terminalRun.Command,
+		Trigger: terminalRun.Trigger, Actor: terminalRun.Actor, BaseRef: terminalRun.BaseRef,
+		HeadRef: terminalRun.HeadRef, HeadSHA: terminalRun.HeadSHA,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, terminalTakeover.RecoveredAttempt)
+	require.Equal(t, runs.AttemptSucceeded, terminalTakeover.RecoveredAttempt.Status)
+	require.Nil(t, terminalTakeover.RetryRun)
+	storedTerminalRun, err := store.GetRun(ctx, terminalRunID)
+	require.NoError(t, err)
+	require.Equal(t, runs.StatusSucceeded, storedTerminalRun.Status)
+
 	// A stale apply after the side-effect marker becomes unknown and blocks
 	// further mutating admission until an operator records reconciliation.
 	unknownCreatedAt := retryCompletedAt.Add(time.Second)
@@ -326,6 +373,7 @@ func TestStoreConformance(t *testing.T) {
 	unknownAttemptID := mustID(t)
 	require.NoError(t, store.CreateAttempt(ctx, runs.RunAttempt{
 		ID: unknownAttemptID, RunID: unknownRunID, InstanceID: unknownInstanceID,
+		DeploymentID:   "conformance",
 		ConcurrencyKey: "sha256:unknown-apply", OwnershipClaimID: "old-apply-claim",
 		Status: runs.AttemptClaimed, ClaimedAt: unknownCreatedAt, HeartbeatAt: unknownCreatedAt,
 	}))
@@ -351,7 +399,7 @@ func TestStoreConformance(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, unknownAttemptID, stillBlocked.UnreconciledUnknown.ID)
 	require.NoError(t, store.ReconcileAttempt(ctx, runs.AttemptReconciliation{
-		ID: unknownAttemptID, At: unknownRecoveredAt.Add(time.Second), Actor: "operator",
+		ID: unknownAttemptID, AuditEventID: mustID(t), At: unknownRecoveredAt.Add(time.Second), Actor: "operator",
 		Summary: "state inspected; fresh plan generated",
 	}))
 	afterReconciliation, err := store.PrepareAttemptTakeover(ctx, unknownRequest)
@@ -363,7 +411,7 @@ func TestStoreConformance(t *testing.T) {
 		RunMetadataBefore: &retentionCutoff,
 	})
 	require.NoError(t, err)
-	require.Equal(t, int64(2), retention.RunsDeleted)
+	require.Equal(t, int64(3), retention.RunsDeleted)
 	require.Equal(t, int64(2), retention.ProjectRunsDeleted)
 	require.Equal(t, int64(0), retention.OutputChunksDeleted)
 	_, err = store.GetRun(ctx, runID)

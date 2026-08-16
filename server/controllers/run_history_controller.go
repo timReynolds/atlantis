@@ -5,10 +5,12 @@ package controllers
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -22,17 +24,25 @@ import (
 )
 
 const (
-	runHistoryPageLimit   = 100
-	runHistoryOutputLimit = 100
-	runHistoryTimeFormat  = "2006-01-02 15:04:05 UTC"
+	runHistoryPageLimit    = 100
+	runHistoryOutputLimit  = 100
+	runHistoryTimeFormat   = "2006-01-02 15:04:05 UTC"
+	maxReconciliationBytes = 4096
 )
 
-// RunHistoryController serves authenticated, read-only durable history pages.
+type runAttemptReconciler interface {
+	GetAttempt(context.Context, runs.ID) (runs.RunAttempt, error)
+	ReconcileAttempt(context.Context, runs.AttemptReconciliation) error
+}
+
+// RunHistoryController serves authenticated durable history pages and the
+// explicit operator reconciliation endpoint for unknown attempts.
 type RunHistoryController struct {
 	AtlantisVersion       string
-	AtlantisURL           *url.URL                     `validate:"required"`
-	Logger                logging.SimpleLogging        `validate:"required"`
-	Store                 runs.Reader                  `validate:"required"`
+	AtlantisURL           *url.URL              `validate:"required"`
+	Logger                logging.SimpleLogging `validate:"required"`
+	Store                 runs.Reader           `validate:"required"`
+	AttemptReconciler     runAttemptReconciler
 	RunListTemplate       web_templates.TemplateWriter `validate:"required"`
 	RunDetailTemplate     web_templates.TemplateWriter `validate:"required"`
 	ProjectDetailTemplate web_templates.TemplateWriter `validate:"required"`
@@ -40,6 +50,90 @@ type RunHistoryController struct {
 	WebAuthentication     bool
 	WebUsername           string
 	WebPassword           string
+}
+
+// ReconcileAttempt records an authenticated operator's explicit resolution of
+// an unknown Terraform mutation. The attempt remains unknown history.
+func (c *RunHistoryController) ReconcileAttempt(w http.ResponseWriter, r *http.Request) {
+	if !c.authorize(w, r) {
+		return
+	}
+	if c.AttemptReconciler == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Header.Get("X-Atlantis-Reconcile-Unknown") != "true" {
+		c.respondError(w, r, http.StatusForbidden, errors.New("missing reconciliation confirmation header"))
+		return
+	}
+	if mediaType := strings.TrimSpace(strings.SplitN(r.Header.Get("Content-Type"), ";", 2)[0]); mediaType != "application/json" {
+		c.respondError(w, r, http.StatusUnsupportedMediaType, errors.New("reconciliation requires application/json"))
+		return
+	}
+	runID, err := pathRunID(r, "run-id")
+	if err != nil {
+		c.respondError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	attemptID, err := pathRunID(r, "attempt-id")
+	if err != nil {
+		c.respondError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	attempt, err := c.AttemptReconciler.GetAttempt(r.Context(), attemptID)
+	if err != nil {
+		c.respondStoreError(w, r, err)
+		return
+	}
+	if attempt.RunID != runID {
+		c.respondError(w, r, http.StatusNotFound, runs.ErrNotFound)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxReconciliationBytes+512)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var request struct {
+		Summary string `json:"summary"`
+	}
+	if err := decoder.Decode(&request); err != nil {
+		c.respondError(w, r, http.StatusBadRequest, fmt.Errorf("decoding reconciliation request: %w", err))
+		return
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		c.respondError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	request.Summary = strings.TrimSpace(request.Summary)
+	if request.Summary == "" || len([]byte(request.Summary)) > maxReconciliationBytes {
+		c.respondError(w, r, http.StatusBadRequest, errors.New("reconciliation summary must be between 1 and 4096 bytes"))
+		return
+	}
+	auditID, err := runs.NewID()
+	if err != nil {
+		c.respondError(w, r, http.StatusInternalServerError, fmt.Errorf("generating reconciliation audit ID: %w", err))
+		return
+	}
+	actor, _, _ := r.BasicAuth()
+	if err := c.AttemptReconciler.ReconcileAttempt(r.Context(), runs.AttemptReconciliation{
+		ID: attemptID, AuditEventID: auditID, At: time.Now().UTC(), Actor: actor, Summary: request.Summary,
+	}); err != nil {
+		c.respondStoreError(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]string{"attempt_id": string(attemptID), "status": "reconciled"})
+}
+
+func ensureJSONEOF(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("reconciliation request must contain one JSON object")
+		}
+		return fmt.Errorf("decoding reconciliation request: %w", err)
+	}
+	return nil
 }
 
 // ListRuns serves /runs and the repository- and pull-scoped aliases.
@@ -266,6 +360,8 @@ func (c *RunHistoryController) respondStoreError(w http.ResponseWriter, r *http.
 	status := http.StatusInternalServerError
 	if errors.Is(err, runs.ErrNotFound) {
 		status = http.StatusNotFound
+	} else if errors.Is(err, runs.ErrConflict) {
+		status = http.StatusConflict
 	} else if strings.Contains(err.Error(), "decoding") || strings.Contains(err.Error(), "validating") {
 		status = http.StatusBadRequest
 	}

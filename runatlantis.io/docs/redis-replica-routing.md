@@ -77,6 +77,23 @@ Graceful shutdown marks the owner store as draining, stops HTTP traffic, waits f
 
 Internal forwarding is at-least-once. A timeout can leave the ingress replica unsure whether the owner accepted a command, so a provider or manual redelivery can execute it again. Atlantis does not claim exactly-once execution. Ownership or forwarding failures return HTTP 503; monitor failed VCS deliveries and redeliver them when the provider does not retry automatically.
 
+### Reconcile an unknown mutation
+
+If an owner disappears after an apply, import, state removal, or drift remediation crosses its durable side-effect marker, Atlantis records the attempt and Run as `unknown`. Later mutating commands for that pull remain blocked until an operator inspects the recorded output and Terraform state, generates a fresh plan where appropriate, and records an explicit reconciliation.
+
+The authenticated history API provides that operational path. Send the web Basic Auth credentials, a non-empty summary of the checks performed, and the explicit confirmation header:
+
+```bash
+curl --fail-with-body \
+  --user "$ATLANTIS_WEB_USERNAME:$ATLANTIS_WEB_PASSWORD" \
+  --header 'Content-Type: application/json' \
+  --header 'X-Atlantis-Reconcile-Unknown: true' \
+  --data '{"summary":"inspected state and generated a fresh plan"}' \
+  'https://atlantis.example.test/runs/<run-id>/attempts/<attempt-id>/reconcile'
+```
+
+Reconciliation does not change the historical `unknown` status and does not retry the mutation. It adds the operator, summary, timestamp, and a durable audit event in the same PostgreSQL transaction. Run history must be protected by `--web-basic-auth`; when web authentication is disabled, the endpoint is not available.
+
 ## Redis Requirements
 
 Use a dedicated production Redis deployment or managed service:

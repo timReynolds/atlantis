@@ -439,6 +439,7 @@ func TestRunHistoryReusesLogicalRunForInterruptedPlan(t *testing.T) {
 	}
 	recovered := runs.RunAttempt{
 		ID: oldAttemptID, RunID: retryID, InstanceID: oldInstanceID,
+		DeploymentID:   "prod-eu",
 		ConcurrencyKey: "sha256:pull-ownership-key", OwnershipClaimID: "claim-old",
 		Status: runs.AttemptInterrupted, ClaimedAt: startedAt, StartedAt: &startedAt,
 		HeartbeatAt: testHistoryTime, CompletedAt: &testHistoryTime,
@@ -450,6 +451,7 @@ func TestRunHistoryReusesLogicalRunForInterruptedPlan(t *testing.T) {
 	history := newTestRunHistory(t, writer)
 	ctx := testRunContext(t)
 	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ExecutionDeploymentID = "prod-eu"
 	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
 	ctx.OwnershipClaimID = "claim-new"
 	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
@@ -477,6 +479,7 @@ func TestRunHistoryBlocksMutationWithUnreconciledUnknownAttempt(t *testing.T) {
 	history := newTestRunHistory(t, writer)
 	ctx := testRunContext(t)
 	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ExecutionDeploymentID = "prod-eu"
 	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
 	ctx.OwnershipClaimID = "claim-new"
 	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerComment)
@@ -502,6 +505,7 @@ func TestRunHistoryAllowsFreshPlanWithUnreconciledUnknownAttempt(t *testing.T) {
 	history := newTestRunHistory(t, writer)
 	ctx := testRunContext(t)
 	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ExecutionDeploymentID = "prod-eu"
 	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
 	ctx.OwnershipClaimID = "claim-new"
 	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
@@ -517,6 +521,7 @@ func claimedAttemptForHistory(t *testing.T) runs.RunAttempt {
 		ID:             "0198a0df-85f1-7d83-a60b-2e57b725c62c",
 		RunID:          "0198a0df-85f1-7d83-a60b-2e57b725c620",
 		InstanceID:     "0198a0df-85f1-7d83-a60b-2e57b725c622",
+		DeploymentID:   "prod-eu",
 		ConcurrencyKey: "sha256:pull-ownership-key", OwnershipClaimID: "claim-old",
 		Status: runs.AttemptClaimed, ClaimedAt: testHistoryTime, HeartbeatAt: testHistoryTime,
 	}

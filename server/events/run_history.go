@@ -180,7 +180,7 @@ func (h *RunHistory) prepareAttemptRecovery(ctx *command.Context, run runs.Run, 
 	if h.executionRecovery == nil {
 		return attemptRecoveryDecision{err: errors.New("execution recovery store is required")}
 	}
-	if ctx.ConcurrencyKey == "" || ctx.OwnershipClaimID == "" {
+	if ctx.ExecutionDeploymentID == "" || ctx.ConcurrencyKey == "" || ctx.OwnershipClaimID == "" {
 		return attemptRecoveryDecision{err: errors.New("routed execution identity is incomplete")}
 	}
 	result, err := h.executionRecovery.PrepareAttemptTakeover(context.Background(), runs.AttemptTakeoverRequest{

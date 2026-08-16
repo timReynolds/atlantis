@@ -41,7 +41,7 @@
   {{ if .Run.RawMetadata }}<details><summary>Run metadata</summary><pre class="history-metadata">{{ .Run.RawMetadata }}</pre></details>{{ end }}
 
   <section class="history-section" id="attempts">
-    <div class="history-section-title"><h4>Execution attempts</h4><span>{{ len .Attempts }} process attempts</span></div>
+    <div class="history-section-title"><h4>Execution attempts</h4><span>{{ len .Attempts }} shown</span></div>
     {{ if .Attempts }}
     <div class="history-table-wrap"><table class="u-full-width history-table history-attempt-table">
       <thead><tr><th>Attempt</th><th>Replica</th><th>Lifecycle</th><th>Mutation boundary</th><th>Outcome</th></tr></thead>
@@ -56,6 +56,7 @@
       {{ end }}</tbody>
     </table></div>
     {{ else }}<div class="history-empty">This run predates durable HA attempt tracking.</div>{{ end }}
+	{{ if .AttemptNextPath }}<a class="button history-next" href="{{ .CleanedBasePath }}{{ .AttemptNextPath }}#attempts">Next 100 attempts</a>{{ end }}
   </section>
 
   <section class="history-section">

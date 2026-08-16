@@ -239,6 +239,7 @@ type RunHistoryDetailData struct {
 	Run             RunHistoryRun
 	Summary         runs.ProjectRunSummary
 	Attempts        []RunHistoryAttempt
+	AttemptNextPath string
 	Projects        []RunHistoryProject
 	Filter          RunHistoryProjectFilter
 	NextPath        string

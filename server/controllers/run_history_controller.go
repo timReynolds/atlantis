@@ -222,7 +222,9 @@ func (c *RunHistoryController) GetRun(w http.ResponseWriter, r *http.Request) {
 	for _, project := range projects.ProjectRuns {
 		projectItems = append(projectItems, presentProject(project))
 	}
-	attemptPage, err := c.Store.ListRunAttempts(r.Context(), runID, runs.PageRequest{Limit: runHistoryPageLimit})
+	attemptPage, err := c.Store.ListRunAttempts(r.Context(), runID, runs.PageRequest{
+		Limit: runHistoryPageLimit, Cursor: r.URL.Query().Get("attempt_cursor"),
+	})
 	if err != nil {
 		c.respondStoreError(w, r, err)
 		return
@@ -245,7 +247,8 @@ func (c *RunHistoryController) GetRun(w http.ResponseWriter, r *http.Request) {
 		AtlantisVersion: c.AtlantisVersion, CleanedBasePath: c.AtlantisURL.Path,
 		Run: presentRun(run), Summary: summary, Projects: projectItems, Attempts: attemptItems,
 		Filter: projectPresentation, NextPath: nextCursorPath(r, projects.NextCursor),
-		RelatedRuns: related,
+		AttemptNextPath: nextNamedCursorPath(r, "attempt_cursor", attemptPage.NextCursor),
+		RelatedRuns:     related,
 	}
 	c.execute(w, r, c.RunDetailTemplate, data)
 }
@@ -713,11 +716,15 @@ func prettyMetadata(metadata runs.Metadata) string {
 }
 
 func nextCursorPath(r *http.Request, cursor string) string {
+	return nextNamedCursorPath(r, "cursor", cursor)
+}
+
+func nextNamedCursorPath(r *http.Request, name, cursor string) string {
 	if cursor == "" {
 		return ""
 	}
 	query := r.URL.Query()
-	query.Set("cursor", cursor)
+	query.Set(name, cursor)
 	return r.URL.Path + "?" + query.Encode()
 }
 

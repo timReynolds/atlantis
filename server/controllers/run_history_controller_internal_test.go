@@ -230,7 +230,7 @@ func TestRunHistoryControllerPresentsAttemptReplicaIdentity(t *testing.T) {
 			ID: attemptID, RunID: runID, InstanceID: instanceID,
 			ConcurrencyKey: "sha256:key", OwnershipClaimID: "claim-2",
 			Status: runs.AttemptRunning, ClaimedAt: startedAt, StartedAt: &startedAt, HeartbeatAt: startedAt,
-		}}},
+		}}, NextCursor: "next-attempt"},
 		instanceResult: runs.ExecutionInstance{
 			ID: instanceID, ReplicaID: "atlantis-2", DeploymentID: "production",
 			StartedAt: startedAt, HeartbeatAt: startedAt, Version: "1.2.3", Commit: "abc123",
@@ -239,7 +239,7 @@ func TestRunHistoryControllerPresentsAttemptReplicaIdentity(t *testing.T) {
 	template := &recordingHistoryTemplate{}
 	controller := testRunHistoryController(t, reader, template)
 	controller.WebAuthentication = true
-	request := mux.SetURLVars(httptest.NewRequest(http.MethodGet, "/runs/"+string(runID), nil), map[string]string{
+	request := mux.SetURLVars(httptest.NewRequest(http.MethodGet, "/runs/"+string(runID)+"?attempt_cursor=current-attempt", nil), map[string]string{
 		"run-id": string(runID),
 	})
 	request.SetBasicAuth("operator", "password")
@@ -254,6 +254,8 @@ func TestRunHistoryControllerPresentsAttemptReplicaIdentity(t *testing.T) {
 	require.Equal(t, "atlantis-2", data.Attempts[0].ReplicaID)
 	require.Equal(t, "production", data.Attempts[0].DeploymentID)
 	require.Equal(t, "abc123", data.Attempts[0].Commit)
+	require.Equal(t, "current-attempt", reader.attemptPageRequest.Cursor)
+	require.Contains(t, data.AttemptNextPath, "attempt_cursor=next-attempt")
 }
 
 func TestRunHistoryControllerReconcilesUnknownAttemptWithAuditIdentity(t *testing.T) {
@@ -339,21 +341,22 @@ func (t *recordingHistoryTemplate) Execute(_ io.Writer, data any) error {
 }
 
 type recordingRunReader struct {
-	failOnRead       bool
-	readCalled       bool
-	listRunsFilter   runs.RunFilter
-	listRunsPage     runs.PageRequest
-	listRunsResult   runs.RunPage
-	getRunResult     runs.Run
-	getProjectResult runs.ProjectRun
-	getOutputResult  runs.OutputPage
-	outputAfter      int64
-	outputLimit      int
-	auditFilter      runs.AuditFilter
-	attemptPage      runs.AttemptPage
-	attemptResult    runs.RunAttempt
-	instanceResult   runs.ExecutionInstance
-	reconciliation   runs.AttemptReconciliation
+	failOnRead         bool
+	readCalled         bool
+	listRunsFilter     runs.RunFilter
+	listRunsPage       runs.PageRequest
+	listRunsResult     runs.RunPage
+	getRunResult       runs.Run
+	getProjectResult   runs.ProjectRun
+	getOutputResult    runs.OutputPage
+	outputAfter        int64
+	outputLimit        int
+	auditFilter        runs.AuditFilter
+	attemptPage        runs.AttemptPage
+	attemptPageRequest runs.PageRequest
+	attemptResult      runs.RunAttempt
+	instanceResult     runs.ExecutionInstance
+	reconciliation     runs.AttemptReconciliation
 }
 
 func (r *recordingRunReader) markRead() {
@@ -413,8 +416,9 @@ func (r *recordingRunReader) GetAttempt(context.Context, runs.ID) (runs.RunAttem
 	return r.attemptResult, nil
 }
 
-func (r *recordingRunReader) ListRunAttempts(context.Context, runs.ID, runs.PageRequest) (runs.AttemptPage, error) {
+func (r *recordingRunReader) ListRunAttempts(_ context.Context, _ runs.ID, page runs.PageRequest) (runs.AttemptPage, error) {
 	r.markRead()
+	r.attemptPageRequest = page
 	return r.attemptPage, nil
 }
 

@@ -4,6 +4,7 @@
 package controllers
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -35,7 +36,10 @@ import (
 	tally "github.com/uber-go/tally/v4"
 )
 
-const atlantisTokenHeader = "X-Atlantis-Token"
+const (
+	atlantisTokenHeader      = "X-Atlantis-Token"
+	driftHistoryWriteTimeout = 10 * time.Second
+)
 
 var nonPRPullCounter atomic.Int64
 
@@ -2028,6 +2032,14 @@ func driftProjectsFromCommandResult(result *command.Result, ref, baseBranch, res
 		indexByIdentity[identity] = len(projects)
 		projects = append(projects, projectDrift)
 	}
+	for i := range projects {
+		if projects[i].Error == "" {
+			checked := projects[i].LastChecked
+			projects[i].LastSuccessfulChecked = &checked
+		} else {
+			projects[i].LastSuccessfulChecked = nil
+		}
+	}
 
 	return projects
 }
@@ -2054,11 +2066,6 @@ func newProjectDriftFromResult(pr command.ProjectResult, ref, baseBranch, resolv
 		projectDrift.Drift = models.NewDriftSummaryFromPlanSuccess(pr.PlanSuccess)
 		projectDrift.PlanOutput = pr.PlanSuccess.TerraformOutput
 	}
-	if projectDrift.Error == "" {
-		checked := projectDrift.LastChecked
-		projectDrift.LastSuccessfulChecked = &checked
-	}
-
 	return projectDrift
 }
 
@@ -2287,14 +2294,16 @@ func (a *APIController) DetectDrift(w http.ResponseWriter, r *http.Request) {
 		if a.DriftHistory == nil {
 			return nil
 		}
+		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), driftHistoryWriteTimeout)
+		defer cancel()
 		record := newDriftDetectionRecord(
 			detectionResult, baseRepo.ID(), normalizedRef, normalizedBaseBranch,
 			ctx.Pull.HeadCommit, string(ctx.RunID), detectionStartedAt, time.Now(), runFailed,
 		)
 		if atomicHistoryEnabled {
-			return atomicHistory.RecordDetectionWithLatest(r.Context(), baseRepo.ID(), record, reconcile)
+			return atomicHistory.RecordDetectionWithLatest(writeCtx, baseRepo.ID(), record, reconcile)
 		}
-		return a.DriftHistory.RecordDetection(r.Context(), record)
+		return a.DriftHistory.RecordDetection(writeCtx, record)
 	}
 
 	// Setup working directory

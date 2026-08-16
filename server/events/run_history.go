@@ -391,13 +391,19 @@ func (h *RunHistory) recordProject(ctx command.ProjectContext, phase command.Nam
 	if len(chunks) == 0 {
 		return
 	}
+	sessionValue, ok := h.sessions.Load(ctx.RunID)
+	if !ok {
+		return
+	}
+	session := sessionValue.(*runSession)
 	for len(chunks) > 0 {
 		batchSize := min(len(chunks), resultOutputWriteBatch)
 		batch := chunks[:batchSize]
 		if err := writeRunHistory(func(writeCtx context.Context) error {
 			return h.writer.AppendOutput(writeCtx, batch)
 		}); err != nil {
-			h.logError(ctx.Log, "persisting suppressed project output", err)
+			h.markPersistenceFailed(ctx.Log, session, "persisting suppressed project output", err)
+			return
 		}
 		chunks = chunks[batchSize:]
 	}

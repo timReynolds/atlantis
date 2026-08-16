@@ -50,8 +50,10 @@ type recordingDriftSender struct {
 }
 
 type recordingDetectionHistory struct {
-	records []drift.DetectionRecord
-	err     error
+	records          []drift.DetectionRecord
+	contextErrors    []error
+	contextDeadlines []bool
+	err              error
 }
 
 type recordingAPIHistoryWriter struct {
@@ -93,8 +95,11 @@ func (*recordingAPIHistoryWriter) AppendAuditEvent(context.Context, runs.AuditEv
 	return nil
 }
 
-func (r *recordingDetectionHistory) RecordDetection(_ context.Context, record drift.DetectionRecord) error {
+func (r *recordingDetectionHistory) RecordDetection(ctx context.Context, record drift.DetectionRecord) error {
 	r.records = append(r.records, record)
+	r.contextErrors = append(r.contextErrors, ctx.Err())
+	_, hasDeadline := ctx.Deadline()
+	r.contextDeadlines = append(r.contextDeadlines, hasDeadline)
 	return r.err
 }
 
@@ -738,6 +743,9 @@ func TestAPIController_DetectDriftSetupErrorRedactsCredentials(t *testing.T) {
 	})
 	req, _ := http.NewRequest("POST", "/api/drift/detect", bytes.NewBuffer(body))
 	req.Header.Set(atlantisTokenHeader, atlantisToken)
+	requestCtx, cancelRequest := context.WithCancel(req.Context())
+	cancelRequest()
+	req = req.WithContext(requestCtx)
 	w := httptest.NewRecorder()
 	ac.DetectDrift(w, req)
 
@@ -749,6 +757,9 @@ func TestAPIController_DetectDriftSetupErrorRedactsCredentials(t *testing.T) {
 	Equals(t, 1, len(runWriter.runsCompleted))
 	Equals(t, runs.StatusFailed, runWriter.runsCompleted[0].Status)
 	Equals(t, 1, len(history.records))
+	Equals(t, 1, len(history.contextErrors))
+	Equals(t, nil, history.contextErrors[0])
+	Equals(t, true, history.contextDeadlines[0])
 	Equals(t, drift.DetectionStatusFailed, history.records[0].Run.Status)
 	Equals(t, string(runWriter.runsCreated[0].ID), history.records[0].Run.ID)
 }
@@ -4704,6 +4715,7 @@ func TestAPIController_DetectDrift_PolicyCheckFailureIsVisibleAndSuppressesWebho
 		Store(Eq("gitlab.com/Repo"), Any[models.ProjectDrift]()).
 		GetCapturedArguments()
 	Assert(t, strings.Contains(stored.Error, "policy_check failed: policy denied"), "expected policy error in stored drift, got %q", stored.Error)
+	Assert(t, stored.LastSuccessfulChecked == nil, "failed policy check must not advance successful freshness")
 	Equals(t, 0, sender.calls)
 }
 
@@ -5247,6 +5259,7 @@ func TestAPIController_DetectDrift_SkipsPolicyCheckResults(t *testing.T) {
 	Equals(t, events.DefaultWorkspace, storedDrift.Workspace)
 	Equals(t, true, storedDrift.Drift.HasDrift)
 	Equals(t, 1, storedDrift.Drift.ToAdd)
+	Assert(t, storedDrift.LastSuccessfulChecked != nil, "successful policy merge must advance successful freshness")
 
 	response, _ := io.ReadAll(w.Result().Body)
 	var result controllers.DriftDetectionResultAPI

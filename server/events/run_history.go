@@ -169,6 +169,7 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 		}); err != nil {
 			h.logError(lifecycle.ctx.Log, "completing project run history", err)
 			session.persistenceIncomplete.Store(true)
+			return false
 		}
 		if status == runs.StatusFailed || status == runs.StatusPartial || status == runs.StatusCancelled {
 			failed++

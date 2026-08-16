@@ -162,10 +162,15 @@ func TestRunHistoryLeavesRunIncompleteWhenProjectCompletionCannotPersist(t *test
 		RunID: ctx.RunID, ProjectName: "network", RepoRelDir: "network", Workspace: "default", Log: ctx.Log,
 	})
 	history.recordProject(projectCtx, command.Plan, command.ProjectCommandOutput{PlanSuccess: &models.PlanSuccess{}})
+	secondProject := history.beginProject(command.ProjectContext{
+		RunID: ctx.RunID, ProjectName: "database", RepoRelDir: "database", Workspace: "default", Log: ctx.Log,
+	})
+	history.recordProject(secondProject, command.Plan, command.ProjectCommandOutput{PlanSuccess: &models.PlanSuccess{}})
 
 	lifecycle.Finish()
 
 	require.Empty(t, writer.runsCompleted, "the running record must remain visibly incomplete")
+	require.Equal(t, 1, writer.completeProjectCalls, "one store outage must stop later completion writes")
 }
 
 func TestRunHistoryLeavesRunIncompleteWhenFinalOutputCannotPersist(t *testing.T) {
@@ -234,15 +239,16 @@ func testRunContext(t *testing.T) *command.Context {
 }
 
 type recordingRunWriter struct {
-	mu                 sync.Mutex
-	runsCreated        []runs.Run
-	runsCompleted      []runs.RunCompletion
-	projectsCreated    []runs.ProjectRun
-	projectsCompleted  []runs.ProjectRunCompletion
-	output             []runs.OutputChunk
-	audit              []runs.AuditEvent
-	completeRunErr     error
-	completeProjectErr error
+	mu                   sync.Mutex
+	runsCreated          []runs.Run
+	runsCompleted        []runs.RunCompletion
+	projectsCreated      []runs.ProjectRun
+	projectsCompleted    []runs.ProjectRunCompletion
+	output               []runs.OutputChunk
+	audit                []runs.AuditEvent
+	completeRunErr       error
+	completeProjectErr   error
+	completeProjectCalls int
 }
 
 func (w *recordingRunWriter) CreateRun(_ context.Context, run runs.Run) error {
@@ -274,6 +280,9 @@ func (w *recordingRunWriter) CreateProjectRun(_ context.Context, project runs.Pr
 func (w *recordingRunWriter) StartProjectRun(context.Context, runs.ID, time.Time) error { return nil }
 
 func (w *recordingRunWriter) CompleteProjectRun(_ context.Context, completion runs.ProjectRunCompletion) error {
+	w.mu.Lock()
+	w.completeProjectCalls++
+	w.mu.Unlock()
 	if w.completeProjectErr != nil {
 		return w.completeProjectErr
 	}

@@ -64,7 +64,7 @@ func TestRegisterExecutionInstance(t *testing.T) {
 func TestCreateAttemptMapsActiveConcurrencyConflict(t *testing.T) {
 	store, mock := newMockStore(t)
 	attempt := claimedAttempt()
-	mock.ExpectExec("WITH superseded_attempts AS").
+	mock.ExpectExec("(?s)WITH superseded_attempts AS .*RETURNING 1").
 		WithArgs(
 			attempt.ID, attempt.RunID, attempt.InstanceID, attempt.DeploymentID, attempt.ConcurrencyKey,
 			attempt.OwnershipClaimID, attempt.Status, attempt.ClaimedAt, nil,

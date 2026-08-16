@@ -159,6 +159,7 @@ func (s *Store) CreateAttempt(ctx context.Context, attempt runs.RunAttempt) erro
           AND concurrency_key = $5
           AND ownership_claim_id <> $6
           AND status IN ($7, $20)
+        RETURNING 1
     )
     INSERT INTO run_attempts (
         id, run_id, instance_id, deployment_id, concurrency_key, ownership_claim_id, status,

@@ -213,6 +213,9 @@ func (c *DefaultCommandRunner) runAutoplanCommand(baseRepo models.Repo, headRepo
 		Trigger:              command.AutoTrigger,
 		ExecutionLease:       routing.Lease,
 		RecoverExternalPlans: routing.RecoverExternalPlans,
+		ExecutionInstanceID:  routing.InstanceID,
+		ConcurrencyKey:       routing.ConcurrencyKey,
+		OwnershipClaimID:     routing.OwnershipClaimID,
 	}
 	if !c.validateCtxAndComment(ctx, command.Autoplan, true) {
 		return
@@ -552,6 +555,9 @@ func (c *DefaultCommandRunner) runCommentCommand(baseRepo models.Repo, maybeHead
 		TeamAllowlistChecker: c.TeamAllowlistChecker,
 		ExecutionLease:       routing.Lease,
 		RecoverExternalPlans: routing.RecoverExternalPlans,
+		ExecutionInstanceID:  routing.InstanceID,
+		ConcurrencyKey:       routing.ConcurrencyKey,
+		OwnershipClaimID:     routing.OwnershipClaimID,
 	}
 
 	if !c.validateCtxAndComment(ctx, cmd.Name, true) {

@@ -397,6 +397,7 @@ func parseStatuses(value string) ([]runs.Status, error) {
 		runs.StatusPending: true, runs.StatusRunning: true, runs.StatusSucceeded: true,
 		runs.StatusUnchanged: true, runs.StatusFailed: true, runs.StatusPartial: true,
 		runs.StatusCancelled: true, runs.StatusSkipped: true,
+		runs.StatusUnknown: true,
 	}
 	values := splitFilterValues(value)
 	statuses := make([]runs.Status, 0, len(values))

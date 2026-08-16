@@ -160,7 +160,7 @@ func TestStoreConformance(t *testing.T) {
 	require.NoError(t, store.CompleteProjectRun(ctx, projectCompletion))
 	require.NoError(t, store.CompleteProjectRun(ctx, projectCompletion), "completion replay must be idempotent")
 	require.NoError(t, store.CompleteRun(ctx, runs.RunCompletion{
-		ID: runID, Status: runs.StatusSucceeded, CompletedAt: completedAt,
+		ID: runID, Status: runs.StatusUnknown, CompletedAt: completedAt,
 	}))
 
 	event := runs.AuditEvent{
@@ -173,7 +173,7 @@ func TestStoreConformance(t *testing.T) {
 
 	storedRun, err := store.GetRun(ctx, runID)
 	require.NoError(t, err)
-	require.Equal(t, runs.StatusSucceeded, storedRun.Status)
+	require.Equal(t, runs.StatusUnknown, storedRun.Status)
 	require.Equal(t, run.HeadSHA, storedRun.HeadSHA)
 	storedProject, err := store.GetProjectRun(ctx, projectRunID)
 	require.NoError(t, err)
@@ -183,7 +183,7 @@ func TestStoreConformance(t *testing.T) {
 
 	runPage, err := store.ListRuns(ctx, runs.RunFilter{
 		Repository: run.Repository, PullNumber: &pull,
-		Commands: []runs.Command{runs.CommandPlan}, Statuses: []runs.Status{runs.StatusSucceeded},
+		Commands: []runs.Command{runs.CommandPlan}, Statuses: []runs.Status{runs.StatusUnknown},
 	}, runs.PageRequest{Limit: 1})
 	require.NoError(t, err)
 	require.Len(t, runPage.Runs, 1)

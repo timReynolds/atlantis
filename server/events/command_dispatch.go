@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/runatlantis/atlantis/server/core/ownership"
+	"github.com/runatlantis/atlantis/server/core/runs"
 	commandpkg "github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/logging"
@@ -134,15 +135,17 @@ func (d *RoutedCommandDispatcher) route(key ownership.Key, execute func(string) 
 
 // LocalCommandExecutor hydrates credentials and runs commands on the owner.
 type LocalCommandExecutor struct {
-	Hydrator    RepoHydrator
-	Runner      CommandRunner
-	PullCleaner PullCleaner
-	WorkingDir  PullStateCleaner
-	ClaimGuard  *LocalClaimGuard
-	Owners      ownership.Store
-	Logger      logging.SimpleLogging
-	TestingMode bool
-	asyncWG     sync.WaitGroup
+	Hydrator     RepoHydrator
+	Runner       CommandRunner
+	PullCleaner  PullCleaner
+	WorkingDir   PullStateCleaner
+	ClaimGuard   *LocalClaimGuard
+	Owners       ownership.Store
+	Logger       logging.SimpleLogging
+	InstanceID   runs.ID
+	DeploymentID string
+	TestingMode  bool
+	asyncWG      sync.WaitGroup
 }
 
 func (e *LocalCommandExecutor) ExecuteComment(command CommentDispatch, claimID string) error {
@@ -191,11 +194,16 @@ func (e *LocalCommandExecutor) ExecuteComment(command CommentDispatch, claimID s
 		return err
 	}
 
+	routing, err := e.routingContext(command.OwnershipKey(), claimID, lease, localStateReset)
+	if err != nil {
+		release()
+		return err
+	}
 	e.run(func() {
 		defer release()
 		routedRunner.RunRoutedCommentCommand(
 			baseRepo, headRepo, pull, command.User, command.PullNum, command.Command,
-			commandpkg.RoutingContext{Lease: lease, RecoverExternalPlans: localStateReset},
+			routing,
 		)
 	})
 	return nil
@@ -235,11 +243,16 @@ func (e *LocalCommandExecutor) ExecuteAutoplan(command AutoplanDispatch, claimID
 		return err
 	}
 
+	routing, err := e.routingContext(command.OwnershipKey(), claimID, lease, localStateReset)
+	if err != nil {
+		release()
+		return err
+	}
 	e.run(func() {
 		defer release()
 		routedRunner.RunRoutedAutoplanCommand(
 			baseRepo, headRepo, pull, command.User,
-			commandpkg.RoutingContext{Lease: lease, RecoverExternalPlans: localStateReset},
+			routing,
 		)
 	})
 	return nil
@@ -348,6 +361,28 @@ func (e *LocalCommandExecutor) acquire(
 		return nil, noopRelease, false, err
 	}
 	return lease, release, localStateReset, nil
+}
+
+func (e *LocalCommandExecutor) routingContext(
+	key ownership.Key,
+	claimID string,
+	lease commandpkg.ExecutionLease,
+	recoverExternalPlans bool,
+) (commandpkg.RoutingContext, error) {
+	routing := commandpkg.RoutingContext{
+		Lease: lease, RecoverExternalPlans: recoverExternalPlans,
+	}
+	if e.InstanceID == "" {
+		return routing, nil
+	}
+	concurrencyKey, err := key.ConcurrencyKey(e.DeploymentID)
+	if err != nil {
+		return commandpkg.RoutingContext{}, fmt.Errorf("deriving durable concurrency key: %w", err)
+	}
+	routing.InstanceID = e.InstanceID
+	routing.ConcurrencyKey = concurrencyKey
+	routing.OwnershipClaimID = claimID
+	return routing, nil
 }
 
 type ownershipExecutionLease struct {

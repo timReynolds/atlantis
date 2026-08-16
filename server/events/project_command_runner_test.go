@@ -2830,6 +2830,20 @@ func (f executionLeaseFunc) Admit(ctx context.Context) error {
 	return f(ctx)
 }
 
+type countingSideEffectMarker struct {
+	calls     int
+	persisted int
+	err       error
+}
+
+func (m *countingSideEffectMarker) MarkSideEffectStarted(context.Context) error {
+	m.calls++
+	if m.persisted == 0 && m.err == nil {
+		m.persisted++
+	}
+	return m.err
+}
+
 // restoringPlanStore writes contents to planPath on Load, simulating an
 // external store restoring a plan after a container restart / re-clone.
 type restoringPlanStore struct {
@@ -3221,12 +3235,14 @@ func TestDefaultProjectCommandRunner_Apply(t *testing.T) {
 				LockKey:      "lock-key",
 			}, nil)
 
+			marker := &countingSideEffectMarker{}
 			ctx := command.ProjectContext{
 				Log:               logging.NewNoopLogger(t),
 				Steps:             c.steps,
 				Workspace:         "default",
 				ApplyRequirements: c.applyReqs,
 				RepoRelDir:        ".",
+				SideEffectMarker:  marker,
 				PullReqStatus: models.PullReqStatus{
 					ApprovalStatus: models.ApprovalStatus{
 						IsApproved: true,
@@ -3246,6 +3262,8 @@ func TestDefaultProjectCommandRunner_Apply(t *testing.T) {
 			res := runner.Apply(ctx)
 			Equals(t, c.expOut, res.ApplySuccess)
 			Equals(t, c.expFailure, res.Failure)
+			Equals(t, 2, marker.calls)
+			Equals(t, 1, marker.persisted)
 
 			for _, step := range c.expSteps {
 				switch step {

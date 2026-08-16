@@ -284,6 +284,8 @@ func newProjectCommandContext(ctx *command.Context,
 
 	return command.ProjectContext{
 		RunID:                      ctx.RunID,
+		AttemptID:                  ctx.AttemptID,
+		SideEffectMarker:           ctx.SideEffectMarker,
 		CommandName:                cmd,
 		SubCommand:                 subCommand,
 		ApplyCmd:                   applyCmd,

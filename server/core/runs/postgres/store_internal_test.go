@@ -32,11 +32,13 @@ func TestLoadMigrations(t *testing.T) {
 	require.NotEmpty(t, migrations)
 	require.Equal(t, int64(1), migrations[0].version)
 	require.Contains(t, migrations[0].sql, "CREATE TABLE run_output_chunks")
-	require.Equal(t, int64(4), migrations[len(migrations)-1].version)
-	require.Contains(t, migrations[len(migrations)-1].sql, "CREATE TABLE run_attempts")
-	require.Contains(t, migrations[len(migrations)-1].sql, "run_attempts_one_active_concurrency_key_idx")
-	require.Contains(t, migrations[len(migrations)-1].sql, "ON run_attempts (deployment_id, concurrency_key)")
-	require.Contains(t, migrations[len(migrations)-1].sql, "status = 'unknown' AND reconciled_at IS NULL")
+	require.Equal(t, int64(4), migrations[3].version)
+	require.Contains(t, migrations[3].sql, "CREATE TABLE run_attempts")
+	require.Contains(t, migrations[3].sql, "run_attempts_one_active_concurrency_key_idx")
+	require.Contains(t, migrations[3].sql, "ON run_attempts (deployment_id, concurrency_key)")
+	require.Contains(t, migrations[3].sql, "status = 'unknown' AND reconciled_at IS NULL")
+	require.Equal(t, int64(5), migrations[len(migrations)-1].version)
+	require.Contains(t, migrations[len(migrations)-1].sql, "'unknown'")
 }
 
 func TestRegisterExecutionInstance(t *testing.T) {
@@ -201,7 +203,7 @@ func TestApplyRetentionKeepsCutoffsIndependent(t *testing.T) {
 		WithArgs(auditBefore, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectExec(regexp.QuoteMeta("WHERE drift_status.identity_hash = retained_drift.identity_hash\n          AND drift_status.last_checked < $1")).
 		WithArgs(driftBefore, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 6))
-	runArgs := []driver.Value{runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, retentionBatchSize}
+	runArgs := []driver.Value{runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, runs.StatusUnknown, retentionBatchSize}
 	mock.ExpectExec("(?s)WITH retained_output AS.*run_attempts.*reconciled_at IS NULL").
 		WithArgs(runArgs...).WillReturnResult(sqlmock.NewResult(0, 8))
 	mock.ExpectExec("(?s)WITH retained_projects AS.*run_attempts.*reconciled_at IS NULL").
@@ -209,10 +211,10 @@ func TestApplyRetentionKeepsCutoffsIndependent(t *testing.T) {
 	mock.ExpectExec("(?s)WITH retained_events AS.*run_attempts.*reconciled_at IS NULL").
 		WithArgs(runArgs...).WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectExec("(?s)WITH retained_runs AS.*run_attempts.*reconciled_at IS NULL").
-		WithArgs(runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, retentionBatchSize).
+		WithArgs(runArgs...).
 		WillReturnResult(sqlmock.NewResult(0, retentionBatchSize))
 	mock.ExpectExec("(?s)WITH retained_runs AS.*run_attempts.*reconciled_at IS NULL").
-		WithArgs(runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, retentionBatchSize).
+		WithArgs(runArgs...).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	result, err := store.ApplyRetention(context.Background(), runs.RetentionPolicy{

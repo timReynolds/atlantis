@@ -70,6 +70,8 @@ func TestRunValidate(t *testing.T) {
 	completed := started.Add(time.Minute)
 	run.CompletedAt = &completed
 	Ok(t, run.Validate())
+	run.Status = runs.StatusUnknown
+	Ok(t, run.Validate())
 
 	run.Metadata = runs.Metadata(`[]`)
 	Assert(t, run.Validate() != nil, "metadata arrays must be rejected")
@@ -115,6 +117,9 @@ func TestProjectRunValidatePreservesAllPlanCounts(t *testing.T) {
 
 	projectRun.Forgets = -1
 	Assert(t, projectRun.Validate() != nil, "negative plan counts must be rejected")
+	projectRun.Forgets = 0
+	projectRun.Status = runs.StatusUnknown
+	Assert(t, projectRun.Validate() != nil, "unknown is a logical run status, not a project result")
 }
 
 func TestPendingProjectRunCanBeRecordedBeforeFanOut(t *testing.T) {

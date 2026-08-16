@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/runatlantis/atlantis/server/core/ownership"
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
@@ -159,13 +160,15 @@ func TestLocalCommandExecutor_DeletesStalePlanBeforeCommentCommand(t *testing.T)
 		require.Equal(t, command.Apply, cmd.Name)
 	}}
 	executor := &events.LocalCommandExecutor{
-		Hydrator:    hydrator,
-		Runner:      runner,
-		WorkingDir:  workingDir,
-		ClaimGuard:  events.NewLocalClaimGuard(),
-		Owners:      &dispatchOwnerStore{},
-		Logger:      logging.NewNoopLogger(t),
-		TestingMode: true,
+		Hydrator:     hydrator,
+		Runner:       runner,
+		WorkingDir:   workingDir,
+		ClaimGuard:   events.NewLocalClaimGuard(),
+		Owners:       &dispatchOwnerStore{},
+		Logger:       logging.NewNoopLogger(t),
+		InstanceID:   runs.ID("0198a0df-85f1-7d83-a60b-2e57b725c62d"),
+		DeploymentID: "prod-eu",
+		TestingMode:  true,
 	}
 	dispatch := testCommentDispatch()
 	dispatch.HeadRepo = &events.RepoRef{FullName: "fork/repo", CloneURL: "https://github.com/fork/repo.git", VCSHost: dispatch.BaseRepo.VCSHost}
@@ -174,6 +177,12 @@ func TestLocalCommandExecutor_DeletesStalePlanBeforeCommentCommand(t *testing.T)
 	require.NoError(t, executor.ExecuteComment(dispatch, "claim-1"))
 	require.NoError(t, executor.ExecuteComment(dispatch, "claim-1"))
 	require.Equal(t, []string{"delete", "run", "run"}, sequence)
+	require.Len(t, runner.routings, 2)
+	expectedKey, err := dispatch.OwnershipKey().ConcurrencyKey("prod-eu")
+	require.NoError(t, err)
+	require.Equal(t, executor.InstanceID, runner.routings[0].InstanceID)
+	require.Equal(t, expectedKey, runner.routings[0].ConcurrencyKey)
+	require.Equal(t, "claim-1", runner.routings[0].OwnershipClaimID)
 }
 
 func TestLocalCommandExecutor_DoesNotRunWhenLocalResetFails(t *testing.T) {
@@ -557,6 +566,7 @@ func (c *recordingPullStateCleaner) Delete(logger logging.SimpleLogging, repo mo
 type recordingCommandRunner struct {
 	comment      func(models.Repo, *models.Repo, *models.PullRequest, models.User, int, *events.CommentCommand)
 	commentCalls int
+	routings     []command.RoutingContext
 }
 
 func (r *recordingCommandRunner) RunCommentCommand(base models.Repo, head *models.Repo, pull *models.PullRequest, user models.User, pullNum int, cmd *events.CommentCommand) {
@@ -569,7 +579,8 @@ func (r *recordingCommandRunner) RunCommentCommand(base models.Repo, head *model
 func (r *recordingCommandRunner) RunAutoplanCommand(models.Repo, models.Repo, models.PullRequest, models.User) {
 }
 
-func (r *recordingCommandRunner) RunRoutedCommentCommand(base models.Repo, head *models.Repo, pull *models.PullRequest, user models.User, pullNum int, cmd *events.CommentCommand, _ command.RoutingContext) {
+func (r *recordingCommandRunner) RunRoutedCommentCommand(base models.Repo, head *models.Repo, pull *models.PullRequest, user models.User, pullNum int, cmd *events.CommentCommand, routing command.RoutingContext) {
+	r.routings = append(r.routings, routing)
 	r.RunCommentCommand(base, head, pull, user, pullNum, cmd)
 }
 

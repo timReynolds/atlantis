@@ -338,6 +338,70 @@ func TestRunLifecycleFinishRecoveringMarksPanicFailed(t *testing.T) {
 	require.Equal(t, runs.StatusFailed, writer.runsCompleted[0].Status)
 }
 
+func TestRunHistoryRecordsRoutedExecutionAttempt(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
+	ctx.OwnershipClaimID = "claim-1"
+
+	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerComment)
+	require.True(t, lifecycle.CanExecute())
+	require.NotEmpty(t, ctx.AttemptID)
+	require.NotNil(t, ctx.SideEffectMarker)
+	require.NoError(t, ctx.SideEffectMarker.MarkSideEffectStarted(context.Background()))
+	lifecycle.Finish()
+
+	require.Len(t, writer.attemptsCreated, 1)
+	require.Equal(t, runs.AttemptClaimed, writer.attemptsCreated[0].Status)
+	require.Equal(t, ctx.RunID, writer.attemptsCreated[0].RunID)
+	require.Equal(t, ctx.ExecutionInstanceID, writer.attemptsCreated[0].InstanceID)
+	require.Equal(t, []runs.ID{ctx.AttemptID}, writer.attemptsStarted)
+	require.Equal(t, []runs.ID{ctx.AttemptID}, writer.sideEffectsStarted)
+	require.Len(t, writer.attemptsCompleted, 1)
+	require.Equal(t, runs.AttemptSucceeded, writer.attemptsCompleted[0].Status)
+	require.Equal(t, []string{"apply.requested", "apply.attempt_started", "apply.completed"}, writer.auditTypes())
+}
+
+func TestRunHistoryFailsClosedWhenAttemptAdmissionIsNotDurable(t *testing.T) {
+	writer := &recordingRunWriter{createAttemptErr: errors.New("database unavailable")}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
+	ctx.OwnershipClaimID = "claim-1"
+
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+	require.False(t, lifecycle.CanExecute())
+	require.True(t, ctx.CommandHasErrors)
+	lifecycle.Finish()
+
+	require.Empty(t, writer.attemptsStarted)
+	require.Equal(t, runs.StatusFailed, writer.runsCompleted[0].Status)
+}
+
+func TestRunHistoryMarksPanicAfterSideEffectUnknown(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
+	ctx.OwnershipClaimID = "claim-1"
+	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerComment)
+	require.NoError(t, ctx.SideEffectMarker.MarkSideEffectStarted(context.Background()))
+
+	func() {
+		defer func() { require.Equal(t, "boom", recover()) }()
+		defer lifecycle.FinishRecovering()
+		panic("boom")
+	}()
+
+	require.Equal(t, runs.StatusUnknown, writer.runsCompleted[0].Status)
+	require.Equal(t, runs.AttemptUnknown, writer.attemptsCompleted[0].Status)
+	require.Contains(t, writer.attemptsCompleted[0].FailureReason, "side effect")
+}
+
 var testHistoryTime = time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
 
 func newTestRunHistory(t *testing.T, writer runs.Writer) *RunHistory {
@@ -377,6 +441,12 @@ type recordingRunWriter struct {
 	completeProjectErr   error
 	completeProjectCalls int
 	appendOutputErr      error
+	createAttemptErr     error
+	attemptsCreated      []runs.RunAttempt
+	attemptsStarted      []runs.ID
+	attemptHeartbeats    []runs.ID
+	sideEffectsStarted   []runs.ID
+	attemptsCompleted    []runs.AttemptCompletion
 }
 
 func (w *recordingRunWriter) CreateRun(_ context.Context, run runs.Run) error {
@@ -455,4 +525,58 @@ func (w *recordingRunWriter) auditTypes() []string {
 		result[i] = event.EventType
 	}
 	return result
+}
+
+func (w *recordingRunWriter) RegisterInstance(context.Context, runs.ExecutionInstance) error {
+	return nil
+}
+
+func (w *recordingRunWriter) HeartbeatInstance(context.Context, runs.ID, time.Time) error {
+	return nil
+}
+
+func (w *recordingRunWriter) StopInstance(context.Context, runs.ID, time.Time) error {
+	return nil
+}
+
+func (w *recordingRunWriter) CreateAttempt(_ context.Context, attempt runs.RunAttempt) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.createAttemptErr != nil {
+		return w.createAttemptErr
+	}
+	w.attemptsCreated = append(w.attemptsCreated, attempt)
+	return nil
+}
+
+func (w *recordingRunWriter) StartAttempt(_ context.Context, id runs.ID, _ time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.attemptsStarted = append(w.attemptsStarted, id)
+	return nil
+}
+
+func (w *recordingRunWriter) HeartbeatAttempt(_ context.Context, id runs.ID, _ time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.attemptHeartbeats = append(w.attemptHeartbeats, id)
+	return nil
+}
+
+func (w *recordingRunWriter) MarkAttemptSideEffectStarted(_ context.Context, id runs.ID, _ time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.sideEffectsStarted = append(w.sideEffectsStarted, id)
+	return nil
+}
+
+func (w *recordingRunWriter) CompleteAttempt(_ context.Context, completion runs.AttemptCompletion) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.attemptsCompleted = append(w.attemptsCompleted, completion)
+	return nil
+}
+
+func (w *recordingRunWriter) ReconcileAttempt(context.Context, runs.AttemptReconciliation) error {
+	return nil
 }

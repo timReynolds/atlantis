@@ -27,8 +27,11 @@ type ProjectContext struct {
 	// are empty when durable history is disabled.
 	RunID        runs.ID
 	ProjectRunID runs.ID
-	CommandName  Name
-	SubCommand   string
+	AttemptID    runs.ID
+	// SideEffectMarker is shared by every project in one execution attempt.
+	SideEffectMarker SideEffectMarker
+	CommandName      Name
+	SubCommand       string
 	// ApplyCmd is the command that users should run to apply this plan. If
 	// this is an apply then this will be empty.
 	ApplyCmd string

@@ -1237,12 +1237,14 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	var commandExecutorWaiter acceptedCommandWaiter
 	if replicaRoutingEnabled {
 		localCommandExecutor := &events.LocalCommandExecutor{
-			Hydrator:    eventParser,
-			Runner:      commandRunner,
-			PullCleaner: pullClosedExecutor,
-			WorkingDir:  workingDir,
-			ClaimGuard:  events.NewLocalClaimGuard(),
-			Logger:      logger,
+			Hydrator:     eventParser,
+			Runner:       commandRunner,
+			PullCleaner:  pullClosedExecutor,
+			WorkingDir:   workingDir,
+			ClaimGuard:   events.NewLocalClaimGuard(),
+			Logger:       logger,
+			InstanceID:   executionInstanceID,
+			DeploymentID: strings.TrimSpace(userConfig.ReplicaDeploymentID),
 		}
 		ownerStore, err = redis.NewOwnerStore(redisDatabase, redis.OwnerStoreConfig{
 			ReplicaID: replicaID, InstanceID: string(executionInstanceID),

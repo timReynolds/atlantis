@@ -42,6 +42,14 @@ func TestProjectResult_IsSuccessful(t *testing.T) {
 			},
 			true,
 		},
+		"import success": {
+			command.ProjectResult{
+				ProjectCommandOutput: command.ProjectCommandOutput{
+					ImportSuccess: &models.ImportSuccess{},
+				},
+			},
+			true,
+		},
 		"state rm success": {
 			command.ProjectResult{
 				ProjectCommandOutput: command.ProjectCommandOutput{

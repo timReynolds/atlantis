@@ -149,6 +149,15 @@ func TestRenderRunSummary(t *testing.T) {
 	}
 	Assert(t, !strings.Contains(apply, "atlantis apply"), "apply summary must not render plan instructions")
 
+	importResults := make([]command.ProjectResult, 50)
+	for i := range importResults {
+		importResults[i].ImportSuccess = &models.ImportSuccess{Output: "imported"}
+	}
+	importSummary := newRenderer("en").RenderRunSummary(ctx, command.Result{ProjectResults: importResults}, &events.CommentCommand{Name: command.Import}, historyURL)
+	for _, expected := range []string{"Ran Import for 50 projects.", "| Succeeded | 50 |", "| Failed | 0 |"} {
+		Assert(t, strings.Contains(importSummary, expected), "expected %q in:\n%s", expected, importSummary)
+	}
+
 	stateResults := make([]command.ProjectResult, 50)
 	for i := range stateResults {
 		stateResults[i].StateRmSuccess = &models.StateRmSuccess{Output: "removed"}

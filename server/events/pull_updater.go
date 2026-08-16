@@ -72,7 +72,7 @@ func (c *PullUpdater) updatePull(ctx *command.Context, cmd PullCommand, res comm
 	if c.shouldUseLargeRunSummary(ctx, res, cmd) {
 		historyURL, err := c.RunHistoryURLGenerator.GenerateRunHistoryURL(ctx.RunID)
 		if err != nil {
-			ctx.Log.Err("generating run history URL: %v", err)
+			ctx.Log.Err("generating run history URL %v", err)
 		} else {
 			comment = c.MarkdownRenderer.RenderRunSummary(ctx, res, cmd, historyURL)
 		}

@@ -6,7 +6,10 @@ package controllers
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,19 +33,19 @@ const (
 	maxReconciliationBytes = 4096
 )
 
-type runAttemptReconciler interface {
-	GetAttempt(context.Context, runs.ID) (runs.RunAttempt, error)
+type runHistoryStore interface {
+	runs.Reader
+	runs.ExecutionReader
 	ReconcileAttempt(context.Context, runs.AttemptReconciliation) error
 }
 
-// RunHistoryController serves authenticated durable history pages and the
-// explicit operator reconciliation endpoint for unknown attempts.
+// RunHistoryController serves authenticated durable history and explicit
+// reconciliation of attempts whose infrastructure outcome is unknown.
 type RunHistoryController struct {
 	AtlantisVersion       string
-	AtlantisURL           *url.URL              `validate:"required"`
-	Logger                logging.SimpleLogging `validate:"required"`
-	Store                 runs.Reader           `validate:"required"`
-	AttemptReconciler     runAttemptReconciler
+	AtlantisURL           *url.URL                     `validate:"required"`
+	Logger                logging.SimpleLogging        `validate:"required"`
+	Store                 runHistoryStore              `validate:"required"`
 	RunListTemplate       web_templates.TemplateWriter `validate:"required"`
 	RunDetailTemplate     web_templates.TemplateWriter `validate:"required"`
 	ProjectDetailTemplate web_templates.TemplateWriter `validate:"required"`
@@ -58,16 +61,14 @@ func (c *RunHistoryController) ReconcileAttempt(w http.ResponseWriter, r *http.R
 	if !c.authorize(w, r) {
 		return
 	}
-	if c.AttemptReconciler == nil {
-		http.NotFound(w, r)
-		return
-	}
-	if r.Header.Get("X-Atlantis-Reconcile-Unknown") != "true" {
+	mediaType := strings.TrimSpace(strings.SplitN(r.Header.Get("Content-Type"), ";", 2)[0])
+	formRequest := mediaType == "application/x-www-form-urlencoded"
+	if mediaType == "application/json" && r.Header.Get("X-Atlantis-Reconcile-Unknown") != "true" {
 		c.respondError(w, r, http.StatusForbidden, errors.New("missing reconciliation confirmation header"))
 		return
 	}
-	if mediaType := strings.TrimSpace(strings.SplitN(r.Header.Get("Content-Type"), ";", 2)[0]); mediaType != "application/json" {
-		c.respondError(w, r, http.StatusUnsupportedMediaType, errors.New("reconciliation requires application/json"))
+	if mediaType != "application/json" && !formRequest {
+		c.respondError(w, r, http.StatusUnsupportedMediaType, errors.New("reconciliation requires JSON or form data"))
 		return
 	}
 	runID, err := pathRunID(r, "run-id")
@@ -80,7 +81,7 @@ func (c *RunHistoryController) ReconcileAttempt(w http.ResponseWriter, r *http.R
 		c.respondError(w, r, http.StatusBadRequest, err)
 		return
 	}
-	attempt, err := c.AttemptReconciler.GetAttempt(r.Context(), attemptID)
+	attempt, err := c.Store.GetAttempt(r.Context(), attemptID)
 	if err != nil {
 		c.respondStoreError(w, r, err)
 		return
@@ -89,22 +90,38 @@ func (c *RunHistoryController) ReconcileAttempt(w http.ResponseWriter, r *http.R
 		c.respondError(w, r, http.StatusNotFound, runs.ErrNotFound)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxReconciliationBytes+512)
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	var request struct {
-		Summary string `json:"summary"`
+	summary := ""
+	switch mediaType {
+	case "application/json":
+		r.Body = http.MaxBytesReader(w, r.Body, maxReconciliationBytes+512)
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		var request struct {
+			Summary string `json:"summary"`
+		}
+		if err := decoder.Decode(&request); err != nil {
+			c.respondError(w, r, http.StatusBadRequest, fmt.Errorf("decoding reconciliation request: %w", err))
+			return
+		}
+		if err := ensureJSONEOF(decoder); err != nil {
+			c.respondError(w, r, http.StatusBadRequest, err)
+			return
+		}
+		summary = request.Summary
+	case "application/x-www-form-urlencoded":
+		r.Body = http.MaxBytesReader(w, r.Body, maxReconciliationBytes+1024)
+		if err := r.ParseForm(); err != nil {
+			c.respondError(w, r, http.StatusBadRequest, fmt.Errorf("parsing reconciliation form: %w", err))
+			return
+		}
+		if !hmac.Equal([]byte(r.Form.Get("csrf_token")), []byte(c.reconciliationToken(runID, attemptID))) {
+			c.respondError(w, r, http.StatusForbidden, errors.New("invalid reconciliation token"))
+			return
+		}
+		summary = r.Form.Get("summary")
 	}
-	if err := decoder.Decode(&request); err != nil {
-		c.respondError(w, r, http.StatusBadRequest, fmt.Errorf("decoding reconciliation request: %w", err))
-		return
-	}
-	if err := ensureJSONEOF(decoder); err != nil {
-		c.respondError(w, r, http.StatusBadRequest, err)
-		return
-	}
-	request.Summary = strings.TrimSpace(request.Summary)
-	if request.Summary == "" || len([]byte(request.Summary)) > maxReconciliationBytes {
+	summary = strings.TrimSpace(summary)
+	if summary == "" || len([]byte(summary)) > maxReconciliationBytes {
 		c.respondError(w, r, http.StatusBadRequest, errors.New("reconciliation summary must be between 1 and 4096 bytes"))
 		return
 	}
@@ -114,10 +131,14 @@ func (c *RunHistoryController) ReconcileAttempt(w http.ResponseWriter, r *http.R
 		return
 	}
 	actor, _, _ := r.BasicAuth()
-	if err := c.AttemptReconciler.ReconcileAttempt(r.Context(), runs.AttemptReconciliation{
-		ID: attemptID, AuditEventID: auditID, At: time.Now().UTC(), Actor: actor, Summary: request.Summary,
+	if err := c.Store.ReconcileAttempt(r.Context(), runs.AttemptReconciliation{
+		ID: attemptID, AuditEventID: auditID, At: time.Now().UTC(), Actor: actor, Summary: summary,
 	}); err != nil {
 		c.respondStoreError(w, r, err)
+		return
+	}
+	if formRequest {
+		http.Redirect(w, r, c.AtlantisURL.Path+runDetailPath(runID)+"#attempts", http.StatusSeeOther)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -201,6 +222,20 @@ func (c *RunHistoryController) GetRun(w http.ResponseWriter, r *http.Request) {
 	for _, project := range projects.ProjectRuns {
 		projectItems = append(projectItems, presentProject(project))
 	}
+	attemptPage, err := c.Store.ListRunAttempts(r.Context(), runID, runs.PageRequest{Limit: runHistoryPageLimit})
+	if err != nil {
+		c.respondStoreError(w, r, err)
+		return
+	}
+	attemptItems := make([]web_templates.RunHistoryAttempt, 0, len(attemptPage.Attempts))
+	for _, attempt := range attemptPage.Attempts {
+		instance, err := c.Store.GetInstance(r.Context(), attempt.InstanceID)
+		if err != nil {
+			c.respondStoreError(w, r, err)
+			return
+		}
+		attemptItems = append(attemptItems, c.presentAttempt(attempt, instance))
+	}
 	related, err := c.relatedRuns(r, run)
 	if err != nil {
 		c.respondStoreError(w, r, err)
@@ -208,7 +243,7 @@ func (c *RunHistoryController) GetRun(w http.ResponseWriter, r *http.Request) {
 	}
 	data := web_templates.RunHistoryDetailData{
 		AtlantisVersion: c.AtlantisVersion, CleanedBasePath: c.AtlantisURL.Path,
-		Run: presentRun(run), Summary: summary, Projects: projectItems,
+		Run: presentRun(run), Summary: summary, Projects: projectItems, Attempts: attemptItems,
 		Filter: projectPresentation, NextPath: nextCursorPath(r, projects.NextCursor),
 		RelatedRuns: related,
 	}
@@ -607,6 +642,9 @@ func presentProject(project runs.ProjectRun) web_templates.RunHistoryProject {
 		DetailPath:  runDetailPath(project.RunID) + "/projects/" + url.PathEscape(string(project.ID)),
 		RawMetadata: prettyMetadata(project.Metadata),
 	}
+	if project.AttemptID != nil {
+		item.AttemptID = string(*project.AttemptID)
+	}
 	if project.PlanArtifact != nil {
 		item.ArtifactKey = project.PlanArtifact.Key
 		item.ArtifactChecksum = project.PlanArtifact.Checksum
@@ -614,6 +652,35 @@ func presentProject(project runs.ProjectRun) web_templates.RunHistoryProject {
 		item.ArtifactExpiresAt = formatOptionalHistoryTime(project.PlanArtifact.ExpiresAt)
 	}
 	return item
+}
+
+func (c *RunHistoryController) presentAttempt(attempt runs.RunAttempt, instance runs.ExecutionInstance) web_templates.RunHistoryAttempt {
+	item := web_templates.RunHistoryAttempt{
+		ID: string(attempt.ID), Status: string(attempt.Status), InstanceID: string(attempt.InstanceID),
+		ReplicaID: instance.ReplicaID, DeploymentID: instance.DeploymentID,
+		AdvertiseURL: instance.AdvertiseURL, Version: instance.Version, Commit: instance.Commit,
+		OwnershipClaimID: attempt.OwnershipClaimID, ClaimedAt: formatHistoryTime(attempt.ClaimedAt),
+		StartedAt: formatOptionalHistoryTime(attempt.StartedAt), HeartbeatAt: formatHistoryTime(attempt.HeartbeatAt),
+		SideEffectStartedAt: formatOptionalHistoryTime(attempt.SideEffectStartedAt),
+		CompletedAt:         formatOptionalHistoryTime(attempt.CompletedAt), FailureReason: attempt.FailureReason,
+		ReconciledAt: formatOptionalHistoryTime(attempt.ReconciledAt), ReconciledBy: attempt.ReconciledBy,
+		ReconciliationSummary: attempt.ReconciliationSummary,
+	}
+	if attempt.Status == runs.AttemptUnknown && attempt.ReconciledAt == nil {
+		item.CanReconcile = true
+		item.ReconcilePath = runDetailPath(attempt.RunID) + "/attempts/" + url.PathEscape(string(attempt.ID)) + "/reconcile"
+		item.CSRFToken = c.reconciliationToken(attempt.RunID, attempt.ID)
+	}
+	return item
+}
+
+func (c *RunHistoryController) reconciliationToken(runID, attemptID runs.ID) string {
+	mac := hmac.New(sha256.New, []byte(c.WebPassword))
+	_, _ = mac.Write([]byte("atlantis-attempt-reconciliation\x00"))
+	_, _ = mac.Write([]byte(runID))
+	_, _ = mac.Write([]byte("\x00"))
+	_, _ = mac.Write([]byte(attemptID))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
 func runDetailPath(id runs.ID) string {

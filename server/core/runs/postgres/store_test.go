@@ -405,6 +405,12 @@ func TestStoreConformance(t *testing.T) {
 	afterReconciliation, err := store.PrepareAttemptTakeover(ctx, unknownRequest)
 	require.NoError(t, err)
 	require.Nil(t, afterReconciliation.UnreconciledUnknown)
+	reconciliationAudit, err := store.ListAuditEvents(ctx, runs.AuditFilter{
+		Repository: "example/infrastructure", EventTypes: []string{"execution_attempt.reconciled"},
+	}, runs.PageRequest{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, reconciliationAudit.Events, 2)
+	require.Contains(t, string(reconciliationAudit.Events[0].Metadata), "attempt_id")
 
 	retentionCutoff := unknownRecoveredAt.Add(2 * time.Second)
 	retention, err := store.ApplyRetention(ctx, runs.RetentionPolicy{

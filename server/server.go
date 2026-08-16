@@ -1165,7 +1165,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	if userConfig.RunStoreType == RunStorePostgres {
 		runHistoryController = &controllers.RunHistoryController{
 			AtlantisVersion: config.AtlantisVersion, AtlantisURL: parsedURL,
-			Logger: logger, Store: runStore, AttemptReconciler: runStore,
+			Logger: logger, Store: runStore,
 			RunListTemplate:       web_templates.RunHistoryListTemplate,
 			RunDetailTemplate:     web_templates.RunHistoryDetailTemplate,
 			ProjectDetailTemplate: web_templates.RunProjectDetailTemplate,

@@ -46,6 +46,8 @@ By default, Atlantis uses the hostname returned by the operating system as the r
 
 For the fork's durable HA mode, also set the same `--replica-deployment-id` on every replica. This mode requires PostgreSQL run history and S3 plan storage. Atlantis creates a distinct process-lifetime instance ID on every restart, stores it in PostgreSQL, and uses that same ID in Redis ownership records. The deployment ID namespaces durable attempt admission, while Redis retains the upstream v1 ownership key so old and new replicas cannot acquire separate owners during a rolling upgrade. Deployments that should not coordinate must use separate Redis databases. The replica ID remains the stable addressable pod identity.
 
+Durable HA adds a `RunAttempt` for each process that tries to execute a logical Run. Attempts record the process instance, Redis ownership claim, concurrency key, heartbeats, terminal classification, and the point at which an infrastructure mutation may have begun. A retried plan keeps its original Run ID and appends a new attempt and attempt-scoped project results; replica identity never becomes part of the external Run ID.
+
 The ownership TTL defaults to 30 seconds and must be at least 10 seconds. Use a TTL long enough to tolerate routine scheduling and Redis latency, but short enough for the desired failover time.
 
 ## Plan Storage
@@ -93,6 +95,19 @@ curl --fail-with-body \
 ```
 
 Reconciliation does not change the historical `unknown` status and does not retry the mutation. It adds the operator, summary, timestamp, and a durable audit event in the same PostgreSQL transaction. Run history must be protected by `--web-basic-auth`; when web authentication is disabled, the endpoint is not available.
+
+## Process loss and takeover
+
+PostgreSQL does not replace the Redis lease. After Redis issues ownership to a different process claim, the new owner checks the active attempt and process heartbeats in PostgreSQL before admitting work. If either heartbeat is still fresh, admission fails closed. This prevents Redis lease expiry by itself from authorizing overlapping work while the old process can still reach PostgreSQL.
+
+When the old claim is different and both heartbeats have expired:
+
+- Work with no recorded infrastructure-mutation boundary is marked `interrupted`. An exact duplicate of a plan for the same repository, pull request, commit, refs, actor, and trigger may create another attempt under the existing logical Run.
+- Work whose mutation boundary was recorded is marked `unknown`. Atlantis does not automatically retry it. Apply, import, state removal, and drift-remediation admission remain blocked for that pull request until an operator reconciles the unknown attempt. A fresh plan is still allowed so the operator can inspect current state.
+
+The authenticated Run detail page shows every attempt, its replica and process identity, ownership claim, last heartbeat, mutation boundary, failure reason, and attempt-scoped project output. For an unreconciled `unknown` attempt, inspect the retained output and Terraform state, generate a fresh plan, and use **Mark reconciled** with an operator summary. Reconciliation preserves the historical `unknown` status and atomically appends an `execution_attempt.reconciled` audit event; it is not permission to apply without reviewing the new plan.
+
+These rules do not provide exactly-once Terraform execution. If a process can reach an infrastructure API while unable to reach both Redis and PostgreSQL, Atlantis cannot externally fence a subprocess that already started. The durable mutation marker ensures a replacement process treats that outcome as unknown instead of redelivering the apply.
 
 ## Redis Requirements
 

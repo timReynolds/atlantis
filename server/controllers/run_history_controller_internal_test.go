@@ -123,12 +123,11 @@ func TestRunHistoryControllerDoesNotExposeProjectOutputWithoutAuthentication(t *
 func TestRunHistoryControllerReconcilesUnknownAttemptThroughConfirmedAPI(t *testing.T) {
 	runID := mustRunHistoryID(t)
 	attemptID := mustRunHistoryID(t)
-	reconciler := &recordingAttemptReconciler{attempt: runs.RunAttempt{
+	reader := &recordingRunReader{attemptResult: runs.RunAttempt{
 		ID: attemptID, RunID: runID, Status: runs.AttemptUnknown,
 	}}
-	controller := testRunHistoryController(t, &recordingRunReader{}, &recordingHistoryTemplate{})
+	controller := testRunHistoryController(t, reader, &recordingHistoryTemplate{})
 	controller.WebAuthentication = true
-	controller.AttemptReconciler = reconciler
 	request := mux.SetURLVars(httptest.NewRequest(http.MethodPost,
 		"/runs/x/attempts/y/reconcile", strings.NewReader(`{"summary":"state inspected; fresh plan required"}`)),
 		map[string]string{"run-id": string(runID), "attempt-id": string(attemptID)})
@@ -140,20 +139,19 @@ func TestRunHistoryControllerReconcilesUnknownAttemptThroughConfirmedAPI(t *test
 	controller.ReconcileAttempt(recorder, request)
 
 	require.Equal(t, http.StatusOK, recorder.Code)
-	require.Equal(t, attemptID, reconciler.reconciliation.ID)
-	require.Equal(t, "operator", reconciler.reconciliation.Actor)
-	require.Equal(t, "state inspected; fresh plan required", reconciler.reconciliation.Summary)
-	require.NotEmpty(t, reconciler.reconciliation.AuditEventID)
-	_, err := runs.ParseID(string(reconciler.reconciliation.AuditEventID))
+	require.Equal(t, attemptID, reader.reconciliation.ID)
+	require.Equal(t, "operator", reader.reconciliation.Actor)
+	require.Equal(t, "state inspected; fresh plan required", reader.reconciliation.Summary)
+	require.NotEmpty(t, reader.reconciliation.AuditEventID)
+	_, err := runs.ParseID(string(reader.reconciliation.AuditEventID))
 	require.NoError(t, err)
 	require.Contains(t, recorder.Body.String(), `"status":"reconciled"`)
 }
 
 func TestRunHistoryControllerReconciliationRequiresConfirmationHeader(t *testing.T) {
-	controller := testRunHistoryController(t, &recordingRunReader{}, &recordingHistoryTemplate{})
+	reader := &recordingRunReader{}
+	controller := testRunHistoryController(t, reader, &recordingHistoryTemplate{})
 	controller.WebAuthentication = true
-	reconciler := &recordingAttemptReconciler{}
-	controller.AttemptReconciler = reconciler
 	request := httptest.NewRequest(http.MethodPost, "/runs/x/attempts/y/reconcile", strings.NewReader(`{"summary":"checked"}`))
 	request.SetBasicAuth("operator", "password")
 	request.Header.Set("Content-Type", "application/json")
@@ -162,7 +160,7 @@ func TestRunHistoryControllerReconciliationRequiresConfirmationHeader(t *testing
 	controller.ReconcileAttempt(recorder, request)
 
 	require.Equal(t, http.StatusForbidden, recorder.Code)
-	require.False(t, reconciler.readCalled)
+	require.False(t, reader.readCalled)
 }
 
 func TestRunHistoryControllerReturnsTypedProjectOutputPage(t *testing.T) {
@@ -220,7 +218,100 @@ func TestRunHistoryControllerParsesAuditDateRange(t *testing.T) {
 	require.Equal(t, time.Date(2026, 8, 17, 0, 0, 0, 0, time.UTC), *reader.auditFilter.CreatedTo)
 }
 
-func testRunHistoryController(t *testing.T, reader runs.Reader, template web_templates.TemplateWriter) *RunHistoryController {
+func TestRunHistoryControllerPresentsAttemptReplicaIdentity(t *testing.T) {
+	runID := mustRunHistoryID(t)
+	attemptID := mustRunHistoryID(t)
+	instanceID := mustRunHistoryID(t)
+	startedAt := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	reader := &recordingRunReader{
+		getRunResult: runs.Run{ID: runID, Repository: "org/repo", Command: runs.CommandPlan,
+			Trigger: runs.TriggerComment, Status: runs.StatusRunning, CreatedAt: startedAt, StartedAt: &startedAt},
+		attemptPage: runs.AttemptPage{Attempts: []runs.RunAttempt{{
+			ID: attemptID, RunID: runID, InstanceID: instanceID,
+			ConcurrencyKey: "sha256:key", OwnershipClaimID: "claim-2",
+			Status: runs.AttemptRunning, ClaimedAt: startedAt, StartedAt: &startedAt, HeartbeatAt: startedAt,
+		}}},
+		instanceResult: runs.ExecutionInstance{
+			ID: instanceID, ReplicaID: "atlantis-2", DeploymentID: "production",
+			StartedAt: startedAt, HeartbeatAt: startedAt, Version: "1.2.3", Commit: "abc123",
+		},
+	}
+	template := &recordingHistoryTemplate{}
+	controller := testRunHistoryController(t, reader, template)
+	controller.WebAuthentication = true
+	request := mux.SetURLVars(httptest.NewRequest(http.MethodGet, "/runs/"+string(runID), nil), map[string]string{
+		"run-id": string(runID),
+	})
+	request.SetBasicAuth("operator", "password")
+	recorder := httptest.NewRecorder()
+
+	controller.GetRun(recorder, request)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	data, ok := template.data.(web_templates.RunHistoryDetailData)
+	require.True(t, ok)
+	require.Len(t, data.Attempts, 1)
+	require.Equal(t, "atlantis-2", data.Attempts[0].ReplicaID)
+	require.Equal(t, "production", data.Attempts[0].DeploymentID)
+	require.Equal(t, "abc123", data.Attempts[0].Commit)
+}
+
+func TestRunHistoryControllerReconcilesUnknownAttemptWithAuditIdentity(t *testing.T) {
+	runID := mustRunHistoryID(t)
+	attemptID := mustRunHistoryID(t)
+	reader := &recordingRunReader{attemptResult: runs.RunAttempt{
+		ID: attemptID, RunID: runID, Status: runs.AttemptUnknown,
+	}}
+	controller := testRunHistoryController(t, reader, &recordingHistoryTemplate{})
+	controller.WebAuthentication = true
+	form := url.Values{
+		"csrf_token": {controller.reconciliationToken(runID, attemptID)},
+		"summary":    {"State inspected; fresh plan confirms no pending changes."},
+	}
+	request := mux.SetURLVars(httptest.NewRequest(http.MethodPost,
+		"/runs/"+string(runID)+"/attempts/"+string(attemptID)+"/reconcile",
+		strings.NewReader(form.Encode())), map[string]string{
+		"run-id": string(runID), "attempt-id": string(attemptID),
+	})
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.SetBasicAuth("operator", "password")
+	recorder := httptest.NewRecorder()
+
+	controller.ReconcileAttempt(recorder, request)
+
+	require.Equal(t, http.StatusSeeOther, recorder.Code)
+	require.Equal(t, attemptID, reader.reconciliation.ID)
+	require.Equal(t, "operator", reader.reconciliation.Actor)
+	require.Equal(t, form.Get("summary"), reader.reconciliation.Summary)
+	_, err := runs.ParseID(string(reader.reconciliation.AuditEventID))
+	require.NoError(t, err)
+	require.Equal(t, "/atlantis/runs/"+string(runID)+"#attempts", recorder.Header().Get("Location"))
+}
+
+func TestRunHistoryControllerRejectsReconciliationWithoutCSRFToken(t *testing.T) {
+	runID := mustRunHistoryID(t)
+	attemptID := mustRunHistoryID(t)
+	reader := &recordingRunReader{attemptResult: runs.RunAttempt{
+		ID: attemptID, RunID: runID, Status: runs.AttemptUnknown,
+	}}
+	controller := testRunHistoryController(t, reader, &recordingHistoryTemplate{})
+	controller.WebAuthentication = true
+	request := mux.SetURLVars(httptest.NewRequest(http.MethodPost,
+		"/runs/"+string(runID)+"/attempts/"+string(attemptID)+"/reconcile",
+		strings.NewReader(url.Values{"summary": {"inspected"}}.Encode())), map[string]string{
+		"run-id": string(runID), "attempt-id": string(attemptID),
+	})
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.SetBasicAuth("operator", "password")
+	recorder := httptest.NewRecorder()
+
+	controller.ReconcileAttempt(recorder, request)
+
+	require.Equal(t, http.StatusForbidden, recorder.Code)
+	require.Empty(t, reader.reconciliation.ID)
+}
+
+func testRunHistoryController(t *testing.T, reader runHistoryStore, template web_templates.TemplateWriter) *RunHistoryController {
 	t.Helper()
 	return &RunHistoryController{
 		AtlantisVersion: "test", AtlantisURL: &url.URL{Path: "/atlantis"},
@@ -242,24 +333,6 @@ type recordingHistoryTemplate struct {
 	data any
 }
 
-type recordingAttemptReconciler struct {
-	attempt        runs.RunAttempt
-	getErr         error
-	reconcileErr   error
-	readCalled     bool
-	reconciliation runs.AttemptReconciliation
-}
-
-func (r *recordingAttemptReconciler) GetAttempt(context.Context, runs.ID) (runs.RunAttempt, error) {
-	r.readCalled = true
-	return r.attempt, r.getErr
-}
-
-func (r *recordingAttemptReconciler) ReconcileAttempt(_ context.Context, reconciliation runs.AttemptReconciliation) error {
-	r.reconciliation = reconciliation
-	return r.reconcileErr
-}
-
 func (t *recordingHistoryTemplate) Execute(_ io.Writer, data any) error {
 	t.data = data
 	return nil
@@ -277,6 +350,10 @@ type recordingRunReader struct {
 	outputAfter      int64
 	outputLimit      int
 	auditFilter      runs.AuditFilter
+	attemptPage      runs.AttemptPage
+	attemptResult    runs.RunAttempt
+	instanceResult   runs.ExecutionInstance
+	reconciliation   runs.AttemptReconciliation
 }
 
 func (r *recordingRunReader) markRead() {
@@ -326,4 +403,25 @@ func (r *recordingRunReader) ListAuditEvents(_ context.Context, filter runs.Audi
 	return runs.AuditPage{}, nil
 }
 
+func (r *recordingRunReader) GetInstance(context.Context, runs.ID) (runs.ExecutionInstance, error) {
+	r.markRead()
+	return r.instanceResult, nil
+}
+
+func (r *recordingRunReader) GetAttempt(context.Context, runs.ID) (runs.RunAttempt, error) {
+	r.markRead()
+	return r.attemptResult, nil
+}
+
+func (r *recordingRunReader) ListRunAttempts(context.Context, runs.ID, runs.PageRequest) (runs.AttemptPage, error) {
+	r.markRead()
+	return r.attemptPage, nil
+}
+
+func (r *recordingRunReader) ReconcileAttempt(_ context.Context, reconciliation runs.AttemptReconciliation) error {
+	r.reconciliation = reconciliation
+	return nil
+}
+
 var _ runs.Reader = (*recordingRunReader)(nil)
+var _ runHistoryStore = (*recordingRunReader)(nil)

@@ -109,8 +109,16 @@ func TestRunHistoryTemplates(t *testing.T) {
 	}
 	project := RunHistoryProject{
 		ID: "019c0000-0000-7000-8000-000000000001", ProjectName: "network",
+		AttemptID: "019c0000-0000-7000-8000-000000000002",
 		Directory: "terraform/network", Workspace: "production", Status: "failed",
 		DetailPath: run.DetailPath + "/projects/019c0000-0000-7000-8000-000000000001",
+	}
+	attempt := RunHistoryAttempt{
+		ID: "019c0000-0000-7000-8000-000000000002", Status: "unknown",
+		InstanceID: "019c0000-0000-7000-8000-000000000003", ReplicaID: "atlantis-2",
+		DeploymentID: "production", FailureReason: "unsafe <outcome>", CanReconcile: true,
+		ReconcilePath: run.DetailPath + "/attempts/019c0000-0000-7000-8000-000000000002/reconcile",
+		CSRFToken:     "token",
 	}
 	cases := []struct {
 		name     string
@@ -118,7 +126,7 @@ func TestRunHistoryTemplates(t *testing.T) {
 		data     any
 	}{
 		{"list", RunHistoryListTemplate, RunHistoryListData{Title: "Run history", Runs: []RunHistoryRun{run}}},
-		{"detail", RunHistoryDetailTemplate, RunHistoryDetailData{Run: run, Summary: runs.ProjectRunSummary{Total: 1, Failed: 1}, Projects: []RunHistoryProject{project}}},
+		{"detail", RunHistoryDetailTemplate, RunHistoryDetailData{Run: run, Summary: runs.ProjectRunSummary{Total: 1, Failed: 1}, Projects: []RunHistoryProject{project}, Attempts: []RunHistoryAttempt{attempt}}},
 		{"audit", RunAuditListTemplate, RunAuditListData{Events: []RunAuditEvent{{Repository: "org/repo", EventType: "plan.completed"}}}},
 		{"drift list", DriftHistoryListTemplate, DriftHistoryListData{Projects: []DriftCurrentProject{{Repository: "org/repo", ProjectName: "network", Outcome: "drifted"}}}},
 		{"drift detection", DriftDetectionTemplate, DriftDetectionDetailData{Detection: DriftDetectionRun{ID: run.ID, Repository: "org/repo", Status: "partial"}, Projects: []DriftDetectionProject{{ProjectName: "network", Error: "unsafe <value>"}}}},
@@ -139,6 +147,12 @@ func TestRunHistoryTemplates(t *testing.T) {
 	Ok(t, err)
 	Assert(t, strings.Contains(output.String(), "sensitive &lt;value&gt;"), "output must be HTML escaped")
 	Assert(t, !strings.Contains(output.String(), "sensitive <value>"), "raw output must not be injected into HTML")
+
+	output.Reset()
+	err = RunHistoryDetailTemplate.Execute(&output, RunHistoryDetailData{Run: run, Attempts: []RunHistoryAttempt{attempt}})
+	Ok(t, err)
+	Assert(t, strings.Contains(output.String(), "unsafe &lt;outcome&gt;"), "attempt failures must be HTML escaped")
+	Assert(t, !strings.Contains(output.String(), "unsafe <outcome>"), "raw attempt failures must not be injected into HTML")
 
 	output.Reset()
 	err = DriftDetectionTemplate.Execute(&output, DriftDetectionDetailData{

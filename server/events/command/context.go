@@ -29,6 +29,7 @@ type RoutingContext struct {
 	Lease                ExecutionLease
 	RecoverExternalPlans bool
 	InstanceID           runs.ID
+	DeploymentID         string
 	ConcurrencyKey       string
 	OwnershipClaimID     string
 }
@@ -154,8 +155,9 @@ type Context struct {
 	RecoverExternalPlans bool
 
 	// HA execution identity is populated only for owner-routed commands.
-	ExecutionInstanceID runs.ID
-	ConcurrencyKey      string
-	OwnershipClaimID    string
-	SideEffectMarker    SideEffectMarker
+	ExecutionInstanceID   runs.ID
+	ExecutionDeploymentID string
+	ConcurrencyKey        string
+	OwnershipClaimID      string
+	SideEffectMarker      SideEffectMarker
 }

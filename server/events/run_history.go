@@ -234,14 +234,15 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 		}
 		return true
 	})
-	if session.completionBlocked.Load() {
+	status := lifecycle.terminalStatus(succeeded, failed)
+	attemptComplete := h.completeAttempt(lifecycle, session, status, now)
+	if session.persistenceIncomplete.Load() || session.completionBlocked.Load() || !attemptComplete {
 		if lifecycle.ctx.Log != nil {
 			lifecycle.ctx.Log.Err("leaving run history incomplete after persistence error")
 		}
 		return
 	}
 
-	status := lifecycle.terminalStatus(succeeded, failed)
 	if err := writeRunHistory(func(writeCtx context.Context) error {
 		return h.writer.CompleteRun(writeCtx, runs.RunCompletion{
 			ID: lifecycle.runID, Status: status, CompletedAt: now,
@@ -250,7 +251,6 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 		h.markPersistenceFailed(lifecycle.ctx.Log, session, "completing run history", err)
 		return
 	}
-	h.completeAttempt(lifecycle, session, status, now)
 	h.appendAudit(lifecycle.ctx.Log, session, string(session.run.Command)+".completed", map[string]any{
 		"status": status, "projects_succeeded": succeeded, "projects_failed": failed,
 	}, now)
@@ -265,13 +265,13 @@ func (h *RunHistory) beginAttempt(lifecycle *RunLifecycle, session *runSession, 
 		lifecycle.canExecute = false
 		lifecycle.Fail()
 		ctx.CommandHasErrors = true
-		h.markPersistenceFailed(ctx.Log, session, action, err)
+		h.logError(ctx.Log, action, err)
 	}
 	if h.executionWriter == nil {
 		block("admitting execution attempt", errors.New("execution attempt store is required"))
 		return
 	}
-	if ctx.ConcurrencyKey == "" || ctx.OwnershipClaimID == "" {
+	if ctx.ExecutionDeploymentID == "" || ctx.ConcurrencyKey == "" || ctx.OwnershipClaimID == "" {
 		block("admitting execution attempt", errors.New("routed execution identity is incomplete"))
 		return
 	}
@@ -282,6 +282,7 @@ func (h *RunHistory) beginAttempt(lifecycle *RunLifecycle, session *runSession, 
 	}
 	attempt := runs.RunAttempt{
 		ID: attemptID, RunID: lifecycle.runID, InstanceID: ctx.ExecutionInstanceID,
+		DeploymentID:   ctx.ExecutionDeploymentID,
 		ConcurrencyKey: ctx.ConcurrencyKey, OwnershipClaimID: ctx.OwnershipClaimID,
 		Status: runs.AttemptClaimed, ClaimedAt: now, HeartbeatAt: now,
 	}
@@ -296,12 +297,15 @@ func (h *RunHistory) beginAttempt(lifecycle *RunLifecycle, session *runSession, 
 	if err := writeRunHistory(func(writeCtx context.Context) error {
 		return h.executionWriter.StartAttempt(writeCtx, attemptID, now)
 	}); err != nil {
-		_ = writeRunHistory(func(writeCtx context.Context) error {
+		completionErr := writeRunHistory(func(writeCtx context.Context) error {
 			return h.executionWriter.CompleteAttempt(writeCtx, runs.AttemptCompletion{
 				ID: attemptID, Status: runs.AttemptInterrupted, CompletedAt: now,
 				FailureReason: "attempt could not enter running state",
 			})
 		})
+		if completionErr != nil {
+			h.blockRunCompletion(ctx.Log, session, "interrupting unstarted execution attempt", completionErr)
+		}
 		block("starting execution attempt", err)
 		return
 	}
@@ -317,9 +321,9 @@ func (h *RunHistory) beginAttempt(lifecycle *RunLifecycle, session *runSession, 
 	}, now)
 }
 
-func (h *RunHistory) completeAttempt(lifecycle *RunLifecycle, session *runSession, runStatus runs.Status, completedAt time.Time) {
+func (h *RunHistory) completeAttempt(lifecycle *RunLifecycle, session *runSession, runStatus runs.Status, completedAt time.Time) bool {
 	if lifecycle.attemptID == "" || h.executionWriter == nil {
-		return
+		return true
 	}
 	status := runs.AttemptSucceeded
 	reason := ""
@@ -336,8 +340,10 @@ func (h *RunHistory) completeAttempt(lifecycle *RunLifecycle, session *runSessio
 			FailureReason: reason,
 		})
 	}); err != nil {
-		h.markPersistenceFailed(lifecycle.ctx.Log, session, "completing execution attempt", err)
+		h.blockRunCompletion(lifecycle.ctx.Log, session, "completing execution attempt", err)
+		return false
 	}
+	return true
 }
 
 func (l *RunLifecycle) startAttemptHeartbeat() {

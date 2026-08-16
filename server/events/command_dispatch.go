@@ -380,6 +380,7 @@ func (e *LocalCommandExecutor) routingContext(
 		return commandpkg.RoutingContext{}, fmt.Errorf("deriving durable concurrency key: %w", err)
 	}
 	routing.InstanceID = e.InstanceID
+	routing.DeploymentID = e.DeploymentID
 	routing.ConcurrencyKey = concurrencyKey
 	routing.OwnershipClaimID = claimID
 	return routing, nil

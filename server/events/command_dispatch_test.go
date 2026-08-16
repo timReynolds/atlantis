@@ -182,6 +182,7 @@ func TestLocalCommandExecutor_DeletesStalePlanBeforeCommentCommand(t *testing.T)
 	require.NoError(t, err)
 	require.Equal(t, executor.InstanceID, runner.routings[0].InstanceID)
 	require.Equal(t, expectedKey, runner.routings[0].ConcurrencyKey)
+	require.Equal(t, "prod-eu", runner.routings[0].DeploymentID)
 	require.Equal(t, "claim-1", runner.routings[0].OwnershipClaimID)
 }
 

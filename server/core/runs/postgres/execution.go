@@ -144,18 +144,37 @@ func (s *Store) CreateAttempt(ctx context.Context, attempt runs.RunAttempt) erro
 	opCtx, cancel := s.operationContext(ctx)
 	defer cancel()
 
-	result, err := s.db.ExecContext(opCtx, `INSERT INTO run_attempts (
+	result, err := s.db.ExecContext(opCtx, `WITH superseded_attempts AS (
+        UPDATE run_attempts
+        SET status = CASE
+                WHEN side_effect_started_at IS NULL THEN $18
+                ELSE $19
+            END,
+            completed_at = $8,
+            failure_reason = CASE
+                WHEN side_effect_started_at IS NULL THEN 'ownership transferred before side effect started'
+                ELSE 'ownership transferred after side effect started'
+            END
+        WHERE deployment_id = $4
+          AND concurrency_key = $5
+          AND ownership_claim_id <> $6
+          AND status IN ($7, $20)
+    )
+    INSERT INTO run_attempts (
         id, run_id, instance_id, deployment_id, concurrency_key, ownership_claim_id, status,
         claimed_at, started_at, heartbeat_at, side_effect_started_at,
         completed_at, failure_reason, reconciled_at, reconciled_by,
         reconciliation_summary, metadata
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+    )
+    SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+    FROM (SELECT count(*) FROM superseded_attempts) AS superseded
     ON CONFLICT DO NOTHING`,
 		attempt.ID, attempt.RunID, attempt.InstanceID, attempt.DeploymentID, attempt.ConcurrencyKey,
 		attempt.OwnershipClaimID, attempt.Status, attempt.ClaimedAt, attempt.StartedAt,
 		attempt.HeartbeatAt, attempt.SideEffectStartedAt, attempt.CompletedAt,
 		attempt.FailureReason, attempt.ReconciledAt, attempt.ReconciledBy,
 		attempt.ReconciliationSummary, []byte(attempt.Metadata),
+		runs.AttemptInterrupted, runs.AttemptUnknown, runs.AttemptRunning,
 	)
 	if err != nil {
 		return fmt.Errorf("creating run attempt: %w", err)

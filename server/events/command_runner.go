@@ -204,18 +204,19 @@ func (c *DefaultCommandRunner) runAutoplanCommand(baseRepo models.Repo, headRepo
 	}
 
 	ctx := &command.Context{
-		User:                 user,
-		Log:                  log,
-		Scope:                scope,
-		Pull:                 pull,
-		HeadRepo:             headRepo,
-		PullStatus:           status,
-		Trigger:              command.AutoTrigger,
-		ExecutionLease:       routing.Lease,
-		RecoverExternalPlans: routing.RecoverExternalPlans,
-		ExecutionInstanceID:  routing.InstanceID,
-		ConcurrencyKey:       routing.ConcurrencyKey,
-		OwnershipClaimID:     routing.OwnershipClaimID,
+		User:                  user,
+		Log:                   log,
+		Scope:                 scope,
+		Pull:                  pull,
+		HeadRepo:              headRepo,
+		PullStatus:            status,
+		Trigger:               command.AutoTrigger,
+		ExecutionLease:        routing.Lease,
+		RecoverExternalPlans:  routing.RecoverExternalPlans,
+		ExecutionInstanceID:   routing.InstanceID,
+		ExecutionDeploymentID: routing.DeploymentID,
+		ConcurrencyKey:        routing.ConcurrencyKey,
+		OwnershipClaimID:      routing.OwnershipClaimID,
 	}
 	if !c.validateCtxAndComment(ctx, command.Autoplan, true) {
 		return
@@ -543,21 +544,22 @@ func (c *DefaultCommandRunner) runCommentCommand(baseRepo models.Repo, maybeHead
 	}
 
 	ctx := &command.Context{
-		User:                 user,
-		Log:                  log,
-		Pull:                 pull,
-		PullStatus:           status,
-		HeadRepo:             headRepo,
-		Scope:                scope,
-		Trigger:              command.CommentTrigger,
-		PolicySet:            cmd.PolicySet,
-		ClearPolicyApproval:  cmd.ClearPolicyApproval,
-		TeamAllowlistChecker: c.TeamAllowlistChecker,
-		ExecutionLease:       routing.Lease,
-		RecoverExternalPlans: routing.RecoverExternalPlans,
-		ExecutionInstanceID:  routing.InstanceID,
-		ConcurrencyKey:       routing.ConcurrencyKey,
-		OwnershipClaimID:     routing.OwnershipClaimID,
+		User:                  user,
+		Log:                   log,
+		Pull:                  pull,
+		PullStatus:            status,
+		HeadRepo:              headRepo,
+		Scope:                 scope,
+		Trigger:               command.CommentTrigger,
+		PolicySet:             cmd.PolicySet,
+		ClearPolicyApproval:   cmd.ClearPolicyApproval,
+		TeamAllowlistChecker:  c.TeamAllowlistChecker,
+		ExecutionLease:        routing.Lease,
+		RecoverExternalPlans:  routing.RecoverExternalPlans,
+		ExecutionInstanceID:   routing.InstanceID,
+		ExecutionDeploymentID: routing.DeploymentID,
+		ConcurrencyKey:        routing.ConcurrencyKey,
+		OwnershipClaimID:      routing.OwnershipClaimID,
 	}
 
 	if !c.validateCtxAndComment(ctx, cmd.Name, true) {

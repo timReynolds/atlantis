@@ -64,12 +64,13 @@ func TestRegisterExecutionInstance(t *testing.T) {
 func TestCreateAttemptMapsActiveConcurrencyConflict(t *testing.T) {
 	store, mock := newMockStore(t)
 	attempt := claimedAttempt()
-	mock.ExpectExec("INSERT INTO run_attempts").
+	mock.ExpectExec("WITH superseded_attempts AS").
 		WithArgs(
 			attempt.ID, attempt.RunID, attempt.InstanceID, attempt.DeploymentID, attempt.ConcurrencyKey,
 			attempt.OwnershipClaimID, attempt.Status, attempt.ClaimedAt, nil,
 			attempt.HeartbeatAt, nil, nil, attempt.FailureReason, nil,
 			attempt.ReconciledBy, attempt.ReconciliationSummary, []byte(`{}`),
+			runs.AttemptInterrupted, runs.AttemptUnknown, runs.AttemptRunning,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery("SELECT .* FROM run_attempts WHERE id = \\$1").

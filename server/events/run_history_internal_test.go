@@ -283,6 +283,7 @@ func TestRunHistoryLeavesRunIncompleteWhenProjectCompletionCannotPersist(t *test
 	writer := &recordingRunWriter{completeProjectErr: errors.New("store unavailable")}
 	history := newTestRunHistory(t, writer)
 	ctx := testRunContext(t)
+	enableHAContext(ctx)
 	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
 	projectCtx := history.beginProject(command.ProjectContext{
 		RunID: ctx.RunID, ProjectName: "network", RepoRelDir: "network", Workspace: "default", Log: ctx.Log,
@@ -297,6 +298,8 @@ func TestRunHistoryLeavesRunIncompleteWhenProjectCompletionCannotPersist(t *test
 
 	require.Empty(t, writer.runsCompleted, "the running record must remain visibly incomplete")
 	require.Equal(t, 1, writer.completeProjectCalls, "one store outage must stop later completion writes")
+	require.Len(t, writer.attemptsCompleted, 1, "attempt admission must not remain active")
+	require.Equal(t, runs.AttemptSucceeded, writer.attemptsCompleted[0].Status)
 }
 
 func TestRunHistoryLeavesRunIncompleteWhenFinalOutputCannotPersist(t *testing.T) {
@@ -343,6 +346,7 @@ func TestRunHistoryRecordsRoutedExecutionAttempt(t *testing.T) {
 	history := newTestRunHistory(t, writer)
 	ctx := testRunContext(t)
 	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ExecutionDeploymentID = "prod-eu"
 	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
 	ctx.OwnershipClaimID = "claim-1"
 
@@ -357,6 +361,7 @@ func TestRunHistoryRecordsRoutedExecutionAttempt(t *testing.T) {
 	require.Equal(t, runs.AttemptClaimed, writer.attemptsCreated[0].Status)
 	require.Equal(t, ctx.RunID, writer.attemptsCreated[0].RunID)
 	require.Equal(t, ctx.ExecutionInstanceID, writer.attemptsCreated[0].InstanceID)
+	require.Equal(t, ctx.ExecutionDeploymentID, writer.attemptsCreated[0].DeploymentID)
 	require.Equal(t, []runs.ID{ctx.AttemptID}, writer.attemptsStarted)
 	require.Equal(t, []runs.ID{ctx.AttemptID}, writer.sideEffectsStarted)
 	require.Len(t, writer.attemptsCompleted, 1)
@@ -369,6 +374,7 @@ func TestRunHistoryFailsClosedWhenAttemptAdmissionIsNotDurable(t *testing.T) {
 	history := newTestRunHistory(t, writer)
 	ctx := testRunContext(t)
 	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ExecutionDeploymentID = "prod-eu"
 	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
 	ctx.OwnershipClaimID = "claim-1"
 
@@ -386,6 +392,7 @@ func TestRunHistoryMarksPanicAfterSideEffectUnknown(t *testing.T) {
 	history := newTestRunHistory(t, writer)
 	ctx := testRunContext(t)
 	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ExecutionDeploymentID = "prod-eu"
 	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
 	ctx.OwnershipClaimID = "claim-1"
 	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerComment)
@@ -426,6 +433,13 @@ func testRunContext(t *testing.T) *command.Context {
 			},
 		},
 	}
+}
+
+func enableHAContext(ctx *command.Context) {
+	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ExecutionDeploymentID = "prod-eu"
+	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
+	ctx.OwnershipClaimID = "claim-1"
 }
 
 type recordingRunWriter struct {

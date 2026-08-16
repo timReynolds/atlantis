@@ -78,6 +78,18 @@ func TestStoreConformance(t *testing.T) {
 	}
 	require.NoError(t, store.CreateAttempt(ctx, attempt))
 	require.NoError(t, store.CreateAttempt(ctx, attempt), "attempt replay must be idempotent")
+	takeoverAttempt := attempt
+	takeoverAttempt.ID = mustID(t)
+	takeoverAttempt.OwnershipClaimID = "claim-2"
+	takeoverAttempt.ClaimedAt = createdAt.Add(500 * time.Millisecond)
+	takeoverAttempt.HeartbeatAt = takeoverAttempt.ClaimedAt
+	require.NoError(t, store.CreateAttempt(ctx, takeoverAttempt), "a new lease generation must retire its predecessor")
+	interruptedAttempt, err := store.GetAttempt(ctx, attemptID)
+	require.NoError(t, err)
+	require.Equal(t, runs.AttemptInterrupted, interruptedAttempt.Status)
+	require.Contains(t, interruptedAttempt.FailureReason, "ownership transferred")
+	attempt = takeoverAttempt
+	attemptID = takeoverAttempt.ID
 	otherInstance := instance
 	otherInstance.ID = mustID(t)
 	otherInstance.ReplicaID = "atlantis-other-0"

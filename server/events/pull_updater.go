@@ -97,6 +97,11 @@ func (c *PullUpdater) createComment(ctx *command.Context, cmd PullCommand, comme
 }
 
 func (c *PullUpdater) shouldUseLargeRunSummary(ctx *command.Context, result command.Result, cmd PullCommand) bool {
+	for _, project := range result.ProjectResults {
+		if project.StateRmSuccess != nil || project.ImportSuccess != nil {
+			return false
+		}
+	}
 	return c.LargeRunSummaryThreshold > 0 &&
 		c.RunHistoryURLGenerator != nil &&
 		c.RunHistoryFinalizer != nil &&

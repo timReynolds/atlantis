@@ -33,6 +33,12 @@ func TestPullUpdaterUsesLargeRunSummaryOnlyWhenDurableUIIsAvailable(t *testing.T
 	result.ProjectResults = result.ProjectResults[:49]
 	require.False(t, updater.shouldUseLargeRunSummary(ctx, result, cmd))
 	result.ProjectResults = make([]command.ProjectResult, 50)
+	result.ProjectResults[0].StateRmSuccess = &models.StateRmSuccess{RePlanCmd: "atlantis plan -p network"}
+	require.False(t, updater.shouldUseLargeRunSummary(ctx, result, cmd))
+	result.ProjectResults[0].StateRmSuccess = nil
+	result.ProjectResults[0].ImportSuccess = &models.ImportSuccess{RePlanCmd: "atlantis plan -p network"}
+	require.False(t, updater.shouldUseLargeRunSummary(ctx, result, cmd))
+	result.ProjectResults[0].ImportSuccess = nil
 	cmd.Verbose = true
 	require.False(t, updater.shouldUseLargeRunSummary(ctx, result, cmd))
 	cmd.Verbose = false

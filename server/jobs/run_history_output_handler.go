@@ -33,6 +33,7 @@ type PersistentProjectCommandOutputHandler struct {
 	logger logging.SimpleLogging
 	now    func() time.Time
 	states sync.Map
+	failed sync.Map
 }
 
 // NewPersistentProjectCommandOutputHandler adds durable batching around the
@@ -79,6 +80,7 @@ func (p *PersistentProjectCommandOutputHandler) FinishRun(runID runs.ID) {
 		p.states.Delete(key)
 		return true
 	})
+	p.failed.Delete(runID)
 }
 
 func (p *PersistentProjectCommandOutputHandler) record(
@@ -90,12 +92,19 @@ func (p *PersistentProjectCommandOutputHandler) record(
 	if ctx.RunID == "" || ctx.ProjectRunID == "" {
 		return
 	}
+	if p.runFailed(ctx.RunID) {
+		return
+	}
 	value, _ := p.states.LoadOrStore(ctx.ProjectRunID, &persistentOutputState{
 		runID: ctx.RunID, projectRunID: ctx.ProjectRunID,
 	})
 	state := value.(*persistentOutputState)
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	if p.runFailed(ctx.RunID) {
+		state.buffer = ""
+		return
+	}
 	if operationComplete {
 		p.flush(state)
 		return
@@ -110,10 +119,13 @@ func (p *PersistentProjectCommandOutputHandler) record(
 	}
 	if state.buffer != "" && state.stream != stream {
 		p.flush(state)
+		if p.runFailed(ctx.RunID) {
+			return
+		}
 	}
 	state.stream = stream
 	state.buffer += msg
-	for len(state.buffer) >= persistentOutputChunkBytes {
+	for !p.runFailed(ctx.RunID) && len(state.buffer) >= persistentOutputChunkBytes {
 		cut := utf8SafeCut(state.buffer, persistentOutputChunkBytes)
 		p.flushPrefix(state, cut)
 	}
@@ -129,6 +141,10 @@ type persistentOutputState struct {
 }
 
 func (p *PersistentProjectCommandOutputHandler) flush(state *persistentOutputState) {
+	if p.runFailed(state.runID) {
+		state.buffer = ""
+		return
+	}
 	if state.buffer == "" {
 		return
 	}
@@ -147,7 +163,14 @@ func (p *PersistentProjectCommandOutputHandler) flushPrefix(state *persistentOut
 	defer cancel()
 	if err := p.writer.AppendOutput(ctx, []runs.OutputChunk{chunk}); err != nil {
 		p.logger.Err("persisting project output: %v", err)
+		p.failed.Store(state.runID, struct{}{})
+		state.buffer = ""
 	}
+}
+
+func (p *PersistentProjectCommandOutputHandler) runFailed(runID runs.ID) bool {
+	_, failed := p.failed.Load(runID)
+	return failed
 }
 
 func utf8SafeCut(value string, maximum int) int {

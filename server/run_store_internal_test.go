@@ -88,13 +88,14 @@ func TestValidateRunStoreConfig(t *testing.T) {
 
 func TestRunStoreRetentionServiceBuildsIndependentCutoffs(t *testing.T) {
 	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.FixedZone("test", 2*60*60))
-	service := runStoreRetentionService{metadataDays: 365, outputDays: 90, now: func() time.Time { return now }}
+	service := runStoreRetentionService{metadataDays: 365, outputDays: 90, driftDays: 365, now: func() time.Time { return now }}
 
 	policy := service.policy(now)
 
 	require.Equal(t, now.UTC().AddDate(0, 0, -365), *policy.RunMetadataBefore)
 	require.Equal(t, now.UTC().AddDate(0, 0, -90), *policy.OutputBefore)
 	require.Nil(t, policy.AuditEventsBefore)
+	require.Equal(t, now.UTC().AddDate(0, 0, -365), *policy.DriftStatusBefore)
 }
 
 func TestRunStoreRetentionServiceStopsWithContext(t *testing.T) {

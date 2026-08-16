@@ -136,6 +136,7 @@ const (
 	RepoConfigJSONFlag               = "repo-config-json"
 	RepoAllowlistFlag                = "repo-allowlist"
 	RunStoreAuditRetentionDaysFlag   = "run-store-audit-retention-days"
+	RunStoreDriftRetentionDaysFlag   = "run-store-drift-retention-days"
 	RunStoreMaxIdleConnsFlag         = "run-store-max-idle-conns"
 	RunStoreMaxOpenConnsFlag         = "run-store-max-open-conns"
 	RunStoreOutputRetentionDaysFlag  = "run-store-output-retention-days"
@@ -206,6 +207,7 @@ const (
 	DefaultRedisInsecureSkipVerify      = false
 	DefaultRunStoreMaxIdleConns         = 5
 	DefaultRunStoreMaxOpenConns         = 10
+	DefaultRunStoreDriftRetentionDays   = 365
 	DefaultRunStoreOutputRetentionDays  = 90
 	DefaultRunStoreType                 = server.RunStoreNoop
 	DefaultTFDistribution               = TFDistributionTerraform
@@ -753,6 +755,10 @@ var intFlags = map[string]intFlag{
 	RunStoreAuditRetentionDaysFlag: {
 		description: "Delete audit events older than this many days. Zero retains audit events indefinitely.",
 	},
+	RunStoreDriftRetentionDaysFlag: {
+		description:  "Delete latest drift status records older than this many days. Zero retains drift status indefinitely.",
+		defaultValue: DefaultRunStoreDriftRetentionDays,
+	},
 	RunStoreMaxIdleConnsFlag: {
 		description:  "Maximum idle PostgreSQL connections for the durable run history store.",
 		defaultValue: DefaultRunStoreMaxIdleConns,
@@ -1079,6 +1085,9 @@ func (s *ServerCmd) setDefaults(c *server.UserConfig, v *viper.Viper) {
 	if !v.IsSet(RunStoreMaxIdleConnsFlag) {
 		c.RunStoreMaxIdleConns = DefaultRunStoreMaxIdleConns
 	}
+	if !v.IsSet(RunStoreDriftRetentionDaysFlag) {
+		c.RunStoreDriftRetentionDays = DefaultRunStoreDriftRetentionDays
+	}
 	if !v.IsSet(RunStoreMaxOpenConnsFlag) {
 		c.RunStoreMaxOpenConns = DefaultRunStoreMaxOpenConns
 	}
@@ -1256,7 +1265,7 @@ func (s *ServerCmd) validate(userConfig server.UserConfig) error {
 	if userConfig.RunStoreMaxIdleConns < 0 || userConfig.RunStoreMaxIdleConns > userConfig.RunStoreMaxOpenConns {
 		return fmt.Errorf("--%s must be between zero and --%s", RunStoreMaxIdleConnsFlag, RunStoreMaxOpenConnsFlag)
 	}
-	if userConfig.RunStoreRetentionDays < 0 || userConfig.RunStoreOutputRetentionDays < 0 || userConfig.RunStoreAuditRetentionDays < 0 {
+	if userConfig.RunStoreRetentionDays < 0 || userConfig.RunStoreOutputRetentionDays < 0 || userConfig.RunStoreAuditRetentionDays < 0 || userConfig.RunStoreDriftRetentionDays < 0 {
 		return fmt.Errorf("run store retention days cannot be negative")
 	}
 

@@ -31,6 +31,8 @@ func TestStoreDoesNotPersistPlanOutput(t *testing.T) {
 	}
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO drift_status")).
 		WithArgs(
+			driftIdentityDigest("example/infrastructure", projectDrift),
+			digestValues("example/infrastructure"),
 			"example/infrastructure", "network", "terraform/network", "production",
 			"main", "main", "deadbeef", "detection-1", true, 1, 2, 3, 4, 5,
 			"1 to add", true, "partial failure", normalizeTime(checkedAt),
@@ -42,16 +44,32 @@ func TestStoreDoesNotPersistPlanOutput(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestStoreRejectsIdentityDigestCollision(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	projectDrift := models.ProjectDrift{ProjectName: "network", Ref: "main", LastChecked: time.Now()}
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO drift_status")).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	err = New(db, time.Second).Store("example/infrastructure", projectDrift)
+	require.EqualError(t, err, "storing PostgreSQL drift status: identity digest collision")
+}
+
 func TestBuildWherePreservesWildcardAndExactSemantics(t *testing.T) {
 	where, args := buildWhere("example/infrastructure", drift.GetOptions{
 		ProjectName: "network", Ref: "main",
 	})
-	require.Equal(t, "WHERE repository = $1 AND project_name = $2 AND ref = $3", where)
-	require.Equal(t, []any{"example/infrastructure", "network", "main"}, args)
+	require.Equal(t, "WHERE repository_hash = $1 AND repository = $2 AND project_name = $3 AND ref = $4", where)
+	require.Equal(t, []any{digestValues("example/infrastructure"), "example/infrastructure", "network", "main"}, args)
 
 	where, args = buildWhere("example/infrastructure", drift.GetOptions{Exact: true})
-	require.Equal(t, "WHERE repository = $1 AND project_name = $2 AND directory = $3 AND workspace = $4 AND ref = $5 AND base_branch = $6", where)
-	require.Equal(t, []any{"example/infrastructure", "", "", "", "", ""}, args)
+	require.Equal(t, "WHERE repository_hash = $1 AND repository = $2 AND project_name = $3 AND directory = $4 AND workspace = $5 AND ref = $6 AND base_branch = $7", where)
+	require.Equal(t, []any{digestValues("example/infrastructure"), "example/infrastructure", "", "", "", "", ""}, args)
+}
+
+func TestDigestValuesIsDelimiterSafe(t *testing.T) {
+	require.NotEqual(t, digestValues("a", "bc"), digestValues("ab", "c"))
 }
 
 func TestDeleteMatchingRequiresFilter(t *testing.T) {

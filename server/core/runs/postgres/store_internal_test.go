@@ -128,12 +128,15 @@ func TestApplyRetentionKeepsCutoffsIndependent(t *testing.T) {
 	outputBefore := testTime
 	auditBefore := testTime.Add(time.Hour)
 	runBefore := testTime.Add(2 * time.Hour)
+	driftBefore := testTime.Add(3 * time.Hour)
 	mock.ExpectExec("WITH retained_output AS").
 		WithArgs(outputBefore, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, retentionBatchSize))
 	mock.ExpectExec("WITH retained_output AS").
 		WithArgs(outputBefore, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 4))
 	mock.ExpectExec("WITH retained_events AS").
 		WithArgs(auditBefore, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectExec("WITH retained_drift AS").
+		WithArgs(driftBefore, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 6))
 	runArgs := []driver.Value{runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, retentionBatchSize}
 	mock.ExpectExec("WITH retained_output AS").
 		WithArgs(runArgs...).WillReturnResult(sqlmock.NewResult(0, 8))
@@ -149,12 +152,13 @@ func TestApplyRetentionKeepsCutoffsIndependent(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	result, err := store.ApplyRetention(context.Background(), runs.RetentionPolicy{
-		RunMetadataBefore: &runBefore, OutputBefore: &outputBefore, AuditEventsBefore: &auditBefore,
+		RunMetadataBefore: &runBefore, OutputBefore: &outputBefore,
+		AuditEventsBefore: &auditBefore, DriftStatusBefore: &driftBefore,
 	})
 	require.NoError(t, err)
 	require.Equal(t, runs.RetentionResult{
 		RunsDeleted: retentionBatchSize + 1, ProjectRunsDeleted: 5,
-		OutputChunksDeleted: retentionBatchSize + 12, AuditEventsDeleted: 2,
+		OutputChunksDeleted: retentionBatchSize + 12, AuditEventsDeleted: 2, DriftStatusesDeleted: 6,
 	}, result)
 	require.NoError(t, mock.ExpectationsWereMet())
 }

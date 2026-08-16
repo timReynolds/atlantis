@@ -132,6 +132,7 @@ type UserConfig struct {
 	RunStoreRetentionDays           int    `mapstructure:"run-store-retention-days"`
 	RunStoreOutputRetentionDays     int    `mapstructure:"run-store-output-retention-days"`
 	RunStoreAuditRetentionDays      int    `mapstructure:"run-store-audit-retention-days"`
+	RunStoreDriftRetentionDays      int    `mapstructure:"run-store-drift-retention-days"`
 
 	// SilenceNoProjects is whether Atlantis should respond to a PR if no projects are found.
 	SilenceNoProjects   bool `mapstructure:"silence-no-projects"`

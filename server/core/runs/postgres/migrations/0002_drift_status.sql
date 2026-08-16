@@ -1,4 +1,6 @@
 CREATE TABLE drift_status (
+    identity_hash bytea PRIMARY KEY,
+    repository_hash bytea NOT NULL,
     repository text NOT NULL,
     project_name text NOT NULL DEFAULT '',
     directory text NOT NULL DEFAULT '',
@@ -17,15 +19,16 @@ CREATE TABLE drift_status (
     changes_outside boolean NOT NULL DEFAULT false,
     error text NOT NULL DEFAULT '',
     last_checked timestamptz NOT NULL,
-    PRIMARY KEY (repository, project_name, directory, workspace, ref, base_branch),
+    CONSTRAINT drift_status_identity_hash_size CHECK (octet_length(identity_hash) = 32),
+    CONSTRAINT drift_status_repository_hash_size CHECK (octet_length(repository_hash) = 32),
     CONSTRAINT drift_status_counts_nonnegative CHECK (
         additions >= 0 AND changes >= 0 AND destructions >= 0 AND imports >= 0 AND forgets >= 0
     )
 );
 
 CREATE INDEX drift_status_repository_checked_idx
-    ON drift_status (repository, last_checked DESC, project_name, directory, workspace);
+    ON drift_status (repository_hash, last_checked DESC, identity_hash);
 CREATE INDEX drift_status_detection_idx
     ON drift_status (detection_id) WHERE detection_id <> '';
 CREATE INDEX drift_status_drift_checked_idx
-    ON drift_status (repository, has_drift, last_checked DESC);
+    ON drift_status (repository_hash, has_drift, last_checked DESC);

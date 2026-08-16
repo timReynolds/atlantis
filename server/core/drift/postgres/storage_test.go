@@ -9,12 +9,14 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/runatlantis/atlantis/server/core/drift"
 	driftpostgres "github.com/runatlantis/atlantis/server/core/drift/postgres"
+	"github.com/runatlantis/atlantis/server/core/runs"
 	runspostgres "github.com/runatlantis/atlantis/server/core/runs/postgres"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/stretchr/testify/require"
@@ -60,6 +62,11 @@ func TestStorageConformance(t *testing.T) {
 	require.NoError(t, storage.Store("another/repository", models.ProjectDrift{
 		ProjectName: "other", Ref: "main", LastChecked: checkedAt,
 	}))
+	longIdentity := strings.Repeat("nested-segment/", 300)
+	require.NoError(t, storage.Store("long/"+longIdentity, models.ProjectDrift{
+		ProjectName: longIdentity, Path: longIdentity, Workspace: longIdentity,
+		Ref: longIdentity, BaseBranch: longIdentity, LastChecked: checkedAt.Add(48 * time.Hour),
+	}))
 
 	results, err := storage.Get("example/infrastructure", drift.GetOptions{Ref: "main", BaseBranch: "main"})
 	require.NoError(t, err)
@@ -97,6 +104,17 @@ func TestStorageConformance(t *testing.T) {
 		Ref: "main", BaseBranch: "main", Exact: true,
 	}))
 	require.NoError(t, storage.Delete("example/infrastructure", "database"))
+	results, err = storage.Get("example/infrastructure", drift.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, results)
+	require.NoError(t, storage.Delete("another/repository", ""))
+	require.NoError(t, storage.Store("example/infrastructure", models.ProjectDrift{
+		ProjectName: "obsolete-ref", Ref: "deleted-branch", LastChecked: checkedAt,
+	}))
+	driftCutoff := checkedAt.Add(time.Hour)
+	retention, err := runStore.ApplyRetention(ctx, runs.RetentionPolicy{DriftStatusBefore: &driftCutoff})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), retention.DriftStatusesDeleted)
 	results, err = storage.Get("example/infrastructure", drift.GetOptions{})
 	require.NoError(t, err)
 	require.Empty(t, results)

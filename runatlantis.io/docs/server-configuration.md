@@ -1474,6 +1474,16 @@ ATLANTIS_RUN_STORE_AUDIT_RETENTION_DAYS=365
 
 Delete audit events older than this many days. The default `0` retains audit events indefinitely.
 
+### `--run-store-drift-retention-days`
+
+```bash
+atlantis server --run-store-drift-retention-days=365
+# or
+ATLANTIS_RUN_STORE_DRIFT_RETENTION_DAYS=365
+```
+
+Delete latest-state drift records older than this many days so deleted and one-off refs do not remain in current status indefinitely. Defaults to `365`; set to `0` to retain drift status indefinitely.
+
 ### `--run-store-max-idle-conns`
 
 ```bash

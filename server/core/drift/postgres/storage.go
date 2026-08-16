@@ -6,7 +6,9 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"strings"
 	"time"
@@ -38,15 +40,17 @@ func New(db *sql.DB, operationTimeout time.Duration) *Storage {
 func (s *Storage) Store(repository string, projectDrift models.ProjectDrift) error {
 	ctx, cancel := s.operationContext()
 	defer cancel()
-	_, err := s.db.ExecContext(ctx, `
+	result, err := s.db.ExecContext(ctx, `
 INSERT INTO drift_status (
+    identity_hash, repository_hash,
     repository, project_name, directory, workspace, ref, base_branch,
     resolved_commit, detection_id, has_drift, additions, changes,
     destructions, imports, forgets, summary, changes_outside, error, last_checked
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
 )
-ON CONFLICT (repository, project_name, directory, workspace, ref, base_branch)
+ON CONFLICT (identity_hash)
 DO UPDATE SET
     resolved_commit = EXCLUDED.resolved_commit,
     detection_id = EXCLUDED.detection_id,
@@ -59,7 +63,15 @@ DO UPDATE SET
     summary = EXCLUDED.summary,
     changes_outside = EXCLUDED.changes_outside,
     error = EXCLUDED.error,
-    last_checked = EXCLUDED.last_checked`,
+    last_checked = EXCLUDED.last_checked
+WHERE drift_status.repository = EXCLUDED.repository
+  AND drift_status.project_name = EXCLUDED.project_name
+  AND drift_status.directory = EXCLUDED.directory
+  AND drift_status.workspace = EXCLUDED.workspace
+  AND drift_status.ref = EXCLUDED.ref
+  AND drift_status.base_branch = EXCLUDED.base_branch`,
+		driftIdentityDigest(repository, projectDrift),
+		digestValues(repository),
 		repository,
 		projectDrift.ProjectName,
 		projectDrift.Path,
@@ -81,6 +93,13 @@ DO UPDATE SET
 	)
 	if err != nil {
 		return fmt.Errorf("storing PostgreSQL drift status: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("checking stored PostgreSQL drift status: %w", err)
+	}
+	if affected != 1 {
+		return fmt.Errorf("storing PostgreSQL drift status: identity digest collision")
 	}
 	return nil
 }
@@ -113,10 +132,10 @@ func (s *Storage) Get(repository string, opts drift.GetOptions) ([]models.Projec
 // Delete removes all repository drift status or every identity with the given
 // project name.
 func (s *Storage) Delete(repository string, projectName string) error {
-	query := "DELETE FROM drift_status WHERE repository = $1"
-	args := []any{repository}
+	query := "DELETE FROM drift_status WHERE repository_hash = $1 AND repository = $2"
+	args := []any{digestValues(repository), repository}
 	if projectName != "" {
-		query += " AND project_name = $2"
+		query += " AND project_name = $3"
 		args = append(args, projectName)
 	}
 	return s.execDelete(query, args)
@@ -205,8 +224,8 @@ ORDER BY last_checked DESC, project_name, directory, workspace`, args
 }
 
 func buildWhere(repository string, opts drift.GetOptions) (string, []any) {
-	clauses := []string{"WHERE repository = $1"}
-	args := []any{repository}
+	clauses := []string{"WHERE repository_hash = $1", "repository = $2"}
+	args := []any{digestValues(repository), repository}
 	appendFilter := func(column string, value any) {
 		args = append(args, value)
 		clauses = append(clauses, fmt.Sprintf("%s = $%d", column, len(args)))
@@ -239,6 +258,24 @@ func buildWhere(repository string, opts drift.GetOptions) (string, []any) {
 		clauses = append(clauses, fmt.Sprintf("last_checked >= $%d", len(args)))
 	}
 	return strings.Join(clauses, " AND "), args
+}
+
+func driftIdentityDigest(repository string, projectDrift models.ProjectDrift) []byte {
+	return digestValues(
+		repository, projectDrift.ProjectName, projectDrift.Path,
+		projectDrift.Workspace, projectDrift.Ref, projectDrift.BaseBranch,
+	)
+}
+
+func digestValues(values ...string) []byte {
+	digest := sha256.New()
+	var size [8]byte
+	for _, value := range values {
+		binary.BigEndian.PutUint64(size[:], uint64(len(value)))
+		_, _ = digest.Write(size[:])
+		_, _ = digest.Write([]byte(value))
+	}
+	return digest.Sum(nil)
 }
 
 type rowScanner interface {

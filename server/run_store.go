@@ -49,7 +49,7 @@ func validateRunStoreConfig(userConfig UserConfig) error {
 	if userConfig.RunStoreMaxOpenConns > 0 && userConfig.RunStoreMaxIdleConns > userConfig.RunStoreMaxOpenConns {
 		return errors.New("run store maximum idle connections exceed maximum open connections")
 	}
-	if userConfig.RunStoreRetentionDays < 0 || userConfig.RunStoreOutputRetentionDays < 0 || userConfig.RunStoreAuditRetentionDays < 0 {
+	if userConfig.RunStoreRetentionDays < 0 || userConfig.RunStoreOutputRetentionDays < 0 || userConfig.RunStoreAuditRetentionDays < 0 || userConfig.RunStoreDriftRetentionDays < 0 {
 		return errors.New("run store retention days cannot be negative")
 	}
 	return nil
@@ -78,13 +78,14 @@ type runStoreRetentionService struct {
 	metadataDays int
 	outputDays   int
 	auditDays    int
+	driftDays    int
 	interval     time.Duration
 	now          func() time.Time
 }
 
 func newRunStoreRetentionService(store runs.Store, userConfig UserConfig, logger logging.SimpleLogging) *runStoreRetentionService {
 	if userConfig.RunStoreType != RunStorePostgres ||
-		(userConfig.RunStoreRetentionDays == 0 && userConfig.RunStoreOutputRetentionDays == 0 && userConfig.RunStoreAuditRetentionDays == 0) {
+		(userConfig.RunStoreRetentionDays == 0 && userConfig.RunStoreOutputRetentionDays == 0 && userConfig.RunStoreAuditRetentionDays == 0 && userConfig.RunStoreDriftRetentionDays == 0) {
 		return nil
 	}
 	return &runStoreRetentionService{
@@ -92,6 +93,7 @@ func newRunStoreRetentionService(store runs.Store, userConfig UserConfig, logger
 		metadataDays: userConfig.RunStoreRetentionDays,
 		outputDays:   userConfig.RunStoreOutputRetentionDays,
 		auditDays:    userConfig.RunStoreAuditRetentionDays,
+		driftDays:    userConfig.RunStoreDriftRetentionDays,
 		interval:     runStoreRetentionInterval,
 		now:          time.Now,
 	}
@@ -118,8 +120,8 @@ func (s *runStoreRetentionService) apply(ctx context.Context) {
 		return
 	}
 	s.logger.Info(
-		"applied run history retention runs %d, project runs %d, output chunks %d, audit events %d",
-		result.RunsDeleted, result.ProjectRunsDeleted, result.OutputChunksDeleted, result.AuditEventsDeleted,
+		"applied run history retention runs %d, project runs %d, output chunks %d, audit events %d, drift statuses %d",
+		result.RunsDeleted, result.ProjectRunsDeleted, result.OutputChunksDeleted, result.AuditEventsDeleted, result.DriftStatusesDeleted,
 	)
 }
 
@@ -129,6 +131,7 @@ func (s *runStoreRetentionService) policy(now time.Time) runs.RetentionPolicy {
 		RunMetadataBefore: retentionCutoff(now, s.metadataDays),
 		OutputBefore:      retentionCutoff(now, s.outputDays),
 		AuditEventsBefore: retentionCutoff(now, s.auditDays),
+		DriftStatusBefore: retentionCutoff(now, s.driftDays),
 	}
 }
 

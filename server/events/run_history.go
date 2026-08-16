@@ -395,7 +395,10 @@ func (h *RunHistory) beginAttempt(lifecycle *RunLifecycle, session *runSession, 
 		return
 	}
 	if ctx.ExecutionDeploymentID == "" || ctx.ConcurrencyKey == "" || ctx.OwnershipClaimID == "" {
-		block("admitting execution attempt", errors.New("routed execution identity is incomplete"))
+		block("admitting execution attempt", fmt.Errorf(
+			"routed execution identity is incomplete (deployment=%t concurrency_key=%t ownership_claim=%t)",
+			ctx.ExecutionDeploymentID != "", ctx.ConcurrencyKey != "", ctx.OwnershipClaimID != "",
+		))
 		return
 	}
 	attemptID, err := h.newID()

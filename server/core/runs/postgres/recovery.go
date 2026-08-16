@@ -74,7 +74,7 @@ func prepareAttemptTakeover(ctx context.Context, tx *sql.Tx, request runs.Attemp
 			if err := completeRecoveredAttempt(ctx, tx, attempt, status, request.RecoveredAt, reason); err != nil {
 				return result, err
 			}
-			if err := completeRecoveredProjects(ctx, tx, attempt.ID, request.RecoveredAt, reason); err != nil {
+			if err := completeRecoveredProjects(ctx, tx, attempt.ID, attempt.RunID, recoveredProjectStatus(status), request.RecoveredAt, reason); err != nil {
 				return result, err
 			}
 			attempt.Status = status
@@ -90,7 +90,7 @@ func prepareAttemptTakeover(ctx context.Context, tx *sql.Tx, request runs.Attemp
 			if err := completeRecoveredAttempt(ctx, tx, attempt, status, request.RecoveredAt, reason); err != nil {
 				return result, err
 			}
-			if err := completeRecoveredProjects(ctx, tx, attempt.ID, request.RecoveredAt, reason); err != nil {
+			if err := completeRecoveredProjects(ctx, tx, attempt.ID, attempt.RunID, recoveredProjectStatus(status), request.RecoveredAt, reason); err != nil {
 				return result, err
 			}
 
@@ -184,12 +184,20 @@ func takeoverClassification(attempt runs.RunAttempt, newClaimID string) (runs.At
 	)
 }
 
-func completeRecoveredProjects(ctx context.Context, tx *sql.Tx, attemptID runs.ID, completedAt time.Time, reason string) error {
+func recoveredProjectStatus(attemptStatus runs.AttemptStatus) runs.Status {
+	if attemptStatus == runs.AttemptUnknown {
+		return runs.StatusUnknown
+	}
+	return runs.StatusFailed
+}
+
+func completeRecoveredProjects(ctx context.Context, tx *sql.Tx, attemptID, runID runs.ID, status runs.Status, completedAt time.Time, reason string) error {
 	_, err := tx.ExecContext(ctx, `UPDATE project_runs
-        SET status = $2, started_at = COALESCE(started_at, $3), completed_at = $3,
-            error_summary = CASE WHEN error_summary = '' THEN $4 ELSE error_summary END
-        WHERE attempt_id = $1 AND status IN ($5, $6)`,
-		attemptID, runs.StatusFailed, completedAt, reason,
+        SET status = $3, started_at = COALESCE(started_at, $4), completed_at = $4,
+            error_summary = CASE WHEN error_summary = '' THEN $5 ELSE error_summary END
+        WHERE (attempt_id = $1 OR (attempt_id IS NULL AND run_id = $2))
+          AND status IN ($6, $7)`,
+		attemptID, runID, status, completedAt, reason,
 		runs.StatusPending, runs.StatusRunning)
 	if err != nil {
 		return fmt.Errorf("completing project results for stale attempt: %w", err)

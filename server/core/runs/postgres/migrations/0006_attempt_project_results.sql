@@ -1,5 +1,17 @@
 ALTER TABLE project_runs ADD COLUMN attempt_id uuid;
 
+-- Before this column existed, one process attempt owned each logical Run.
+-- Associate legacy project rows with the latest recorded attempt so takeover
+-- recovery can terminalize in-flight rows after an upgrade.
+UPDATE project_runs AS project
+SET attempt_id = latest_attempt.id
+FROM (
+    SELECT DISTINCT ON (run_id) id, run_id
+    FROM run_attempts
+    ORDER BY run_id, claimed_at DESC, id DESC
+) AS latest_attempt
+WHERE project.run_id = latest_attempt.run_id;
+
 ALTER TABLE run_attempts ADD CONSTRAINT run_attempts_id_run_unique UNIQUE (id, run_id);
 ALTER TABLE project_runs ADD CONSTRAINT project_runs_attempt_run_fk
     FOREIGN KEY (attempt_id, run_id) REFERENCES run_attempts (id, run_id);

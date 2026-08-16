@@ -4,9 +4,11 @@
 package postgres
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/stretchr/testify/require"
 )
@@ -86,4 +88,29 @@ func TestRunMatchesPlanRetryRequiresExactLogicalOperation(t *testing.T) {
 	request.HeadSHA = run.HeadSHA
 	request.Command = runs.CommandApply
 	require.False(t, runMatchesPlanRetry(run, request))
+}
+
+func TestCompleteRecoveredProjectsIncludesRollingUpgradeRows(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	mock.ExpectBegin()
+	tx, err := db.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	mock.ExpectExec(`(?s)WHERE \(attempt_id = \$1 OR \(attempt_id IS NULL AND run_id = \$2\)\)`).
+		WithArgs(
+			testAttemptID, testRunID, runs.StatusFailed, testTime, "replica disappeared",
+			runs.StatusPending, runs.StatusRunning,
+		).
+		WillReturnResult(sqlmock.NewResult(0, 2))
+
+	require.NoError(t, completeRecoveredProjects(
+		context.Background(), tx, testAttemptID, testRunID, runs.StatusFailed, testTime, "replica disappeared",
+	))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRecoveredProjectStatusPreservesUnknownApplyOutcome(t *testing.T) {
+	require.Equal(t, runs.StatusUnknown, recoveredProjectStatus(runs.AttemptUnknown))
+	require.Equal(t, runs.StatusFailed, recoveredProjectStatus(runs.AttemptInterrupted))
 }

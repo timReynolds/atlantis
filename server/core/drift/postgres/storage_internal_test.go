@@ -4,6 +4,7 @@
 package postgres
 
 import (
+	"database/sql"
 	"regexp"
 	"testing"
 	"time"
@@ -37,7 +38,7 @@ func TestStoreDoesNotPersistPlanOutput(t *testing.T) {
 			"main", "main", "deadbeef", "detection-1", true, 1, 2, 3, 4, 5,
 			"1 to add", true, "partial failure", normalizeTime(checkedAt),
 		).
-		WillReturnRows(sqlmock.NewRows([]string{"stored", "identity_matches"}).AddRow(true, true))
+		WillReturnRows(sqlmock.NewRows([]string{"stored"}).AddRow(true))
 
 	store := New(db, time.Second)
 	require.NoError(t, store.Store("example/infrastructure", projectDrift))
@@ -50,7 +51,9 @@ func TestStoreRejectsIdentityDigestCollision(t *testing.T) {
 	defer db.Close()
 	projectDrift := models.ProjectDrift{ProjectName: "network", Ref: "main", LastChecked: time.Now()}
 	mock.ExpectQuery(regexp.QuoteMeta("WITH stored AS (")).
-		WillReturnRows(sqlmock.NewRows([]string{"stored", "identity_matches"}).AddRow(false, false))
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery("SELECT EXISTS").
+		WillReturnRows(sqlmock.NewRows([]string{"identity_matches"}).AddRow(false))
 
 	err = New(db, time.Second).Store("example/infrastructure", projectDrift)
 	require.EqualError(t, err, "storing PostgreSQL drift status: identity digest collision")
@@ -62,7 +65,9 @@ func TestStoreIgnoresOlderResultForSameIdentity(t *testing.T) {
 	defer db.Close()
 	projectDrift := models.ProjectDrift{ProjectName: "network", Ref: "main", LastChecked: time.Now()}
 	mock.ExpectQuery(regexp.QuoteMeta("WITH stored AS (")).
-		WillReturnRows(sqlmock.NewRows([]string{"stored", "identity_matches"}).AddRow(false, true))
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery("SELECT EXISTS").
+		WillReturnRows(sqlmock.NewRows([]string{"identity_matches"}).AddRow(true))
 
 	require.NoError(t, New(db, time.Second).Store("example/infrastructure", projectDrift))
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -91,4 +96,23 @@ func TestDeleteMatchingRequiresFilter(t *testing.T) {
 
 	err = New(db, time.Second).DeleteMatching("example/infrastructure", drift.GetOptions{})
 	require.EqualError(t, err, "at least one drift delete filter is required")
+}
+
+func TestDeleteObservedIncludesDetectionVersion(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	checkedAt := time.Now().UTC()
+	observed := models.ProjectDrift{
+		ProjectName: "network", Path: "terraform/network", Workspace: "production",
+		Ref: "main", BaseBranch: "main", DetectionID: "detection-1", LastChecked: checkedAt,
+	}
+	mock.ExpectExec("DELETE FROM drift_status").WithArgs(
+		digestValues("example/infrastructure"), "example/infrastructure",
+		observed.ProjectName, observed.Path, observed.Workspace, observed.Ref, observed.BaseBranch,
+		normalizeTime(observed.LastChecked), observed.DetectionID,
+	).WillReturnResult(sqlmock.NewResult(0, 0))
+
+	require.NoError(t, New(db, time.Second).DeleteObserved("example/infrastructure", observed))
+	require.NoError(t, mock.ExpectationsWereMet())
 }

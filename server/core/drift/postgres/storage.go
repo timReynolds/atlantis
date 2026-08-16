@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -40,7 +41,7 @@ func New(db *sql.DB, operationTimeout time.Duration) *Storage {
 func (s *Storage) Store(repository string, projectDrift models.ProjectDrift) error {
 	ctx, cancel := s.operationContext()
 	defer cancel()
-	var stored, identityMatches bool
+	var stored bool
 	err := s.db.QueryRowContext(ctx, `
 WITH stored AS (
   INSERT INTO drift_status (
@@ -75,18 +76,7 @@ WITH stored AS (
 	  AND drift_status.last_checked <= EXCLUDED.last_checked
 	RETURNING TRUE
 )
-SELECT
-  EXISTS (SELECT 1 FROM stored),
-  EXISTS (
-    SELECT 1 FROM drift_status
-    WHERE identity_hash = $1
-      AND repository = $3
-      AND project_name = $4
-      AND directory = $5
-      AND workspace = $6
-      AND ref = $7
-      AND base_branch = $8
-  )`,
+SELECT TRUE FROM stored`,
 		driftIdentityDigest(repository, projectDrift),
 		digestValues(repository),
 		repository,
@@ -107,11 +97,32 @@ SELECT
 		projectDrift.Drift.ChangesOutside,
 		projectDrift.Error,
 		normalizeTime(projectDrift.LastChecked),
-	).Scan(&stored, &identityMatches)
-	if err != nil {
+	).Scan(&stored)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("storing PostgreSQL drift status: %w", err)
 	}
-	if !stored && !identityMatches {
+	if stored {
+		return nil
+	}
+	var identityMatches bool
+	err = s.db.QueryRowContext(ctx, `SELECT EXISTS (
+    SELECT 1 FROM drift_status
+    WHERE identity_hash = $1
+      AND repository = $2
+      AND project_name = $3
+      AND directory = $4
+      AND workspace = $5
+      AND ref = $6
+      AND base_branch = $7
+)`,
+		driftIdentityDigest(repository, projectDrift), repository,
+		projectDrift.ProjectName, projectDrift.Path, projectDrift.Workspace,
+		projectDrift.Ref, projectDrift.BaseBranch,
+	).Scan(&identityMatches)
+	if err != nil {
+		return fmt.Errorf("checking PostgreSQL drift status identity: %w", err)
+	}
+	if !identityMatches {
 		return fmt.Errorf("storing PostgreSQL drift status: identity digest collision")
 	}
 	return nil
@@ -161,6 +172,18 @@ func (s *Storage) DeleteMatching(repository string, opts drift.GetOptions) error
 	}
 	where, args := buildWhere(repository, opts)
 	return s.execDelete("DELETE FROM drift_status "+where, args)
+}
+
+// DeleteObserved removes one exact identity only if the detection version is
+// unchanged since reconciliation read it.
+func (s *Storage) DeleteObserved(repository string, observed models.ProjectDrift) error {
+	where, args := buildWhere(repository, drift.GetOptions{
+		ProjectName: observed.ProjectName, Path: observed.Path, Workspace: observed.Workspace,
+		Ref: observed.Ref, BaseBranch: observed.BaseBranch, Exact: true,
+	})
+	args = append(args, normalizeTime(observed.LastChecked), observed.DetectionID)
+	query := fmt.Sprintf("DELETE FROM drift_status %s AND last_checked = $%d AND detection_id = $%d", where, len(args)-1, len(args))
+	return s.execDelete(query, args)
 }
 
 // GetAll retrieves the latest drift results grouped by repository.

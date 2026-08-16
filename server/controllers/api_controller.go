@@ -2071,15 +2071,17 @@ func (a *APIController) reconcileDriftStorage(repository, ref, baseBranch string
 		if project.LastChecked.After(startedAt) {
 			continue
 		}
-		if err := a.DriftStorage.DeleteMatching(repository, drift.GetOptions{
-			ProjectName: project.ProjectName,
-			Path:        project.Path,
-			Workspace:   project.Workspace,
-			Ref:         project.Ref,
-			BaseBranch:  project.BaseBranch,
-			Exact:       true,
-		}); err != nil {
-			return err
+		var deleteErr error
+		if deleter, ok := a.DriftStorage.(drift.ObservedDeleter); ok {
+			deleteErr = deleter.DeleteObserved(repository, project)
+		} else {
+			deleteErr = a.DriftStorage.DeleteMatching(repository, drift.GetOptions{
+				ProjectName: project.ProjectName, Path: project.Path, Workspace: project.Workspace,
+				Ref: project.Ref, BaseBranch: project.BaseBranch, Exact: true,
+			})
+		}
+		if deleteErr != nil {
+			return deleteErr
 		}
 	}
 	return nil

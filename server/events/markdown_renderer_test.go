@@ -101,6 +101,55 @@ func TestRenderErr(t *testing.T) {
 	}
 }
 
+func TestRenderRunSummary(t *testing.T) {
+	newRenderer := func(language string) *events.MarkdownRenderer {
+		return events.NewMarkdownRenderer(false, false, false, false, false, false, "", "atlantis", false, false, i18n.TranslatorConfig{LanguageCode: language})
+	}
+	ctx := &command.Context{
+		Log:  logging.NewNoopLogger(t).WithHistory(),
+		Pull: models.PullRequest{BaseRepo: models.Repo{VCSHost: models.VCSHost{Type: models.Github}}},
+	}
+	results := make([]command.ProjectResult, 0, 100)
+	for i := 0; i < 70; i++ {
+		results = append(results, command.ProjectResult{ProjectCommandOutput: command.ProjectCommandOutput{
+			PlanSuccess: &models.PlanSuccess{TerraformOutput: "sensitive full output\nPlan: 1 to add, 0 to change, 0 to destroy."},
+		}})
+	}
+	for i := 0; i < 20; i++ {
+		results = append(results, command.ProjectResult{ProjectCommandOutput: command.ProjectCommandOutput{
+			PlanSuccess: &models.PlanSuccess{TerraformOutput: "No changes. Your infrastructure matches the configuration."},
+		}})
+	}
+	for i := 0; i < 10; i++ {
+		results = append(results, command.ProjectResult{ProjectCommandOutput: command.ProjectCommandOutput{Error: errors.New("plan failed")}})
+	}
+	const historyURL = "https://atlantis.example.test/runs/019c0000-0000-7000-8000-000000000000"
+
+	rendered := newRenderer("en").RenderRunSummary(ctx, command.Result{ProjectResults: results}, &events.CommentCommand{Name: command.Plan}, historyURL)
+	for _, expected := range []string{
+		"Ran Plan for 100 projects.", "| Succeeded | 70 |", "| Unchanged | 20 |",
+		"| Failed | 10 |", "[View full project results and command output in Atlantis](" + historyURL + ")",
+		"atlantis apply", "atlantis unlock",
+	} {
+		Assert(t, strings.Contains(rendered, expected), "expected %q in:\n%s", expected, rendered)
+	}
+	Assert(t, !strings.Contains(rendered, "sensitive full output"), "summary must omit project output")
+
+	spanish := newRenderer("es").RenderRunSummary(ctx, command.Result{ProjectResults: results}, &events.CommentCommand{Name: command.Plan}, historyURL)
+	Assert(t, strings.Contains(spanish, "Ver los resultados completos"), "expected localized history link in:\n%s", spanish)
+
+	applyResults := []command.ProjectResult{
+		{ProjectCommandOutput: command.ProjectCommandOutput{ApplySuccess: "complete"}},
+		{ProjectCommandOutput: command.ProjectCommandOutput{ApplySuccess: "complete"}},
+		{ProjectCommandOutput: command.ProjectCommandOutput{Failure: "requirement failed"}},
+	}
+	apply := newRenderer("en").RenderRunSummary(ctx, command.Result{ProjectResults: applyResults}, &events.CommentCommand{Name: command.Apply}, historyURL)
+	for _, expected := range []string{"Ran Apply for 3 projects.", "| Succeeded | 2 |", "| Failed | 1 |"} {
+		Assert(t, strings.Contains(apply, expected), "expected %q in:\n%s", expected, apply)
+	}
+	Assert(t, !strings.Contains(apply, "atlantis apply"), "apply summary must not render plan instructions")
+}
+
 func TestRenderWorkingDirLockMetadata(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
 	const commitURL = "https://github.com/owner/repo/commit/" + sha

@@ -6,14 +6,22 @@ package events
 import (
 	"slices"
 
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/vcs"
 )
 
+// RunHistoryURLGenerator constructs the authenticated detail URL for a Run.
+type RunHistoryURLGenerator interface {
+	GenerateRunHistoryURL(runID runs.ID) (string, error)
+}
+
 type PullUpdater struct {
-	HidePrevPlanComments bool
-	VCSClient            vcs.Client
-	MarkdownRenderer     *MarkdownRenderer
+	HidePrevPlanComments     bool
+	VCSClient                vcs.Client
+	MarkdownRenderer         *MarkdownRenderer
+	RunHistoryURLGenerator   RunHistoryURLGenerator
+	LargeRunSummaryThreshold int
 }
 
 func (c *PullUpdater) updatePull(ctx *command.Context, cmd PullCommand, res command.Result) {
@@ -53,8 +61,28 @@ func (c *PullUpdater) updatePull(ctx *command.Context, cmd PullCommand, res comm
 		res.ProjectResults = commentOnProjects
 	}
 
-	comment := c.MarkdownRenderer.Render(ctx, res, cmd)
+	var comment string
+	if c.shouldUseLargeRunSummary(ctx, res, cmd) {
+		historyURL, err := c.RunHistoryURLGenerator.GenerateRunHistoryURL(ctx.RunID)
+		if err != nil {
+			ctx.Log.Err("generating run history URL: %v", err)
+		} else {
+			comment = c.MarkdownRenderer.RenderRunSummary(ctx, res, cmd, historyURL)
+		}
+	}
+	if comment == "" {
+		comment = c.MarkdownRenderer.Render(ctx, res, cmd)
+	}
 	if err := c.VCSClient.CreateComment(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull.Num, comment, cmd.CommandName().String()); err != nil {
 		ctx.Log.Err("unable to comment: %s", err)
 	}
+}
+
+func (c *PullUpdater) shouldUseLargeRunSummary(ctx *command.Context, result command.Result, cmd PullCommand) bool {
+	return c.LargeRunSummaryThreshold > 0 &&
+		c.RunHistoryURLGenerator != nil &&
+		ctx.RunID != "" &&
+		result.Error == nil && result.Failure == "" &&
+		len(result.ProjectResults) >= c.LargeRunSummaryThreshold &&
+		!cmd.IsVerbose()
 }

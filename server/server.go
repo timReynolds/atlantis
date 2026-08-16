@@ -84,6 +84,9 @@ const (
 	ProjectJobsViewRouteName = "project-jobs-detail"
 	// RunHistoryViewRouteName is the named route for durable run details.
 	RunHistoryViewRouteName = "run-history-detail"
+	// largeRunSummaryProjectThreshold bounds VCS comments when authenticated
+	// durable history can provide the complete project output.
+	largeRunSummaryProjectThreshold = 50
 	// binDirName is the name of the directory inside our data dir where
 	// we download binaries.
 	BinDirName = "bin"
@@ -879,6 +882,10 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		HidePrevPlanComments: userConfig.HidePrevPlanComments,
 		VCSClient:            vcsClient,
 		MarkdownRenderer:     markdownRenderer,
+	}
+	if runHistory != nil && userConfig.WebBasicAuth {
+		pullUpdater.RunHistoryURLGenerator = router
+		pullUpdater.LargeRunSummaryThreshold = largeRunSummaryProjectThreshold
 	}
 
 	autoMerger := &events.AutoMerger{

@@ -418,7 +418,7 @@ func TestStoreConformance(t *testing.T) {
 	require.NoError(t, err,
 		"unreconciled unknown attempts must retain their run, project output, and admission fence")
 	require.NoError(t, store.ReconcileAttempt(ctx, runs.AttemptReconciliation{
-		ID: replacementAttempt.ID, At: completedAt.Add(time.Millisecond), Actor: "operator",
+		ID: replacementAttempt.ID, AuditEventID: mustID(t), At: completedAt.Add(time.Millisecond), Actor: "operator",
 		Summary: "state inspected after retention protection test",
 	}))
 	retention, err = store.ApplyRetention(ctx, runs.RetentionPolicy{

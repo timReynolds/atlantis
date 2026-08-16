@@ -1239,7 +1239,7 @@ func (a *APIController) Remediate(w http.ResponseWriter, r *http.Request) {
 			responder.InternalError(w, r, err)
 			return
 		}
-		a.Logger.Warn("failed to store completed drift remediation history: %v", persistenceErr)
+		a.Logger.Warn("failed to store completed drift remediation history %v", persistenceErr)
 	}
 	if result.Status == models.RemediationStatusFailed || result.Status == models.RemediationStatusPartial {
 		historyCtx.CommandHasErrors = true
@@ -2282,22 +2282,27 @@ func (a *APIController) DetectDrift(w http.ResponseWriter, r *http.Request) {
 		detectionResult.ID = string(ctx.RunID)
 	}
 	detectionResult.DetectedAt = detectionStartedAt
-	recordDetectionHistory := func(runFailed bool) error {
+	atomicHistory, atomicHistoryEnabled := a.DriftHistory.(drift.AtomicDetectionWriter)
+	recordDetectionHistory := func(runFailed, reconcile bool) error {
 		if a.DriftHistory == nil {
 			return nil
 		}
-		return a.DriftHistory.RecordDetection(r.Context(), newDriftDetectionRecord(
+		record := newDriftDetectionRecord(
 			detectionResult, baseRepo.ID(), normalizedRef, normalizedBaseBranch,
 			ctx.Pull.HeadCommit, string(ctx.RunID), detectionStartedAt, time.Now(), runFailed,
-		))
+		)
+		if atomicHistoryEnabled {
+			return atomicHistory.RecordDetectionWithLatest(r.Context(), baseRepo.ID(), record, reconcile)
+		}
+		return a.DriftHistory.RecordDetection(r.Context(), record)
 	}
 
 	// Setup working directory
 	if err := a.apiSetup(ctx, command.Plan); err != nil {
 		lifecycle.Fail()
 		lifecycle.Finish()
-		if historyErr := recordDetectionHistory(true); historyErr != nil {
-			a.Logger.Warn("failed to store drift detection history: %v", historyErr)
+		if historyErr := recordDetectionHistory(true, false); historyErr != nil {
+			a.Logger.Warn("failed to store drift detection history %v", historyErr)
 		}
 		responder.InternalError(w, r, fmt.Errorf("setup failed: %w", err))
 		return
@@ -2313,8 +2318,8 @@ func (a *APIController) DetectDrift(w http.ResponseWriter, r *http.Request) {
 		if a.FailOnPreWorkflowHookError {
 			lifecycle.Fail()
 			lifecycle.Finish()
-			if historyErr := recordDetectionHistory(true); historyErr != nil {
-				a.Logger.Warn("failed to store drift detection history: %v", historyErr)
+			if historyErr := recordDetectionHistory(true, false); historyErr != nil {
+				a.Logger.Warn("failed to store drift detection history %v", historyErr)
 			}
 			responder.InternalError(w, r, fmt.Errorf("pre-workflow hook failed: %w", err))
 			return
@@ -2327,8 +2332,8 @@ func (a *APIController) DetectDrift(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		lifecycle.Fail()
 		lifecycle.Finish()
-		if historyErr := recordDetectionHistory(true); historyErr != nil {
-			a.Logger.Warn("failed to store drift detection history: %v", historyErr)
+		if historyErr := recordDetectionHistory(true, false); historyErr != nil {
+			a.Logger.Warn("failed to store drift detection history %v", historyErr)
 		}
 		if errors.Is(err, events.ErrTeamAllowlistDenied) {
 			responder.Forbidden(w, r, err.Error())
@@ -2347,17 +2352,19 @@ func (a *APIController) DetectDrift(w http.ResponseWriter, r *http.Request) {
 		detectedProjects[newDriftProjectIdentity(projectDrift)] = struct{}{}
 		// PlanOutput is only ever returned in the immediate detect response;
 		// Store strips it before persisting, so it is never persisted.
-		if err := a.DriftStorage.Store(baseRepo.ID(), projectDrift); err != nil {
-			storeFailed = true
-			projectDrift.Error = appendDriftProjectError(projectDrift.Error, fmt.Sprintf("storing drift result: %v", err))
-			a.Logger.Warn("failed to store drift data: %v", err)
+		if !atomicHistoryEnabled {
+			if err := a.DriftStorage.Store(baseRepo.ID(), projectDrift); err != nil {
+				storeFailed = true
+				projectDrift.Error = appendDriftProjectError(projectDrift.Error, fmt.Sprintf("storing drift result: %v", err))
+				a.Logger.Warn("failed to store drift data %v", err)
+			}
 		}
 		detectionResult.AddProject(projectDrift)
 	}
 
-	if fullDetection && !storeFailed && !preHookFailed && !driftDetectionHasErrors(detectionResult) {
+	if !atomicHistoryEnabled && fullDetection && !storeFailed && !preHookFailed && !driftDetectionHasErrors(detectionResult) {
 		if err := a.reconcileDriftStorage(baseRepo.ID(), normalizedRef, normalizedBaseBranch, detectedProjects, detectionStartedAt); err != nil {
-			a.Logger.Warn("failed to reconcile drift data: %v", err)
+			a.Logger.Warn("failed to reconcile drift data %v", err)
 		}
 	}
 	if preHookFailed || storeFailed || driftDetectionHasErrors(detectionResult) {
@@ -2366,8 +2373,9 @@ func (a *APIController) DetectDrift(w http.ResponseWriter, r *http.Request) {
 	lifecycle.Finish()
 
 	if a.DriftHistory != nil {
-		if err := recordDetectionHistory(ctx.CommandHasErrors); err != nil {
-			a.Logger.Warn("failed to store drift detection history: %v", err)
+		reconcile := fullDetection && !ctx.CommandHasErrors
+		if err := recordDetectionHistory(ctx.CommandHasErrors, reconcile); err != nil {
+			a.Logger.Warn("failed to store drift detection history %v", err)
 			if len(detectionResult.Projects) == 0 {
 				responder.InternalError(w, r, fmt.Errorf("storing drift detection history: %w", err))
 				return

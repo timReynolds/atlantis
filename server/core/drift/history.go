@@ -115,6 +115,13 @@ type HistoryWriter interface {
 	RecordDetection(ctx context.Context, record DetectionRecord) error
 }
 
+// AtomicDetectionWriter persists latest project status and immutable detection
+// history in one transaction. Reconcile removes older latest-state rows for
+// projects absent from a successful full detection of the same ref.
+type AtomicDetectionWriter interface {
+	RecordDetectionWithLatest(ctx context.Context, repository string, record DetectionRecord, reconcile bool) error
+}
+
 // HistoryReader serves read-only drift UI queries.
 type HistoryReader interface {
 	ListCurrentStatus(ctx context.Context, filter CurrentStatusFilter, page HistoryPageRequest) (CurrentStatusPage, error)

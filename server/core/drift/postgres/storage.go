@@ -41,8 +41,16 @@ func New(db *sql.DB, operationTimeout time.Duration) *Storage {
 func (s *Storage) Store(repository string, projectDrift models.ProjectDrift) error {
 	ctx, cancel := s.operationContext()
 	defer cancel()
+	return storeDriftStatus(ctx, s.db, repository, projectDrift)
+}
+
+type driftStatusQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func storeDriftStatus(ctx context.Context, querier driftStatusQuerier, repository string, projectDrift models.ProjectDrift) error {
 	var stored bool
-	err := s.db.QueryRowContext(ctx, `
+	err := querier.QueryRowContext(ctx, `
 WITH stored AS (
   INSERT INTO drift_status (
     identity_hash, repository_hash,
@@ -108,7 +116,7 @@ SELECT TRUE FROM stored`,
 		return nil
 	}
 	var identityMatches bool
-	err = s.db.QueryRowContext(ctx, `SELECT EXISTS (
+	err = querier.QueryRowContext(ctx, `SELECT EXISTS (
     SELECT 1 FROM drift_status
     WHERE identity_hash = $1
       AND repository = $2

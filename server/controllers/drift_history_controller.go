@@ -332,7 +332,7 @@ func (c *DriftHistoryController) authorize(w http.ResponseWriter, r *http.Reques
 func (c *DriftHistoryController) execute(w http.ResponseWriter, r *http.Request, tmpl web_templates.TemplateWriter, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := tmpl.Execute(w, data); err != nil {
-		c.Logger.Err("rendering drift history page: %v", err)
+		c.Logger.Err("rendering drift history page %v", err)
 		if !headersWritten(w) {
 			http.Error(w, "Unable to render drift history", http.StatusInternalServerError)
 		}
@@ -341,7 +341,7 @@ func (c *DriftHistoryController) execute(w http.ResponseWriter, r *http.Request,
 
 func (c *DriftHistoryController) respondError(w http.ResponseWriter, r *http.Request, status int, err error) {
 	if status >= http.StatusInternalServerError {
-		c.Logger.Err("serving drift history request %q: %v", r.URL.RequestURI(), err)
+		c.Logger.Err("serving drift history request %q %v", r.URL.RequestURI(), err)
 	}
 	http.Error(w, http.StatusText(status), status)
 }

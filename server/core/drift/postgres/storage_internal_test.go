@@ -4,7 +4,9 @@
 package postgres
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"regexp"
 	"testing"
 	"time"
@@ -70,6 +72,37 @@ func TestStoreIgnoresOlderResultForSameIdentity(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"identity_matches"}).AddRow(true))
 
 	require.NoError(t, New(db, time.Second).Store("example/infrastructure", projectDrift))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRecordDetectionWithLatestRollsBackLatestStateWhenHistoryFails(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	checkedAt := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	project := models.ProjectDrift{
+		ProjectName: "network", Path: "terraform/network", Workspace: "production",
+		Ref: "main", BaseBranch: "main", DetectionID: "detection-1", LastChecked: checkedAt,
+	}
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("WITH stored AS (")).
+		WillReturnRows(sqlmock.NewRows([]string{"stored"}).AddRow(true))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO drift_detection_runs")).
+		WillReturnError(errors.New("duplicate detection"))
+	mock.ExpectRollback()
+
+	err = NewHistoryStore(db, time.Second).RecordDetectionWithLatest(context.Background(), "example/infrastructure", drift.DetectionRecord{
+		Run: drift.DetectionRun{
+			ID: "detection-1", Repository: "example/infrastructure", Ref: "main", BaseBranch: "main",
+			Status: drift.DetectionStatusSucceeded, StartedAt: checkedAt, CompletedAt: checkedAt,
+			TotalProjects: 1,
+		},
+		Projects: []drift.DetectionProject{{
+			DetectionID: "detection-1", Project: project, Outcome: drift.DetectionOutcomeClean,
+		}},
+	}, false)
+	require.EqualError(t, err, "inserting PostgreSQL drift detection: duplicate detection")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

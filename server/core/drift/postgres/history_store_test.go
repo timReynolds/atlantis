@@ -71,9 +71,7 @@ func TestDurableHistoryConformance(t *testing.T) {
 		Ref: "main", BaseBranch: "main", ResolvedCommit: "deadbeef", DetectionID: string(runID),
 		Error: "lock acquisition failed", LastChecked: completedAt,
 	}
-	require.NoError(t, latest.Store("github.com/example/infrastructure", drifted))
-	require.NoError(t, latest.Store("github.com/example/infrastructure", locked))
-	require.NoError(t, history.RecordDetection(ctx, drift.DetectionRecord{
+	require.NoError(t, history.RecordDetectionWithLatest(ctx, "github.com/example/infrastructure", drift.DetectionRecord{
 		Run: drift.DetectionRun{
 			ID: string(runID), RunID: string(runID), Repository: "github.com/example/infrastructure",
 			DisplayRepository: "example/infrastructure", Ref: "main", BaseBranch: "main",
@@ -85,7 +83,28 @@ func TestDurableHistoryConformance(t *testing.T) {
 			{DetectionID: string(runID), Ordinal: 0, Project: drifted, Outcome: drift.DetectionOutcomeDrifted},
 			{DetectionID: string(runID), Ordinal: 1, Project: locked, Outcome: drift.DetectionOutcomeLocked},
 		},
-	}))
+	}, false))
+
+	// A history insert error must roll back latest-state changes from the same
+	// transaction. Reusing the immutable detection ID forces that late error.
+	rollbackProject := drifted
+	rollbackProject.ProjectName = "must-roll-back"
+	rollbackProject.Path = "terraform/must-roll-back"
+	require.Error(t, history.RecordDetectionWithLatest(ctx, "github.com/example/infrastructure", drift.DetectionRecord{
+		Run: drift.DetectionRun{
+			ID: string(runID), RunID: string(runID), Repository: "github.com/example/infrastructure",
+			DisplayRepository: "example/infrastructure", Ref: "main", BaseBranch: "main",
+			ResolvedCommit: "deadbeef", Status: drift.DetectionStatusSucceeded,
+			StartedAt: startedAt, CompletedAt: completedAt, TotalProjects: 1,
+		},
+		Projects: []drift.DetectionProject{{
+			DetectionID: string(runID), Ordinal: 0, Project: rollbackProject,
+			Outcome: drift.DetectionOutcomeDrifted,
+		}},
+	}, false))
+	rolledBack, err := latest.Get("github.com/example/infrastructure", drift.GetOptions{ProjectName: "must-roll-back"})
+	require.NoError(t, err)
+	require.Empty(t, rolledBack)
 
 	remediationID := mustHistoryID(t)
 	remediation := models.NewRemediationResult(string(remediationID), "example/infrastructure", "main", models.RemediationPlanOnly)

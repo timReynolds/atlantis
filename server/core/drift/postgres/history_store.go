@@ -43,12 +43,59 @@ func (s *HistoryStore) RecordDetection(ctx context.Context, record drift.Detecti
 		return fmt.Errorf("starting PostgreSQL drift history transaction: %w", err)
 	}
 	defer tx.Rollback() // nolint: errcheck
+	if err := insertDetection(ctx, tx, record); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing PostgreSQL drift history: %w", err)
+	}
+	return nil
+}
 
+// RecordDetectionWithLatest atomically persists current project status and its
+// immutable detection record.
+func (s *HistoryStore) RecordDetectionWithLatest(ctx context.Context, repository string, record drift.DetectionRecord, reconcile bool) error {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("starting PostgreSQL drift history transaction: %w", err)
+	}
+	defer tx.Rollback() // nolint: errcheck
+
+	for _, project := range record.Projects {
+		projectDrift := project.Project
+		projectDrift.PlanOutput = ""
+		if err := storeDriftStatus(ctx, tx, repository, projectDrift); err != nil {
+			return err
+		}
+	}
+	if reconcile {
+		if _, err := tx.ExecContext(ctx, `
+DELETE FROM drift_status
+WHERE repository_hash = $1 AND repository = $2 AND ref = $3
+  AND base_branch = $4 AND last_checked <= $5`,
+			digestValues(repository), repository, record.Run.Ref, record.Run.BaseBranch,
+			normalizeTime(record.Run.StartedAt),
+		); err != nil {
+			return fmt.Errorf("reconciling PostgreSQL drift status: %w", err)
+		}
+	}
+	if err := insertDetection(ctx, tx, record); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing PostgreSQL drift status and history: %w", err)
+	}
+	return nil
+}
+
+func insertDetection(ctx context.Context, tx *sql.Tx, record drift.DetectionRecord) error {
 	var runID any
 	if record.Run.RunID != "" {
 		runID = record.Run.RunID
 	}
-	_, err = tx.ExecContext(ctx, `
+	_, err := tx.ExecContext(ctx, `
 INSERT INTO drift_detection_runs (
     id, run_id, repository, display_repository, ref, base_branch,
     resolved_commit, status, started_at, completed_at, total_projects,
@@ -95,9 +142,6 @@ LEFT JOIN LATERAL (
 		); err != nil {
 			return fmt.Errorf("inserting PostgreSQL drift detection project: %w", err)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("committing PostgreSQL drift history: %w", err)
 	}
 	return nil
 }
@@ -313,6 +357,8 @@ const currentOutcomeSQL = `CASE
     WHEN ds.has_drift THEN 'drifted'
     ELSE 'clean'
 END`
+
+var _ drift.AtomicDetectionWriter = (*HistoryStore)(nil)
 
 const detectionRunSelect = `
 SELECT id, run_id, repository, display_repository, ref, base_branch,

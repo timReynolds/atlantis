@@ -109,7 +109,7 @@ func (s *runStoreRetentionService) Run(ctx context.Context) {
 func (s *runStoreRetentionService) apply(ctx context.Context) {
 	result, err := s.store.ApplyRetention(ctx, s.policy(s.now()))
 	if err != nil {
-		s.logger.Err("applying run history retention: %v", err)
+		s.logger.Err("applying run history retention %v", err)
 		return
 	}
 	s.logger.Info(

@@ -140,6 +140,46 @@ func TestRunHistoryRecordsSkippedRunWithoutProjects(t *testing.T) {
 	require.Equal(t, runs.StatusSkipped, writer.runsCompleted[0].Status)
 }
 
+func TestRunHistoryRetainsVCSDeliveryID(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	ctx.Pull.VCSDeliveryID = "delivery-123"
+
+	history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+
+	var metadata map[string]any
+	require.NoError(t, json.Unmarshal(writer.runsCreated[0].Metadata, &metadata))
+	require.Equal(t, "delivery-123", metadata["vcs_delivery_id"])
+}
+
+func TestRunHistoryLeavesRunIncompleteWhenProjectCompletionCannotPersist(t *testing.T) {
+	writer := &recordingRunWriter{completeProjectErr: errors.New("store unavailable")}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+	projectCtx := history.beginProject(command.ProjectContext{
+		RunID: ctx.RunID, ProjectName: "network", RepoRelDir: "network", Workspace: "default", Log: ctx.Log,
+	})
+	history.recordProject(projectCtx, command.Plan, command.ProjectCommandOutput{PlanSuccess: &models.PlanSuccess{}})
+
+	lifecycle.Finish()
+
+	require.Empty(t, writer.runsCompleted, "the running record must remain visibly incomplete")
+}
+
+func TestRunHistoryLeavesRunIncompleteWhenFinalOutputCannotPersist(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	history.SetOutputFinalizer(incompleteOutputFinalizer{})
+	ctx := testRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+
+	lifecycle.Finish()
+
+	require.Empty(t, writer.runsCompleted, "the running record must remain visibly incomplete")
+}
+
 func TestRunLifecycleFinishRecoveringMarksPanicFailed(t *testing.T) {
 	writer := &recordingRunWriter{}
 	history := newTestRunHistory(t, writer)
@@ -182,13 +222,14 @@ func testRunContext(t *testing.T) *command.Context {
 }
 
 type recordingRunWriter struct {
-	mu                sync.Mutex
-	runsCreated       []runs.Run
-	runsCompleted     []runs.RunCompletion
-	projectsCreated   []runs.ProjectRun
-	projectsCompleted []runs.ProjectRunCompletion
-	output            []runs.OutputChunk
-	audit             []runs.AuditEvent
+	mu                 sync.Mutex
+	runsCreated        []runs.Run
+	runsCompleted      []runs.RunCompletion
+	projectsCreated    []runs.ProjectRun
+	projectsCompleted  []runs.ProjectRunCompletion
+	output             []runs.OutputChunk
+	audit              []runs.AuditEvent
+	completeProjectErr error
 }
 
 func (w *recordingRunWriter) CreateRun(_ context.Context, run runs.Run) error {
@@ -217,11 +258,20 @@ func (w *recordingRunWriter) CreateProjectRun(_ context.Context, project runs.Pr
 func (w *recordingRunWriter) StartProjectRun(context.Context, runs.ID, time.Time) error { return nil }
 
 func (w *recordingRunWriter) CompleteProjectRun(_ context.Context, completion runs.ProjectRunCompletion) error {
+	if w.completeProjectErr != nil {
+		return w.completeProjectErr
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.projectsCompleted = append(w.projectsCompleted, completion)
 	return nil
 }
+
+type incompleteOutputFinalizer struct{}
+
+func (incompleteOutputFinalizer) FinishRun(runs.ID) bool { return false }
+
+var _ RunOutputFinalizer = incompleteOutputFinalizer{}
 
 func (w *recordingRunWriter) AppendOutput(_ context.Context, chunks []runs.OutputChunk) error {
 	w.mu.Lock()

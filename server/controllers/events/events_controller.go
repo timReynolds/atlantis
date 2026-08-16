@@ -32,6 +32,7 @@ import (
 
 const githubHeader = "X-Github-Event"
 const gitlabHeader = "X-Gitlab-Event"
+const gitlabRequestIDHeader = "X-Gitlab-Event-UUID"
 const azuredevopsHeader = "Request-Id"
 const azuredevopsServerHeader = "X-VSS-ActivityId"
 
@@ -370,6 +371,9 @@ func (e *VCSEventsController) handleGiteaPullRequestEvent(logger logging.SimpleL
 		e.respond(w, logging.Error, http.StatusInternalServerError, "Failed to process event")
 		return
 	}
+	if pullEventType == models.OpenedPullEvent || pullEventType == models.UpdatedPullEvent {
+		pull.VCSDeliveryID = reqID
+	}
 
 	logger.Debug("Parsed Gitea event into Atlantis models successfully")
 
@@ -397,7 +401,7 @@ func (e *VCSEventsController) HandleGiteaPullRequestCommentEvent(w http.Response
 	baseRepo, user, pullNum, _ := e.Parser.ParseGiteaIssueCommentEvent(event)
 	// Since we're lacking headRepo and maybePull details, we'll pass nil
 	// This follows the same approach as the GitHub client for handling comment events without full PR details
-	response := e.handleCommentEvent(e.Logger, baseRepo, nil, nil, user, pullNum, event.Comment.Body, event.Comment.ID, models.Gitea)
+	response := e.handleCommentEvent(e.Logger, baseRepo, nil, nil, user, pullNum, event.Comment.Body, event.Comment.ID, models.Gitea, reqID)
 
 	e.respond(w, logging.Debug, http.StatusOK, "%s", response.body)
 }
@@ -429,7 +433,7 @@ func (e *VCSEventsController) HandleGithubCommentEvent(event *github.IssueCommen
 
 	// We pass in nil for maybeHeadRepo because the head repo data isn't
 	// available in the GithubIssueComment event.
-	return e.handleCommentEvent(logger, baseRepo, nil, nil, user, pullNum, comment.GetBody(), comment.GetID(), models.Github)
+	return e.handleCommentEvent(logger, baseRepo, nil, nil, user, pullNum, comment.GetBody(), comment.GetID(), models.Github, strings.TrimPrefix(githubReqID, "X-Github-Delivery="))
 }
 
 // HandleBitbucketCloudCommentEvent handles comment events from Bitbucket.
@@ -439,7 +443,7 @@ func (e *VCSEventsController) HandleBitbucketCloudCommentEvent(w http.ResponseWr
 		e.respond(w, logging.Error, http.StatusBadRequest, "Error parsing pull data: %s %s=%s", err, bitbucketCloudRequestIDHeader, reqID)
 		return
 	}
-	resp := e.handleCommentEvent(e.Logger, baseRepo, &headRepo, &pull, user, pull.Num, comment, -1, models.BitbucketCloud)
+	resp := e.handleCommentEvent(e.Logger, baseRepo, &headRepo, &pull, user, pull.Num, comment, -1, models.BitbucketCloud, reqID)
 
 	//TODO: move this to the outer most function similar to github
 	lvl := logging.Debug
@@ -460,7 +464,7 @@ func (e *VCSEventsController) HandleBitbucketServerCommentEvent(w http.ResponseW
 		e.respond(w, logging.Error, http.StatusBadRequest, "Error parsing pull data: %s %s=%s", err, bitbucketCloudRequestIDHeader, reqID)
 		return
 	}
-	resp := e.handleCommentEvent(e.Logger, baseRepo, &headRepo, &pull, user, pull.Num, comment, -1, models.BitbucketCloud)
+	resp := e.handleCommentEvent(e.Logger, baseRepo, &headRepo, &pull, user, pull.Num, comment, -1, models.BitbucketServer, reqID)
 
 	//TODO: move this to the outer most function similar to github
 	lvl := logging.Debug
@@ -482,6 +486,9 @@ func (e *VCSEventsController) handleBitbucketCloudPullRequestEvent(logger loggin
 	}
 	e.Logger.Debug("SHA is %q", pull.HeadCommit)
 	pullEventType := e.Parser.GetBitbucketCloudPullEventType(eventType, pull.HeadCommit, pull.URL)
+	if pullEventType == models.OpenedPullEvent || pullEventType == models.UpdatedPullEvent {
+		pull.VCSDeliveryID = reqID
+	}
 
 	// Annotate logger with repo and pull/merge request number.
 	logger = logger.With(
@@ -511,6 +518,9 @@ func (e *VCSEventsController) handleBitbucketServerPullRequestEvent(logger loggi
 		return
 	}
 	pullEventType := e.Parser.GetBitbucketServerPullEventType(eventType)
+	if pullEventType == models.OpenedPullEvent || pullEventType == models.UpdatedPullEvent {
+		pull.VCSDeliveryID = reqID
+	}
 
 	// Annotate logger with repo and pull/merge request number.
 	logger = logger.With(
@@ -548,6 +558,9 @@ func (e *VCSEventsController) HandleGithubPullRequestEvent(logger logging.Simple
 				isSilenced: false,
 			},
 		}
+	}
+	if pullEventType == models.OpenedPullEvent || pullEventType == models.UpdatedPullEvent {
+		pull.VCSDeliveryID = strings.TrimPrefix(githubReqID, "X-Github-Delivery=")
 	}
 
 	// Annotate logger with repo and pull/merge request number.
@@ -625,6 +638,7 @@ func (e *VCSEventsController) handlePullRequestEvent(logger logging.SimpleLoggin
 }
 
 func (e *VCSEventsController) handleGitlabPost(w http.ResponseWriter, r *http.Request) {
+	reqID := r.Header.Get(gitlabRequestIDHeader)
 	event, err := e.GitlabRequestParserValidator.ParseAndValidate(r, e.GitlabWebhookSecret)
 	if err != nil {
 		e.respond(w, logging.Warn, http.StatusBadRequest, "%s", err.Error())
@@ -635,9 +649,9 @@ func (e *VCSEventsController) handleGitlabPost(w http.ResponseWriter, r *http.Re
 	switch event := event.(type) {
 	case gitlab.MergeCommentEvent:
 		e.Logger.Debug("handling as comment event")
-		e.HandleGitlabCommentEvent(w, event)
+		e.HandleGitlabCommentEvent(w, event, reqID)
 	case gitlab.MergeEvent:
-		e.HandleGitlabMergeRequestEvent(e.Logger, w, event)
+		e.HandleGitlabMergeRequestEvent(e.Logger, w, event, reqID)
 	case gitlab.CommitCommentEvent:
 		e.Logger.Debug("comments on commits are not supported, only comments on merge requests")
 		e.respond(w, logging.Debug, http.StatusOK, "Ignoring comment on commit event")
@@ -649,14 +663,14 @@ func (e *VCSEventsController) handleGitlabPost(w http.ResponseWriter, r *http.Re
 
 // HandleGitlabCommentEvent handles comment events from GitLab where Atlantis
 // commands can come from. It's exported to make testing easier.
-func (e *VCSEventsController) HandleGitlabCommentEvent(w http.ResponseWriter, event gitlab.MergeCommentEvent) {
+func (e *VCSEventsController) HandleGitlabCommentEvent(w http.ResponseWriter, event gitlab.MergeCommentEvent, deliveryID string) {
 	// todo: can gitlab return the pull request here too?
 	baseRepo, headRepo, commentID, user, err := e.Parser.ParseGitlabMergeRequestCommentEvent(event)
 	if err != nil {
 		e.respond(w, logging.Error, http.StatusBadRequest, "Error parsing webhook: %s", err)
 		return
 	}
-	resp := e.handleCommentEvent(e.Logger, baseRepo, &headRepo, nil, user, event.MergeRequest.IID, event.ObjectAttributes.Note, int64(commentID), models.Gitlab)
+	resp := e.handleCommentEvent(e.Logger, baseRepo, &headRepo, nil, user, event.MergeRequest.IID, event.ObjectAttributes.Note, int64(commentID), models.Gitlab, deliveryID)
 
 	//TODO: move this to the outer most function similar to github
 	lvl := logging.Debug
@@ -670,13 +684,16 @@ func (e *VCSEventsController) HandleGitlabCommentEvent(w http.ResponseWriter, ev
 	e.respond(w, lvl, code, "%s", msg)
 }
 
-func (e *VCSEventsController) handleCommentEvent(logger logging.SimpleLogging, baseRepo models.Repo, maybeHeadRepo *models.Repo, maybePull *models.PullRequest, user models.User, pullNum int, comment string, commentID int64, vcsHost models.VCSHostType) HTTPResponse {
+func (e *VCSEventsController) handleCommentEvent(logger logging.SimpleLogging, baseRepo models.Repo, maybeHeadRepo *models.Repo, maybePull *models.PullRequest, user models.User, pullNum int, comment string, commentID int64, vcsHost models.VCSHostType, deliveryID string) HTTPResponse {
 	logger = logger.WithHistory(
 		"repo", baseRepo.FullName,
 		"pull", pullNum,
 	)
 
 	parseResult := e.CommentParser.Parse(comment, vcsHost)
+	if parseResult.Command != nil {
+		parseResult.Command.VCSDeliveryID = deliveryID
+	}
 	if parseResult.Ignore {
 		truncated := comment
 		truncateLen := 40
@@ -753,11 +770,14 @@ func (e *VCSEventsController) handleCommentEvent(logger logging.SimpleLogging, b
 // HandleGitlabMergeRequestEvent will delete any locks associated with the pull
 // request if the event is a merge request closed event. It's exported to make
 // testing easier.
-func (e *VCSEventsController) HandleGitlabMergeRequestEvent(logger logging.SimpleLogging, w http.ResponseWriter, event gitlab.MergeEvent) {
+func (e *VCSEventsController) HandleGitlabMergeRequestEvent(logger logging.SimpleLogging, w http.ResponseWriter, event gitlab.MergeEvent, deliveryID string) {
 	pull, pullEventType, baseRepo, headRepo, user, err := e.Parser.ParseGitlabMergeRequestEvent(event)
 	if err != nil {
 		e.respond(w, logging.Error, http.StatusBadRequest, "Error parsing webhook: %s", err)
 		return
+	}
+	if pullEventType == models.OpenedPullEvent || pullEventType == models.UpdatedPullEvent {
+		pull.VCSDeliveryID = deliveryID
 	}
 
 	// Annotate logger with repo and pull/merge request number.
@@ -820,7 +840,7 @@ func (e *VCSEventsController) HandleAzureDevopsPullRequestCommentedEvent(w http.
 		e.respond(w, logging.Error, http.StatusBadRequest, "Error parsing pull request repository field: %s; %s", err, azuredevopsReqID)
 		return
 	}
-	resp := e.handleCommentEvent(e.Logger, baseRepo, nil, nil, user, resource.PullRequest.GetPullRequestID(), string(strippedComment), -1, models.AzureDevops)
+	resp := e.handleCommentEvent(e.Logger, baseRepo, nil, nil, user, resource.PullRequest.GetPullRequestID(), string(strippedComment), -1, models.AzureDevops, azuredevopsReqID)
 
 	//TODO: move this to the outer most function similar to github
 	lvl := logging.Debug
@@ -869,6 +889,9 @@ func (e *VCSEventsController) HandleAzureDevopsPullRequestEvent(w http.ResponseW
 	if err != nil {
 		e.respond(w, logging.Error, http.StatusBadRequest, "Error parsing pull data: %s %s", err, azuredevopsReqID)
 		return
+	}
+	if pullEventType == models.OpenedPullEvent || pullEventType == models.UpdatedPullEvent {
+		pull.VCSDeliveryID = azuredevopsReqID
 	}
 	e.Logger.Info("identified event as type %q", pullEventType.String())
 	resp := e.handlePullRequestEvent(e.Logger, baseRepo, headRepo, pull, user, pullEventType)

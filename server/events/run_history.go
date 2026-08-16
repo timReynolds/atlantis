@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -25,7 +26,7 @@ const (
 
 // RunOutputFinalizer flushes and releases buffered output for a logical Run.
 type RunOutputFinalizer interface {
-	FinishRun(runID runs.ID)
+	FinishRun(runID runs.ID) bool
 }
 
 // RunHistory records command and project lifecycles without owning execution.
@@ -76,9 +77,7 @@ func (h *RunHistory) Begin(ctx *command.Context, runCommand runs.Command, trigge
 		return lifecycle
 	}
 	ctx.RunID = runID
-	session := &runSession{
-		run: run, projects: sync.Map{},
-	}
+	session := &runSession{run: run, projects: sync.Map{}}
 	h.sessions.Store(runID, session)
 	lifecycle.runID = runID
 	h.appendAudit(ctx.Log, session, string(run.Command)+".requested", nil, now)
@@ -142,8 +141,8 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 		return
 	}
 	session := value.(*runSession)
-	if h.outputFinalizer != nil {
-		h.outputFinalizer.FinishRun(lifecycle.runID)
+	if h.outputFinalizer != nil && !h.outputFinalizer.FinishRun(lifecycle.runID) {
+		session.persistenceIncomplete.Store(true)
 	}
 	now := h.now().UTC()
 	succeeded, failed := 0, 0
@@ -169,6 +168,7 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 			return h.writer.CompleteProjectRun(writeCtx, completion)
 		}); err != nil {
 			h.logError(lifecycle.ctx.Log, "completing project run history", err)
+			session.persistenceIncomplete.Store(true)
 		}
 		if status == runs.StatusFailed || status == runs.StatusPartial || status == runs.StatusCancelled {
 			failed++
@@ -177,6 +177,12 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 		}
 		return true
 	})
+	if session.persistenceIncomplete.Load() {
+		if lifecycle.ctx.Log != nil {
+			lifecycle.ctx.Log.Err("leaving run history incomplete after persistence error")
+		}
+		return
+	}
 
 	status := lifecycle.terminalStatus(succeeded, failed)
 	if err := writeRunHistory(func(writeCtx context.Context) error {
@@ -219,8 +225,9 @@ func (l *RunLifecycle) terminalStatus(succeeded, failed int) runs.Status {
 }
 
 type runSession struct {
-	run      runs.Run
-	projects sync.Map
+	run                   runs.Run
+	projects              sync.Map
+	persistenceIncomplete atomic.Bool
 }
 
 type projectIdentity struct {
@@ -276,6 +283,7 @@ func (h *RunHistory) beginProject(ctx command.ProjectContext) command.ProjectCon
 		})
 	}); err != nil {
 		h.logError(ctx.Log, "creating project run history", err)
+		session.persistenceIncomplete.Store(true)
 	}
 	return ctx
 }
@@ -400,7 +408,7 @@ func (h *RunHistory) logError(log logging.SimpleLogging, action string, err erro
 		log = h.logger
 	}
 	if log != nil {
-		log.Err("%s: %v", action, err)
+		log.Err("%s %v", action, err)
 	}
 }
 
@@ -414,6 +422,7 @@ func positivePullNumber(number int) *int {
 func runMetadata(ctx *command.Context) runs.Metadata {
 	return marshalMetadata(map[string]any{
 		"api": ctx.API, "pull_url": ctx.Pull.URL, "vcs": ctx.Pull.BaseRepo.VCSHost.Type.String(),
+		"vcs_delivery_id": ctx.Pull.VCSDeliveryID,
 	})
 }
 

@@ -289,15 +289,16 @@ func (a *APIController) Plan(w http.ResponseWriter, r *http.Request) {
 		a.apiReportLegacyError(w, code, err)
 		return
 	}
+	lifecycle := a.RunHistory.Begin(ctx, runs.CommandPlan, runs.TriggerAPI)
+	defer lifecycle.FinishRecovering()
 
 	err = a.apiSetup(ctx, command.Plan)
 	if err != nil {
+		lifecycle.Fail()
 		a.apiReportLegacyError(w, http.StatusInternalServerError, err)
 		return
 	}
 	defer a.cleanupNonPRWorkingDir(ctx)
-	lifecycle := a.RunHistory.Begin(ctx, runs.CommandPlan, runs.TriggerAPI)
-	defer lifecycle.FinishRecovering()
 
 	result, err := a.apiPlan(request, ctx)
 	if err != nil {
@@ -328,15 +329,16 @@ func (a *APIController) Apply(w http.ResponseWriter, r *http.Request) {
 		a.apiReportLegacyError(w, code, err)
 		return
 	}
+	lifecycle := a.RunHistory.Begin(ctx, runs.CommandApply, runs.TriggerAPI)
+	defer lifecycle.FinishRecovering()
 
 	err = a.apiSetup(ctx, command.Apply)
 	if err != nil {
+		lifecycle.Fail()
 		a.apiReportLegacyError(w, http.StatusInternalServerError, err)
 		return
 	}
 	defer a.cleanupNonPRWorkingDir(ctx)
-	lifecycle := a.RunHistory.Begin(ctx, runs.CommandApply, runs.TriggerAPI)
-	defer lifecycle.FinishRecovering()
 
 	// We must first make the plan for all projects
 	result, err := a.apiPlan(request, ctx)

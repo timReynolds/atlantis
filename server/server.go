@@ -1348,7 +1348,7 @@ func (s *Server) Start() error {
 		s.Logger.Err("while closing database: %v", err)
 	}
 	if err := s.closeRunStore(1 * time.Second); err != nil {
-		s.Logger.Err("while closing run store: %v", err)
+		s.Logger.Err("while closing run store %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

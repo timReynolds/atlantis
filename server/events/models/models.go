@@ -206,6 +206,9 @@ type MergeableStatus struct {
 type PullRequest struct {
 	// Num is the pull request number or ID.
 	Num int
+	// VCSDeliveryID identifies the webhook delivery that accepted this work.
+	// It is operational metadata and is not part of pull request identity.
+	VCSDeliveryID string
 	// HeadCommit is a sha256 that points to the head of the branch that is being
 	// pull requested into the base. If the pull request is from Bitbucket Cloud
 	// the string will only be 12 characters long because Bitbucket Cloud

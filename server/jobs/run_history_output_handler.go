@@ -68,7 +68,8 @@ func (p *PersistentProjectCommandOutputHandler) SendWorkflowHook(ctx models.Work
 }
 
 // FinishRun flushes and releases every buffered Project Run in a logical Run.
-func (p *PersistentProjectCommandOutputHandler) FinishRun(runID runs.ID) {
+// It reports whether every attempted output write was persisted.
+func (p *PersistentProjectCommandOutputHandler) FinishRun(runID runs.ID) bool {
 	p.states.Range(func(key, value any) bool {
 		state := value.(*persistentOutputState)
 		if state.runID != runID {
@@ -80,7 +81,9 @@ func (p *PersistentProjectCommandOutputHandler) FinishRun(runID runs.ID) {
 		p.states.Delete(key)
 		return true
 	})
+	complete := !p.runFailed(runID)
 	p.failed.Delete(runID)
+	return complete
 }
 
 func (p *PersistentProjectCommandOutputHandler) record(
@@ -162,7 +165,7 @@ func (p *PersistentProjectCommandOutputHandler) flushPrefix(state *persistentOut
 	ctx, cancel := context.WithTimeout(context.Background(), persistentOutputWriteTimeout)
 	defer cancel()
 	if err := p.writer.AppendOutput(ctx, []runs.OutputChunk{chunk}); err != nil {
-		p.logger.Err("persisting project output: %v", err)
+		p.logger.Err("persisting project output %v", err)
 		p.failed.Store(state.runID, struct{}{})
 		state.buffer = ""
 	}

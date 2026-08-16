@@ -26,7 +26,7 @@ func TestPersistentProjectCommandOutputHandlerPreservesStreamsAndOrdering(t *tes
 	handler.SendStream(ctx, "first", runs.OutputStdout, false)
 	handler.SendStream(ctx, "warning", runs.OutputStderr, false)
 	handler.Send(ctx, "summary", false)
-	handler.FinishRun(ctx.RunID)
+	require.True(t, handler.FinishRun(ctx.RunID))
 
 	require.Equal(t, []runs.OutputChunk{
 		{ProjectRunID: ctx.ProjectRunID, Sequence: 0, Stream: runs.OutputStdout, Content: "first\n", CreatedAt: handler.now()},
@@ -78,7 +78,7 @@ func TestPersistentProjectCommandOutputHandlerStopsWritingAfterStoreFailure(t *t
 	handler.SendStream(first, "stream transition", runs.OutputStderr, false)
 	handler.SendStream(first, strings.Repeat("x", persistentOutputChunkBytes), runs.OutputStderr, false)
 	handler.SendStream(second, strings.Repeat("y", persistentOutputChunkBytes), runs.OutputStdout, false)
-	handler.FinishRun(first.RunID)
+	require.False(t, handler.FinishRun(first.RunID))
 
 	require.Equal(t, 1, writer.calls)
 }

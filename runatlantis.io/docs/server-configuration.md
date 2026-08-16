@@ -620,8 +620,11 @@ ATLANTIS_ENABLE_DRIFT_DETECTION=true
 Enable drift detection API endpoints. Drift detection does not run Terraform apply, but
 it does execute the normal plan lifecycle, including configured pre-workflow hooks,
 custom workflows, custom plan steps, and Terraform plan commands. When enabled, Atlantis
-will initialize in-memory storage for drift detection results and a remediation service,
-making drift detection, status, and plan-only remediation endpoints functional. If drift [webhooks](sending-notifications-via-webhooks.md#drift-detection-webhooks)
+will initialize storage for drift detection results and a remediation service,
+making drift detection, status, and plan-only remediation endpoints functional. Storage is
+in-memory by default; selecting [`--run-store-type=postgres`](#--run-store-type)
+persists the latest status for every project identity across server restarts using the
+same PostgreSQL connection pool. Plan output is never stored in drift status. If drift [webhooks](sending-notifications-via-webhooks.md#drift-detection-webhooks)
 are configured (`event: drift`), successful detection runs send notifications to Slack or HTTP endpoints,
 including no-drift heartbeat results. Drift detection does not bypass team allowlists or PR-state
 `plan_requirements` such as `approved` or `mergeable`; those checks fail closed when
@@ -1531,7 +1534,7 @@ atlantis server --run-store-type=postgres
 ATLANTIS_RUN_STORE_TYPE=postgres
 ```
 
-Selects the durable run history store. Valid values are `noop` and `postgres`; the default is `noop`, which preserves the existing Atlantis execution and storage behavior. The PostgreSQL store holds run metadata, project results, audit records, and chunked command output. It does not replace Redis coordination or the external plan artifact store.
+Selects the durable run history store. Valid values are `noop` and `postgres`; the default is `noop`, which preserves the existing Atlantis execution and storage behavior. The PostgreSQL store holds run metadata, project results, audit records, and chunked command output. When drift detection is enabled, its PostgreSQL pool also stores durable latest-state drift status. It does not replace Redis coordination or the external plan artifact store.
 
 When `postgres` is selected, Atlantis registers read-only history pages at `/runs`, repository and pull-request scoped routes under `/repos`, project output pages under `/runs/{run-id}`, and `/audit`. Repository routes preserve provider namespaces such as `group/subgroup/repo`. Because Terraform output can contain secrets, these routes are available only when [`--web-basic-auth`](#--web-basic-auth) is enabled. They return `404 Not Found` when web authentication is disabled, and Atlantis rejects the publicly known default web credentials when history and web authentication are both enabled.
 

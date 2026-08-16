@@ -39,8 +39,10 @@ import (
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/drift"
+	driftpostgres "github.com/runatlantis/atlantis/server/core/drift/postgres"
 	"github.com/runatlantis/atlantis/server/core/redis"
 	"github.com/runatlantis/atlantis/server/core/runs"
+	runspostgres "github.com/runatlantis/atlantis/server/core/runs/postgres"
 	"github.com/runatlantis/atlantis/server/core/terraform/tfclient"
 	"github.com/runatlantis/atlantis/server/jobs"
 	"github.com/runatlantis/atlantis/server/metrics"
@@ -1153,7 +1155,11 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 
 	if userConfig.EnableDriftDetection {
 		logger.Info("Drift detection is enabled")
-		driftStorage := drift.NewInMemoryStorage()
+		var driftStorage drift.Storage = drift.NewInMemoryStorage()
+		if postgresStore, ok := runStore.(*runspostgres.Store); ok {
+			logger.Info("utilizing PostgreSQL drift status storage")
+			driftStorage = driftpostgres.New(postgresStore.Database(), 0)
+		}
 		apiController.DriftStorage = driftStorage
 		apiController.RemediationService = drift.NewInMemoryRemediationService(driftStorage)
 

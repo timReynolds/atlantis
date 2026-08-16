@@ -2881,3 +2881,35 @@ func TestRunRoutedAutoplanCommandRejectsLostOwnershipBeforeProjectSelection(t *t
 	postWorkflowHooksCommandRunner.(*mocks.MockPostWorkflowHooksCommandRunner).VerifyWasCalled(Never()).RunPostHooks(
 		Any[*command.Context](), Any[*events.CommentCommand]())
 }
+
+func TestRunRoutedAutoplanCommandRejectsLostOwnershipAfterProjectBuild(t *testing.T) {
+	setup(t)
+	pull := models.PullRequest{
+		Num: testdata.Pull.Num, BaseRepo: testdata.GithubRepo,
+		BaseBranch: "main", State: models.OpenPullState,
+	}
+	projectCtx := command.ProjectContext{
+		CommandName: command.Plan, ProjectName: "network", RepoRelDir: "terraform/network",
+		Workspace: events.DefaultWorkspace, BaseRepo: testdata.GithubRepo, Pull: pull,
+	}
+	When(projectCommandBuilder.BuildAutoplanCommands(Any[*command.Context]())).ThenReturn([]command.ProjectContext{projectCtx}, nil)
+	admitCalls := 0
+	lease := executionLeaseFunc(func(context.Context) error {
+		admitCalls++
+		if admitCalls >= 5 {
+			return events.ErrOwnershipChanged
+		}
+		return nil
+	})
+
+	ch.RunRoutedAutoplanCommand(
+		testdata.GithubRepo, testdata.GithubRepo, pull, testdata.User,
+		command.RoutingContext{Lease: lease},
+	)
+
+	Equals(t, 6, admitCalls)
+	projectCommandBuilder.VerifyWasCalledOnce().BuildAutoplanCommands(Any[*command.Context]())
+	projectCommandRunner.VerifyWasCalled(Never()).Plan(Any[command.ProjectContext]())
+	postWorkflowHooksCommandRunner.(*mocks.MockPostWorkflowHooksCommandRunner).VerifyWasCalled(Never()).RunPostHooks(
+		Any[*command.Context](), Any[*events.CommentCommand]())
+}

@@ -129,6 +129,9 @@ func (p *PlanCommandRunner) runAutoplan(ctx *command.Context) {
 	}
 
 	projectCmds, err := p.prjCmdBuilder.BuildAutoplanCommands(ctx)
+	if !admitRoutedCommand(ctx.Log, ctx.ExecutionLease, "mutating plan state") {
+		return
+	}
 	if err != nil {
 		if statusErr := p.commitStatusUpdater.UpdateCombined(ctx.Log, baseRepo, pull, models.FailedCommitStatus, command.Plan); statusErr != nil {
 			ctx.Log.Warn("unable to update commit status: %s", statusErr)
@@ -234,6 +237,9 @@ func (p *PlanCommandRunner) run(ctx *command.Context, cmd *CommentCommand) {
 
 	projectCmds, err := p.prjCmdBuilder.BuildPlanCommands(ctx, cmd)
 	if MarkCommandSkippedIfIgnoredTargetedDir(ctx, command.Plan, err) {
+		return
+	}
+	if !admitRoutedCommand(ctx.Log, ctx.ExecutionLease, "mutating plan state") {
 		return
 	}
 

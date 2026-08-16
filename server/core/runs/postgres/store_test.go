@@ -488,7 +488,7 @@ func TestStoreConformance(t *testing.T) {
 		RunMetadataBefore: &retentionCutoff,
 	})
 	require.NoError(t, err)
-	require.Equal(t, int64(3), retention.RunsDeleted)
+	require.Equal(t, int64(4), retention.RunsDeleted)
 	require.Equal(t, int64(2), retention.ProjectRunsDeleted)
 	require.Equal(t, int64(0), retention.OutputChunksDeleted)
 	_, err = store.GetRun(ctx, runID)

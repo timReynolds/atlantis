@@ -28,7 +28,7 @@ func TestHandleCommentEvent_DispatchesCredentialFreeCommand(t *testing.T) {
 
 	response := controller.handleCommentEvent(
 		logging.NewNoopLogger(t), baseRepo, &headRepo, &pull, models.User{Username: "alice"},
-		12, "atlantis apply", 1, models.Github,
+		12, "atlantis apply", 1, models.Github, "delivery-123",
 	)
 
 	require.Zero(t, response.err.code)
@@ -40,6 +40,7 @@ func TestHandleCommentEvent_DispatchesCredentialFreeCommand(t *testing.T) {
 	require.NotContains(t, string(payload), "base-token")
 	require.NotContains(t, string(payload), "head-token")
 	require.Equal(t, 12, dispatcher.comments[0].OwnershipKey().PullNum)
+	require.Equal(t, "delivery-123", dispatcher.comments[0].Command.VCSDeliveryID)
 }
 
 func TestHandleCommentEvent_DispatchFailureIsUnavailable(t *testing.T) {
@@ -53,7 +54,7 @@ func TestHandleCommentEvent_DispatchFailureIsUnavailable(t *testing.T) {
 
 	response := controller.handleCommentEvent(
 		logging.NewNoopLogger(t), baseRepo, nil, nil, models.User{}, 12,
-		"atlantis plan", 1, models.Github,
+		"atlantis plan", 1, models.Github, "delivery-456",
 	)
 
 	require.Equal(t, 503, response.err.code)
@@ -64,7 +65,7 @@ func TestHandleCommentEvent_DispatchFailureIsUnavailable(t *testing.T) {
 func TestHandlePullRequestEvent_DispatchesAutoplanAndCleanup(t *testing.T) {
 	baseRepo := routedTestRepo(t, "owner/repo", "base-token")
 	headRepo := routedTestRepo(t, "fork/repo", "head-token")
-	pull := models.PullRequest{Num: 12, HeadCommit: "abc123", BaseRepo: baseRepo}
+	pull := models.PullRequest{Num: 12, HeadCommit: "abc123", VCSDeliveryID: "delivery-789", BaseRepo: baseRepo}
 	dispatcher := &recordingDispatcher{}
 	runner := &recordingLegacyRunner{}
 	cleaner := &recordingLegacyPullCleaner{}
@@ -76,6 +77,7 @@ func TestHandlePullRequestEvent_DispatchesAutoplanAndCleanup(t *testing.T) {
 	require.Zero(t, response.err.code)
 	require.Equal(t, "Processing...", response.body)
 	require.Len(t, dispatcher.autoplans, 1)
+	require.Equal(t, "delivery-789", dispatcher.autoplans[0].Pull.VCSDeliveryID)
 	require.Equal(t, 0, runner.autoplanCalls)
 
 	response = controller.handlePullRequestEvent(

@@ -41,6 +41,7 @@ func NewRepoRef(repo models.Repo) (RepoRef, error) {
 type PullRef struct {
 	Num                      int                     `json:"num"`
 	HeadCommit               string                  `json:"head_commit"`
+	VCSDeliveryID            string                  `json:"vcs_delivery_id,omitempty"`
 	URL                      string                  `json:"url"`
 	HeadBranch               string                  `json:"head_branch"`
 	BaseBranch               string                  `json:"base_branch"`
@@ -55,6 +56,7 @@ func NewPullRef(pull models.PullRequest) PullRef {
 	return PullRef{
 		Num:                      pull.Num,
 		HeadCommit:               pull.HeadCommit,
+		VCSDeliveryID:            pull.VCSDeliveryID,
 		URL:                      pull.URL,
 		HeadBranch:               pull.HeadBranch,
 		BaseBranch:               pull.BaseBranch,
@@ -70,6 +72,7 @@ func (p PullRef) ToModel(baseRepo models.Repo) models.PullRequest {
 	return models.PullRequest{
 		Num:                      p.Num,
 		HeadCommit:               p.HeadCommit,
+		VCSDeliveryID:            p.VCSDeliveryID,
 		URL:                      p.URL,
 		HeadBranch:               p.HeadBranch,
 		BaseBranch:               p.BaseBranch,

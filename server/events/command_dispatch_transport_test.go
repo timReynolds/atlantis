@@ -49,6 +49,7 @@ func TestPullRef_RoundTripsAllNonRepositoryFields(t *testing.T) {
 	pull := models.PullRequest{
 		Num:                      12,
 		HeadCommit:               "abc123",
+		VCSDeliveryID:            "delivery-123",
 		URL:                      "https://github.com/owner/repo/pull/12",
 		HeadBranch:               "feature",
 		BaseBranch:               "main",

@@ -39,6 +39,7 @@ func TestLoadMigrations(t *testing.T) {
 	require.Contains(t, migrations[3].sql, "status = 'unknown' AND reconciled_at IS NULL")
 	require.Equal(t, int64(5), migrations[len(migrations)-1].version)
 	require.Contains(t, migrations[len(migrations)-1].sql, "'unknown'")
+	require.Contains(t, migrations[len(migrations)-1].sql, "ALTER TABLE project_runs")
 }
 
 func TestRegisterExecutionInstance(t *testing.T) {
@@ -64,13 +65,15 @@ func TestRegisterExecutionInstance(t *testing.T) {
 func TestCreateAttemptMapsActiveConcurrencyConflict(t *testing.T) {
 	store, mock := newMockStore(t)
 	attempt := claimedAttempt()
-	mock.ExpectExec("(?s)WITH superseded_attempts AS .*RETURNING 1").
+	mock.ExpectExec("(?s)WITH superseded_attempts AS .*superseded_runs AS .*superseded_project_runs AS").
 		WithArgs(
 			attempt.ID, attempt.RunID, attempt.InstanceID, attempt.DeploymentID, attempt.ConcurrencyKey,
 			attempt.OwnershipClaimID, attempt.Status, attempt.ClaimedAt, nil,
 			attempt.HeartbeatAt, nil, nil, attempt.FailureReason, nil,
 			attempt.ReconciledBy, attempt.ReconciliationSummary, []byte(`{}`),
 			runs.AttemptInterrupted, runs.AttemptUnknown, runs.AttemptRunning,
+			runs.StatusFailed, runs.StatusUnknown, runs.StatusRunning,
+			runs.StatusCancelled, runs.StatusPending,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery("SELECT .* FROM run_attempts WHERE id = \\$1").

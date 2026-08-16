@@ -159,7 +159,37 @@ func (s *Store) CreateAttempt(ctx context.Context, attempt runs.RunAttempt) erro
           AND concurrency_key = $5
           AND ownership_claim_id <> $6
           AND status IN ($7, $20)
-        RETURNING 1
+        RETURNING run_id, status
+    ), superseded_runs AS (
+        UPDATE runs
+        SET status = CASE
+                WHEN superseded_attempts.status = $19 THEN $22
+                ELSE $21
+            END,
+            completed_at = $8
+        FROM superseded_attempts
+        WHERE runs.id = superseded_attempts.run_id
+          AND runs.id <> $2
+          AND runs.status = $23
+        RETURNING runs.id
+    ), superseded_project_runs AS (
+        UPDATE project_runs
+        SET status = CASE
+                WHEN project_runs.status = $25 THEN $24
+                WHEN superseded_attempts.status = $19 THEN $22
+                ELSE $21
+            END,
+            completed_at = $8,
+            error_summary = CASE
+                WHEN project_runs.status = $25 THEN 'execution ownership transferred before project started'
+                WHEN superseded_attempts.status = $19 THEN 'execution ownership transferred after infrastructure side effect started'
+                ELSE 'execution ownership transferred before infrastructure side effect started'
+            END
+        FROM superseded_attempts
+        WHERE project_runs.run_id = superseded_attempts.run_id
+          AND project_runs.run_id <> $2
+          AND project_runs.status IN ($25, $23)
+        RETURNING project_runs.id
     )
     INSERT INTO run_attempts (
         id, run_id, instance_id, deployment_id, concurrency_key, ownership_claim_id, status,
@@ -168,7 +198,11 @@ func (s *Store) CreateAttempt(ctx context.Context, attempt runs.RunAttempt) erro
         reconciliation_summary, metadata
     )
     SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
-    FROM (SELECT count(*) FROM superseded_attempts) AS superseded
+    FROM (
+        SELECT
+            (SELECT count(*) FROM superseded_runs),
+            (SELECT count(*) FROM superseded_project_runs)
+    ) AS superseded
     ON CONFLICT DO NOTHING`,
 		attempt.ID, attempt.RunID, attempt.InstanceID, attempt.DeploymentID, attempt.ConcurrencyKey,
 		attempt.OwnershipClaimID, attempt.Status, attempt.ClaimedAt, attempt.StartedAt,
@@ -176,6 +210,8 @@ func (s *Store) CreateAttempt(ctx context.Context, attempt runs.RunAttempt) erro
 		attempt.FailureReason, attempt.ReconciledAt, attempt.ReconciledBy,
 		attempt.ReconciliationSummary, []byte(attempt.Metadata),
 		runs.AttemptInterrupted, runs.AttemptUnknown, runs.AttemptRunning,
+		runs.StatusFailed, runs.StatusUnknown, runs.StatusRunning,
+		runs.StatusCancelled, runs.StatusPending,
 	)
 	if err != nil {
 		return fmt.Errorf("creating run attempt: %w", err)

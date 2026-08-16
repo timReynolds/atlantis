@@ -145,6 +145,7 @@ type ProjectRunSummary struct {
 	Partial   int
 	Cancelled int
 	Skipped   int
+	Unknown   int
 }
 
 // OutputPage is an ordered page of output chunks.

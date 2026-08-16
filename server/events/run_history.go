@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
+	"github.com/runatlantis/atlantis/server/events/vcs"
 	"github.com/runatlantis/atlantis/server/logging"
 )
 
@@ -262,7 +264,9 @@ func (h *RunHistory) beginAttempt(lifecycle *RunLifecycle, session *runSession, 
 		return
 	}
 	block := func(action string, err error) {
+		lifecycle.mu.Lock()
 		lifecycle.canExecute = false
+		lifecycle.mu.Unlock()
 		lifecycle.Fail()
 		ctx.CommandHasErrors = true
 		h.logError(ctx.Log, action, err)
@@ -596,7 +600,7 @@ func (h *RunHistory) recordProject(ctx command.ProjectContext, phase command.Nam
 		if err := writeRunHistory(func(writeCtx context.Context) error {
 			return h.writer.AppendOutput(writeCtx, batch)
 		}); err != nil {
-			h.markPersistenceFailed(ctx.Log, session, "persisting suppressed project output", err)
+			h.blockRunCompletion(ctx.Log, session, "persisting suppressed project output", err)
 			return
 		}
 		chunks = chunks[batchSize:]
@@ -809,27 +813,90 @@ func errorSummary(output command.ProjectCommandOutput) string {
 	return summary[:cut]
 }
 
+// RunAdmissionFailureReporter tells the requester that fail-closed HA
+// admission prevented execution from starting.
+type RunAdmissionFailureReporter interface {
+	ReportRunAdmissionFailure(ctx *command.Context, commandName command.Name)
+}
+
+// NewVCSRunAdmissionFailureReporter reports durable-admission failures through
+// the same VCS surfaces used by normal command failures.
+func NewVCSRunAdmissionFailureReporter(client vcs.Client, statuses CommitStatusUpdater) RunAdmissionFailureReporter {
+	return &vcsRunAdmissionFailureReporter{client: client, statuses: statuses}
+}
+
+type vcsRunAdmissionFailureReporter struct {
+	client   vcs.Client
+	statuses CommitStatusUpdater
+}
+
+func (r *vcsRunAdmissionFailureReporter) ReportRunAdmissionFailure(ctx *command.Context, commandName command.Name) {
+	if ctx == nil {
+		return
+	}
+	if !ctx.SuppressVCSStatus && r.statuses != nil && (commandName == command.Plan || commandName == command.Apply) {
+		if err := r.statuses.UpdateCombined(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.FailedCommitStatus, commandName); err != nil {
+			ctx.Log.Warn("unable to update status after durable execution admission failure: %s", err)
+		}
+	}
+	if r.client == nil || ctx.Pull.Num <= 0 {
+		return
+	}
+	message := fmt.Sprintf("**Atlantis %s did not start**\n\nAtlantis could not durably record execution ownership. No command was run. Check the Atlantis server logs before retrying.", commandName.String())
+	if err := r.client.CreateComment(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull.Num, message, commandName.String()); err != nil {
+		ctx.Log.Warn("unable to comment after durable execution admission failure: %s", err)
+	}
+}
+
 // NewRunHistoryCommandRunner decorates one accepted logical comment command.
-func NewRunHistoryCommandRunner(history *RunHistory, runner CommentCommandRunner, runCommand runs.Command) CommentCommandRunner {
+func NewRunHistoryCommandRunner(history *RunHistory, runner CommentCommandRunner, runCommand runs.Command, reporters ...RunAdmissionFailureReporter) CommentCommandRunner {
 	if history == nil {
 		return runner
 	}
-	return &runHistoryCommandRunner{history: history, runner: runner, runCommand: runCommand}
+	var reporter RunAdmissionFailureReporter
+	if len(reporters) > 0 {
+		reporter = reporters[0]
+	}
+	return &runHistoryCommandRunner{history: history, runner: runner, runCommand: runCommand, admissionFailureReporter: reporter}
 }
 
 type runHistoryCommandRunner struct {
-	history    *RunHistory
-	runner     CommentCommandRunner
-	runCommand runs.Command
+	history                  *RunHistory
+	runner                   CommentCommandRunner
+	runCommand               runs.Command
+	admissionFailureReporter RunAdmissionFailureReporter
 }
 
 func (r *runHistoryCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
 	lifecycle := r.history.Begin(ctx, r.runCommand, historyTrigger(ctx))
 	defer lifecycle.FinishRecovering()
 	if !lifecycle.CanExecute() {
+		if r.admissionFailureReporter != nil {
+			r.admissionFailureReporter.ReportRunAdmissionFailure(ctx, historyCommandName(r.runCommand, cmd))
+		}
 		return
 	}
 	r.runner.Run(ctx, cmd)
+}
+
+func historyCommandName(runCommand runs.Command, cmd *CommentCommand) command.Name {
+	if cmd != nil {
+		return cmd.CommandName()
+	}
+	switch runCommand {
+	case runs.CommandPlan:
+		return command.Plan
+	case runs.CommandApply:
+		return command.Apply
+	case runs.CommandImport:
+		return command.Import
+	case runs.CommandStateRemove:
+		return command.State
+	case runs.CommandUnlock:
+		return command.Unlock
+	default:
+		return command.Plan
+	}
 }
 
 func (r *runHistoryCommandRunner) ShouldSkipPreWorkflowHooks(ctx *command.Context, cmd *CommentCommand) bool {

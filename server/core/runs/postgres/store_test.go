@@ -246,6 +246,89 @@ func TestStoreConformance(t *testing.T) {
 	require.ErrorIs(t, err, runs.ErrNotFound)
 }
 
+func TestAttemptTakeoverFinalizesSupersededRun(t *testing.T) {
+	if testing.Short() {
+		t.Skip("PostgreSQL conformance test is disabled in short mode")
+	}
+	testURL := os.Getenv("ATLANTIS_POSTGRES_TEST_URL")
+	if testURL == "" {
+		t.Skip("ATLANTIS_POSTGRES_TEST_URL is not set")
+	}
+	for _, test := range []struct {
+		name              string
+		sideEffectStarted bool
+		expectedStatus    runs.Status
+		expectedAttempt   runs.AttemptStatus
+	}{
+		{name: "before side effect", expectedStatus: runs.StatusFailed, expectedAttempt: runs.AttemptInterrupted},
+		{name: "after side effect", sideEffectStarted: true, expectedStatus: runs.StatusUnknown, expectedAttempt: runs.AttemptUnknown},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			store, cleanup := newIsolatedStore(t, ctx, testURL)
+			defer cleanup()
+
+			createdAt := time.Now().UTC().Truncate(time.Microsecond)
+			startedAt := createdAt.Add(time.Second)
+			oldRunID, newRunID := mustID(t), mustID(t)
+			for _, runID := range []runs.ID{oldRunID, newRunID} {
+				run := runs.Run{
+					ID: runID, Repository: "example/infrastructure", Command: runs.CommandApply,
+					Trigger: runs.TriggerComment, Status: runs.StatusPending, CreatedAt: createdAt,
+				}
+				require.NoError(t, store.CreateRun(ctx, run))
+				require.NoError(t, store.StartRun(ctx, runID, startedAt))
+			}
+			instanceID := mustID(t)
+			require.NoError(t, store.RegisterInstance(ctx, runs.ExecutionInstance{
+				ID: instanceID, ReplicaID: "atlantis-0", DeploymentID: "takeover-test",
+				StartedAt: createdAt, HeartbeatAt: createdAt,
+			}))
+			oldAttemptID := mustID(t)
+			oldAttempt := runs.RunAttempt{
+				ID: oldAttemptID, RunID: oldRunID, InstanceID: instanceID,
+				DeploymentID: "takeover-test", ConcurrencyKey: "sha256:pull",
+				OwnershipClaimID: "claim-1", Status: runs.AttemptClaimed,
+				ClaimedAt: createdAt, HeartbeatAt: createdAt,
+			}
+			require.NoError(t, store.CreateAttempt(ctx, oldAttempt))
+			require.NoError(t, store.StartAttempt(ctx, oldAttemptID, startedAt))
+			projectRunID := mustID(t)
+			require.NoError(t, store.CreateProjectRun(ctx, runs.ProjectRun{
+				ID: projectRunID, RunID: oldRunID, Directory: "terraform/network",
+				Workspace: "production", Status: runs.StatusPending,
+			}))
+			require.NoError(t, store.StartProjectRun(ctx, projectRunID, startedAt))
+			if test.sideEffectStarted {
+				require.NoError(t, store.MarkAttemptSideEffectStarted(ctx, oldAttemptID, startedAt.Add(time.Millisecond)))
+			}
+
+			takeoverAt := startedAt.Add(2 * time.Millisecond)
+			require.NoError(t, store.CreateAttempt(ctx, runs.RunAttempt{
+				ID: mustID(t), RunID: newRunID, InstanceID: instanceID,
+				DeploymentID: "takeover-test", ConcurrencyKey: "sha256:pull",
+				OwnershipClaimID: "claim-2", Status: runs.AttemptClaimed,
+				ClaimedAt: takeoverAt, HeartbeatAt: takeoverAt,
+			}))
+
+			storedAttempt, err := store.GetAttempt(ctx, oldAttemptID)
+			require.NoError(t, err)
+			require.Equal(t, test.expectedAttempt, storedAttempt.Status)
+			storedRun, err := store.GetRun(ctx, oldRunID)
+			require.NoError(t, err)
+			require.Equal(t, test.expectedStatus, storedRun.Status)
+			require.Equal(t, takeoverAt, *storedRun.CompletedAt)
+			storedProject, err := store.GetProjectRun(ctx, projectRunID)
+			require.NoError(t, err)
+			require.Equal(t, test.expectedStatus, storedProject.Status)
+			currentRun, err := store.GetRun(ctx, newRunID)
+			require.NoError(t, err)
+			require.Equal(t, runs.StatusRunning, currentRun.Status)
+		})
+	}
+}
+
 func newIsolatedStore(t *testing.T, ctx context.Context, rawURL string) (*postgres.Store, func()) {
 	t.Helper()
 	parsed, err := url.Parse(rawURL)

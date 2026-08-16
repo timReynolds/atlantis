@@ -387,6 +387,23 @@ func TestRunHistoryFailsClosedWhenAttemptAdmissionIsNotDurable(t *testing.T) {
 	require.Equal(t, runs.StatusFailed, writer.runsCompleted[0].Status)
 }
 
+func TestRunHistoryCommandRunnerReportsAttemptAdmissionFailure(t *testing.T) {
+	writer := &recordingRunWriter{createAttemptErr: errors.New("database unavailable")}
+	history := newTestRunHistory(t, writer)
+	underlying := &recordingCommentCommandRunner{}
+	reporter := &recordingAdmissionFailureReporter{}
+	runner := NewRunHistoryCommandRunner(history, underlying, runs.CommandApply, reporter)
+	ctx := testRunContext(t)
+	enableHAContext(ctx)
+
+	runner.Run(ctx, &CommentCommand{Name: command.Apply})
+
+	require.False(t, underlying.called)
+	require.Equal(t, 1, reporter.calls)
+	require.Equal(t, command.Apply, reporter.commandName)
+	require.Equal(t, runs.StatusFailed, writer.runsCompleted[0].Status)
+}
+
 func TestRunHistoryMarksPanicAfterSideEffectUnknown(t *testing.T) {
 	writer := &recordingRunWriter{}
 	history := newTestRunHistory(t, writer)
@@ -594,3 +611,24 @@ func (w *recordingRunWriter) CompleteAttempt(_ context.Context, completion runs.
 func (w *recordingRunWriter) ReconcileAttempt(context.Context, runs.AttemptReconciliation) error {
 	return nil
 }
+
+type recordingCommentCommandRunner struct {
+	called bool
+}
+
+func (r *recordingCommentCommandRunner) Run(*command.Context, *CommentCommand) {
+	r.called = true
+}
+
+type recordingAdmissionFailureReporter struct {
+	calls       int
+	commandName command.Name
+}
+
+func (r *recordingAdmissionFailureReporter) ReportRunAdmissionFailure(_ *command.Context, commandName command.Name) {
+	r.calls++
+	r.commandName = commandName
+}
+
+var _ CommentCommandRunner = (*recordingCommentCommandRunner)(nil)
+var _ RunAdmissionFailureReporter = (*recordingAdmissionFailureReporter)(nil)

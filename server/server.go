@@ -1060,14 +1060,15 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		userConfig.SilenceNoProjects,
 	)
 
+	admissionFailureReporter := events.NewVCSRunAdmissionFailureReporter(vcsClient, commitStatusUpdater)
 	commentCommandRunnerByCmd := map[command.Name]events.CommentCommandRunner{
-		command.Plan:            events.NewRunHistoryCommandRunner(runHistory, planCommandRunner, runs.CommandPlan),
-		command.Apply:           events.NewRunHistoryCommandRunner(runHistory, applyCommandRunner, runs.CommandApply),
+		command.Plan:            events.NewRunHistoryCommandRunner(runHistory, planCommandRunner, runs.CommandPlan, admissionFailureReporter),
+		command.Apply:           events.NewRunHistoryCommandRunner(runHistory, applyCommandRunner, runs.CommandApply, admissionFailureReporter),
 		command.ApprovePolicies: approvePoliciesCommandRunner,
-		command.Unlock:          events.NewRunHistoryCommandRunner(runHistory, unlockCommandRunner, runs.CommandUnlock),
+		command.Unlock:          events.NewRunHistoryCommandRunner(runHistory, unlockCommandRunner, runs.CommandUnlock, admissionFailureReporter),
 		command.Version:         versionCommandRunner,
-		command.Import:          events.NewRunHistoryCommandRunner(runHistory, importCommandRunner, runs.CommandImport),
-		command.State:           events.NewRunHistoryCommandRunner(runHistory, stateCommandRunner, runs.CommandStateRemove),
+		command.Import:          events.NewRunHistoryCommandRunner(runHistory, importCommandRunner, runs.CommandImport, admissionFailureReporter),
+		command.State:           events.NewRunHistoryCommandRunner(runHistory, stateCommandRunner, runs.CommandStateRemove, admissionFailureReporter),
 		command.Cancel:          cancelCommandRunner,
 	}
 

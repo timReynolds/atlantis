@@ -348,7 +348,7 @@ func validateLifecycle(status Status, createdAt time.Time, startedAt, completedA
 func (s Status) validForProject() bool {
 	switch s {
 	case StatusPending, StatusRunning, StatusSucceeded, StatusUnchanged, StatusFailed,
-		StatusPartial, StatusCancelled, StatusSkipped:
+		StatusPartial, StatusCancelled, StatusSkipped, StatusUnknown:
 		return true
 	default:
 		return false

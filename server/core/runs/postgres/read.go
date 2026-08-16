@@ -257,6 +257,8 @@ func (s *Store) SummarizeProjectRuns(ctx context.Context, runID runs.ID) (runs.P
 			summary.Cancelled += count
 		case runs.StatusSkipped:
 			summary.Skipped += count
+		case runs.StatusUnknown:
+			summary.Unknown += count
 		default:
 			return runs.ProjectRunSummary{}, fmt.Errorf("summarizing project runs: unknown status %q", status)
 		}

@@ -119,7 +119,7 @@ func TestProjectRunValidatePreservesAllPlanCounts(t *testing.T) {
 	Assert(t, projectRun.Validate() != nil, "negative plan counts must be rejected")
 	projectRun.Forgets = 0
 	projectRun.Status = runs.StatusUnknown
-	Assert(t, projectRun.Validate() != nil, "unknown is a logical run status, not a project result")
+	Ok(t, projectRun.Validate())
 }
 
 func TestPendingProjectRunCanBeRecordedBeforeFanOut(t *testing.T) {

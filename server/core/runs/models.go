@@ -29,7 +29,7 @@ func ParseID(value string) (ID, error) {
 	if err != nil {
 		return "", fmt.Errorf("parsing history identifier: %w", err)
 	}
-	if id.Version() != uuid.Version(7) {
+	if id.Version() != uuid.Version(7) || id.Variant() != uuid.RFC4122 {
 		return "", fmt.Errorf("history identifier must be UUIDv7")
 	}
 	return ID(id.String()), nil

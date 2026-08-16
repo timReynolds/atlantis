@@ -34,6 +34,12 @@ func TestParseIDRequiresUUIDv7AndReturnsCanonicalForm(t *testing.T) {
 	Assert(t, err != nil, "nil UUID must be rejected")
 	_, err = runs.ParseID(uuid.New().String())
 	Assert(t, err != nil, "UUIDv4 must be rejected")
+
+	nonRFC := uuid.MustParse(string(id))
+	nonRFC[8] &= 0x3f
+	Equals(t, uuid.Reserved, nonRFC.Variant())
+	_, err = runs.ParseID(nonRFC.String())
+	Assert(t, err != nil, "non-RFC UUIDv7 must be rejected")
 }
 
 func TestRunValidate(t *testing.T) {

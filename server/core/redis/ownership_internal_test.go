@@ -239,6 +239,32 @@ func TestOwnerStore_ReusedReplicaIDDoesNotOwnPriorProcessClaim(t *testing.T) {
 	require.False(t, newProcess.Owns(key, observed.ClaimID))
 }
 
+func TestOwnerStore_UsesProvidedProcessIdentityAndDeploymentNamespace(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redislib.NewClient(&redislib.Options{Addr: mr.Addr()})
+	const instanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	store, err := NewOwnerStoreWithClient(client, OwnerStoreConfig{
+		ReplicaID: "atlantis-0", InstanceID: instanceID, DeploymentID: "prod-eu",
+		AdvertiseURL: testOwnerURL, TTL: 30 * time.Second,
+	}, logging.NewNoopLogger(t))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, store.Close())
+		require.NoError(t, client.Close())
+	})
+
+	record, err := store.Claim(context.Background(), testOwnershipKey(67))
+	require.NoError(t, err)
+	require.Equal(t, instanceID, record.InstanceID)
+	require.Equal(t, "prod-eu", record.DeploymentID)
+
+	defaultKey, err := redisOwnershipKey("", testOwnershipKey(67))
+	require.NoError(t, err)
+	deploymentKey, err := redisOwnershipKey("prod-eu", testOwnershipKey(67))
+	require.NoError(t, err)
+	require.NotEqual(t, defaultKey, deploymentKey)
+}
+
 func TestOwnerStore_StaleClaimCannotRenewOrReleaseReplacement(t *testing.T) {
 	mr := miniredis.RunT(t)
 	storeA := newTestOwnerStoreWithTTL(t, mr, "atlantis-0", testOwnerURL, 30*time.Second)
@@ -301,7 +327,7 @@ func TestOwnerStore_StoredRecordContainsOnlyRoutingMetadata(t *testing.T) {
 	_, err := store.Claim(context.Background(), key)
 	require.NoError(t, err)
 
-	redisKey, err := redisOwnershipKey(key)
+	redisKey, err := redisOwnershipKey("", key)
 	require.NoError(t, err)
 	serialized, err := mr.Get(redisKey)
 	require.NoError(t, err)

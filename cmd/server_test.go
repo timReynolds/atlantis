@@ -135,6 +135,7 @@ var testFlags = map[string]any{
 	RedisUsername:                    "",
 	RedisClusterAddresses:            "",
 	ReplicaAdvertiseURLFlag:          "http://replica-0:4141",
+	ReplicaDeploymentIDFlag:          "",
 	ReplicaIDFlag:                    "replica-0",
 	RepoAllowlistFlag:                "github.com/runatlantis/atlantis",
 	RepoConfigFlag:                   "",
@@ -211,6 +212,16 @@ func TestExecute_ReplicaRoutingValidation(t *testing.T) {
 		Ok(t, c.Execute())
 	})
 
+	t.Run("valid durable HA prerequisites", func(t *testing.T) {
+		flags := valid()
+		flags[ReplicaDeploymentIDFlag] = "prod-eu"
+		flags[RunStoreTypeFlag] = "postgres"
+		flags[RunStorePostgresURLFlag] = "postgres://database/atlantis"
+		flags[EnableExternalStoresFlag] = true
+		c := setup(flags, t)
+		Ok(t, c.Execute())
+	})
+
 	t.Run("plain redis locking does not enable routing", func(t *testing.T) {
 		c := setup(map[string]any{
 			GHUserFlag:        "user",
@@ -277,6 +288,23 @@ func TestExecute_ReplicaRoutingValidation(t *testing.T) {
 			},
 			expected: "--ownership-ttl-seconds must be at least 10",
 		},
+		{
+			name: "durable HA requires PostgreSQL history",
+			configure: func(flags map[string]any) {
+				flags[ReplicaDeploymentIDFlag] = "prod-eu"
+				flags[EnableExternalStoresFlag] = true
+			},
+			expected: "--replica-deployment-id requires --run-store-type=postgres",
+		},
+		{
+			name: "durable HA requires external plans",
+			configure: func(flags map[string]any) {
+				flags[ReplicaDeploymentIDFlag] = "prod-eu"
+				flags[RunStoreTypeFlag] = "postgres"
+				flags[RunStorePostgresURLFlag] = "postgres://database/atlantis"
+			},
+			expected: "--replica-deployment-id requires --enable-external-stores",
+		},
 	}
 
 	for _, test := range tests {
@@ -298,6 +326,7 @@ func TestInit_ReplicaRoutingFlagContract(t *testing.T) {
 		InternalCommandTokenFlag: {"activates replica routing"},
 		OwnershipTTLSecondsFlag:  {"does not activate replica routing"},
 		ReplicaAdvertiseURLFlag:  {"activates replica routing"},
+		ReplicaDeploymentIDFlag:  {"durable replica identity", "PostgreSQL run history", "S3 plan storage"},
 		ReplicaIDFlag:            {"Defaults to the process hostname", "activates replica routing"},
 	} {
 		usage := c.Flags().Lookup(flag).Usage

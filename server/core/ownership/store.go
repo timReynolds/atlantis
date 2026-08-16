@@ -6,6 +6,8 @@ package ownership
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -43,9 +45,25 @@ func (k Key) Canonical() (string, error) {
 	return fmt.Sprintf("%s\x00%s\x00%d", hostname, repoFullName, k.PullNum), nil
 }
 
+// ConcurrencyKey returns a PostgreSQL-safe digest of the same whole-pull
+// ownership boundary used by Redis. deploymentID namespaces independent
+// Atlantis installations that intentionally share infrastructure.
+func (k Key) ConcurrencyKey(deploymentID string) (string, error) {
+	canonical, err := k.Canonical()
+	if err != nil {
+		return "", err
+	}
+	if deploymentID = strings.TrimSpace(deploymentID); deploymentID != "" {
+		canonical = deploymentID + "\x00" + canonical
+	}
+	sum := sha256.Sum256([]byte(canonical))
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
 // Record describes the replica process that currently owns a pull request.
 type Record struct {
 	SchemaVersion int       `json:"schema_version"`
+	DeploymentID  string    `json:"deployment_id,omitempty"`
 	ReplicaID     string    `json:"replica_id"`
 	InstanceID    string    `json:"instance_id"`
 	AdvertiseURL  string    `json:"advertise_url"`

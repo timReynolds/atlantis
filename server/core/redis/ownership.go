@@ -5,11 +5,10 @@ package redis
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,6 +49,8 @@ const releaseOwnerScript = "" +
 // OwnerStoreConfig identifies a replica and configures its ownership lease.
 type OwnerStoreConfig struct {
 	ReplicaID    string
+	InstanceID   string
+	DeploymentID string
 	AdvertiseURL string
 	TTL          time.Duration
 }
@@ -104,9 +105,15 @@ func NewOwnerStoreWithClient(client redislib.Cmdable, config OwnerStoreConfig, l
 	if config.TTL <= 0 {
 		return nil, errors.New("ownership TTL must be positive")
 	}
-	instanceID, err := runs.NewID()
-	if err != nil {
-		return nil, fmt.Errorf("generating ownership instance ID: %w", err)
+	instanceID := strings.TrimSpace(config.InstanceID)
+	if instanceID == "" {
+		generated, err := runs.NewID()
+		if err != nil {
+			return nil, fmt.Errorf("generating ownership instance ID: %w", err)
+		}
+		instanceID = string(generated)
+	} else if _, err := runs.ParseID(instanceID); err != nil {
+		return nil, fmt.Errorf("validating ownership instance ID: %w", err)
 	}
 
 	loopCtx, cancel := context.WithCancel(context.Background())
@@ -114,7 +121,7 @@ func NewOwnerStoreWithClient(client redislib.Cmdable, config OwnerStoreConfig, l
 		client:     client,
 		config:     config,
 		logger:     logger,
-		instanceID: string(instanceID),
+		instanceID: instanceID,
 		owned:      make(map[string]ownedRecord),
 		cancel:     cancel,
 		done:       make(chan struct{}),
@@ -128,12 +135,13 @@ func (s *OwnerStore) Claim(ctx context.Context, key ownership.Key) (ownership.Re
 	if s.draining.Load() {
 		return ownership.Record{}, ownership.ErrDraining
 	}
-	redisKey, err := redisOwnershipKey(key)
+	redisKey, err := redisOwnershipKey(s.config.DeploymentID, key)
 	if err != nil {
 		return ownership.Record{}, err
 	}
 	record := ownership.Record{
 		SchemaVersion: ownerRecordSchemaVersion,
+		DeploymentID:  s.config.DeploymentID,
 		ReplicaID:     s.config.ReplicaID,
 		InstanceID:    s.instanceID,
 		AdvertiseURL:  s.config.AdvertiseURL,
@@ -167,7 +175,7 @@ func (s *OwnerStore) Claim(ctx context.Context, key ownership.Key) (ownership.Re
 
 // Admit renews the exact local claim only when Redis still contains it.
 func (s *OwnerStore) Admit(ctx context.Context, key ownership.Key, claimID string) (bool, error) {
-	redisKey, err := redisOwnershipKey(key)
+	redisKey, err := redisOwnershipKey(s.config.DeploymentID, key)
 	if err != nil {
 		return false, err
 	}
@@ -182,7 +190,7 @@ func (s *OwnerStore) Admit(ctx context.Context, key ownership.Key, claimID strin
 
 // Current returns the current live ownership record, if one exists.
 func (s *OwnerStore) Current(ctx context.Context, key ownership.Key) (ownership.Record, bool, error) {
-	redisKey, err := redisOwnershipKey(key)
+	redisKey, err := redisOwnershipKey(s.config.DeploymentID, key)
 	if err != nil {
 		return ownership.Record{}, false, err
 	}
@@ -202,7 +210,7 @@ func (s *OwnerStore) Current(ctx context.Context, key ownership.Key) (ownership.
 
 // Owns reports whether this process holds the exact claim in its local lease set.
 func (s *OwnerStore) Owns(key ownership.Key, claimID string) bool {
-	redisKey, err := redisOwnershipKey(key)
+	redisKey, err := redisOwnershipKey(s.config.DeploymentID, key)
 	if err != nil {
 		return false
 	}
@@ -214,7 +222,7 @@ func (s *OwnerStore) Owns(key ownership.Key, claimID string) bool {
 
 // Release removes a claim only when this process still owns the exact record.
 func (s *OwnerStore) Release(ctx context.Context, key ownership.Key, claimID string) error {
-	redisKey, err := redisOwnershipKey(key)
+	redisKey, err := redisOwnershipKey(s.config.DeploymentID, key)
 	if err != nil {
 		return err
 	}
@@ -353,7 +361,7 @@ func (s *OwnerStore) renewOwned(ctx context.Context) {
 }
 
 func (s *OwnerStore) renewClaim(ctx context.Context, key ownership.Key, record ownership.Record) (bool, error) {
-	redisKey, err := redisOwnershipKey(key)
+	redisKey, err := redisOwnershipKey(s.config.DeploymentID, key)
 	if err != nil {
 		return false, err
 	}
@@ -405,13 +413,16 @@ func (s *OwnerStore) clearRenewalFailure() {
 	s.healthMu.Unlock()
 }
 
-func redisOwnershipKey(key ownership.Key) (string, error) {
-	canonical, err := key.Canonical()
+func redisOwnershipKey(deploymentID string, key ownership.Key) (string, error) {
+	concurrencyKey, err := key.ConcurrencyKey(deploymentID)
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256([]byte(canonical))
-	return "atlantis:ha:ownership:v1:" + hex.EncodeToString(sum[:]), nil
+	version := "v1"
+	if strings.TrimSpace(deploymentID) != "" {
+		version = "v2"
+	}
+	return "atlantis:ha:ownership:" + version + ":" + strings.TrimPrefix(concurrencyKey, "sha256:"), nil
 }
 
 func decodeOwnerRecord(serialized string) (ownership.Record, error) {

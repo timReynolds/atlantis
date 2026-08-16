@@ -1113,7 +1113,7 @@ Terraform files.
 ATLANTIS_INTERNAL_COMMAND_TOKEN="shared-internal-secret"
 ```
 
-Shared secret used to authenticate command forwarding between replicas. Configuring this value, `--replica-advertise-url`, or `--replica-id` activates replica-routing validation, so configure the complete routing group on every replica. Expose the internal command endpoints only to trusted Atlantis replicas. Prefer the environment variable over a command-line argument so the secret is not exposed in process arguments.
+Shared secret used to authenticate command forwarding between replicas. Configuring this value, `--replica-advertise-url`, `--replica-deployment-id`, or `--replica-id` activates replica-routing validation, so configure the complete routing group on every replica. Expose the internal command endpoints only to trusted Atlantis replicas. Prefer the environment variable over a command-line argument so the secret is not exposed in process arguments.
 
 ### `--language` <Badge text="v0.45.0+" type="info"/>
 
@@ -1398,6 +1398,18 @@ ATLANTIS_REPLICA_ADVERTISE_URL="http://atlantis-0.atlantis-headless:4141"
 ```
 
 Absolute internal HTTP(S) URL used by other replicas to forward commands to this replica. Configuring it activates replica routing and requires Redis locking plus `--internal-command-token`. The URL may include a base path but must not include credentials, a query, or a fragment. In Kubernetes, use a stable per-pod DNS name rather than the load-balanced Service address.
+
+### `--replica-deployment-id`
+
+```bash
+atlantis server --replica-deployment-id="prod-eu"
+# or
+ATLANTIS_REPLICA_DEPLOYMENT_ID=prod-eu
+```
+
+Stable identifier shared by every replica in one durable HA deployment. Setting it enables durable process identity and namespaces Redis ownership keys so independent Atlantis deployments can share Redis without claiming each other's pull requests.
+
+Durable HA also requires `--run-store-type=postgres`, `--enable-external-stores`, and an S3 `external_stores.plan_store`. Atlantis records a new process-lifetime `instance_id` at startup and persists replica, deployment, version, commit, heartbeat, and graceful-stop information. The `instance_id` is operational history and never changes a logical run ID.
 
 ### `--replica-id`
 

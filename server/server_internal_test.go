@@ -32,6 +32,7 @@ func TestServer_ShutdownOrdersOwnershipAndDatabase(t *testing.T) {
 	s := &Server{
 		OwnerStore:            owners,
 		commandExecutorWaiter: &recordingCommandWaiter{calls: &calls},
+		executionInstance:     &recordingExecutionInstanceLifecycle{calls: &calls},
 		Drainer:               &events.Drainer{},
 		Logger:                logging.NewNoopLogger(t),
 		database:              database,
@@ -39,7 +40,7 @@ func TestServer_ShutdownOrdersOwnershipAndDatabase(t *testing.T) {
 	httpServer := &recordingHTTPShutdowner{calls: &calls}
 
 	assert.NoError(t, s.shutdown(httpServer, time.Second))
-	assert.Equal(t, []string{"begin-drain", "http-shutdown", "command-wait", "owner-close", "database-close"}, calls)
+	assert.Equal(t, []string{"begin-drain", "http-shutdown", "command-wait", "owner-close", "instance-stop", "database-close"}, calls)
 }
 
 func TestServer_ShutdownCompletesCleanupAfterHTTPTimeout(t *testing.T) {
@@ -67,6 +68,17 @@ type recordingHTTPShutdowner struct {
 
 type recordingCommandWaiter struct {
 	calls *[]string
+}
+
+type recordingExecutionInstanceLifecycle struct {
+	calls *[]string
+}
+
+func (s *recordingExecutionInstanceLifecycle) Start(context.Context) error { return nil }
+func (s *recordingExecutionInstanceLifecycle) Ready(context.Context) error { return nil }
+func (s *recordingExecutionInstanceLifecycle) Stop(context.Context) error {
+	*s.calls = append(*s.calls, "instance-stop")
+	return nil
 }
 
 func (w *recordingCommandWaiter) Wait() {

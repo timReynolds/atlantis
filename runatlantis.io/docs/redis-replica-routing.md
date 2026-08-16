@@ -40,9 +40,11 @@ ATLANTIS_OWNERSHIP_TTL_SECONDS=30
 ATLANTIS_INTERNAL_COMMAND_TOKEN=<shared-secret>
 ```
 
-Setting `--replica-advertise-url`, `--internal-command-token`, or the optional `--replica-id` override expresses routing intent. If any one is configured, Atlantis requires Redis locking, a Redis endpoint, a valid advertise URL, and a non-empty internal token. Partial routing configuration fails startup.
+Setting `--replica-advertise-url`, `--internal-command-token`, `--replica-deployment-id`, or the optional `--replica-id` override expresses routing intent. If any one is configured, Atlantis requires Redis locking, a Redis endpoint, a valid advertise URL, and a non-empty internal token. Partial routing configuration fails startup.
 
 By default, Atlantis uses the hostname returned by the operating system as the replica ID. Use `--replica-id` only when that hostname is not stable and unique. In Kubernetes, the container hostname is normally the pod name; do not use the Kubernetes worker-node hostname.
+
+For the fork's durable HA mode, also set the same `--replica-deployment-id` on every replica. This mode requires PostgreSQL run history and S3 plan storage. Atlantis creates a distinct process-lifetime instance ID on every restart, stores it in PostgreSQL, and uses that same ID in Redis ownership records. The deployment ID namespaces ownership keys; the replica ID remains the stable addressable pod identity.
 
 The ownership TTL defaults to 30 seconds and must be at least 10 seconds. Use a TTL long enough to tolerate routine scheduling and Redis latency, but short enough for the desired failover time.
 

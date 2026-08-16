@@ -142,7 +142,9 @@ type Server struct {
 	RunStore                       runs.Store
 	EnableReplicaRouting           bool
 	OwnerStore                     ownership.Store `validate:"required_if=EnableReplicaRouting true"`
+	ExecutionInstanceID            runs.ID
 	commandExecutorWaiter          acceptedCommandWaiter
+	executionInstance              executionInstanceLifecycle
 	database                       db.Database
 	runStoreHealth                 runStorePinger
 	runStoreCloser                 io.Closer
@@ -158,6 +160,7 @@ type Config struct {
 	AllowForkPRsFlag          string
 	AtlantisURLFlag           string
 	AtlantisVersion           string
+	AtlantisCommit            string
 	DefaultTFDistributionFlag string
 	DefaultTFVersionFlag      string
 	RepoConfigJSONFlag        string
@@ -203,12 +206,21 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		return nil, err
 	}
 	replicaRoutingEnabled := userConfig.replicaRoutingConfigured()
+	durableHAEnabled := userConfig.durableHAConfigured()
 	replicaID := ""
+	var executionInstanceID runs.ID
 	if replicaRoutingEnabled {
 		var err error
 		replicaID, err = userConfig.resolveReplicaID()
 		if err != nil {
 			return nil, err
+		}
+	}
+	if durableHAEnabled {
+		var err error
+		executionInstanceID, err = runs.NewID()
+		if err != nil {
+			return nil, fmt.Errorf("generating execution instance ID: %w", err)
 		}
 	}
 
@@ -258,6 +270,9 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		if err != nil {
 			return nil, fmt.Errorf("parsing --%s: %w", config.RepoConfigJSONFlag, err)
 		}
+	}
+	if durableHAEnabled && globalCfg.ExternalStores.PlanStore.Type != "s3" {
+		return nil, errors.New("--replica-deployment-id requires an S3 external_stores.plan_store")
 	}
 
 	statsScope, statsReporter, closer, err := metrics.NewScope(globalCfg.Metrics, logger, userConfig.StatsNamespace)
@@ -488,6 +503,17 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		}
 	}()
 	runStoreRetention := newRunStoreRetentionService(runStore, userConfig, logger)
+	var executionInstance executionInstanceLifecycle
+	if durableHAEnabled {
+		startedAt := time.Now().UTC()
+		executionInstance = newExecutionInstanceService(runStore, runs.ExecutionInstance{
+			ID: executionInstanceID, ReplicaID: replicaID,
+			DeploymentID: strings.TrimSpace(userConfig.ReplicaDeploymentID),
+			AdvertiseURL: userConfig.ReplicaAdvertiseURL,
+			StartedAt:    startedAt, HeartbeatAt: startedAt,
+			Version: config.AtlantisVersion, Commit: config.AtlantisCommit,
+		}, time.Duration(userConfig.OwnershipTTLSeconds)*time.Second/3, logger)
+	}
 	var runHistory *events.RunHistory
 	if userConfig.RunStoreType == RunStorePostgres {
 		runHistory = events.NewRunHistory(runStore, logger)
@@ -1219,7 +1245,8 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 			Logger:      logger,
 		}
 		ownerStore, err = redis.NewOwnerStore(redisDatabase, redis.OwnerStoreConfig{
-			ReplicaID:    replicaID,
+			ReplicaID: replicaID, InstanceID: string(executionInstanceID),
+			DeploymentID: strings.TrimSpace(userConfig.ReplicaDeploymentID),
 			AdvertiseURL: userConfig.ReplicaAdvertiseURL,
 			TTL:          time.Duration(userConfig.OwnershipTTLSeconds) * time.Second,
 		}, logger)
@@ -1314,7 +1341,9 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		RunStore:                       runStore,
 		EnableReplicaRouting:           replicaRoutingEnabled,
 		OwnerStore:                     ownerStore,
+		ExecutionInstanceID:            executionInstanceID,
 		commandExecutorWaiter:          commandExecutorWaiter,
+		executionInstance:              executionInstance,
 		database:                       database,
 		runStoreHealth:                 runStoreHealth,
 		runStoreCloser:                 runStoreCloser,
@@ -1403,6 +1432,11 @@ func (s *Server) SetupRoutes() {
 
 // Start creates the routes and starts serving traffic.
 func (s *Server) Start() error {
+	if s.executionInstance != nil {
+		if err := s.executionInstance.Start(context.Background()); err != nil {
+			return err
+		}
+	}
 	s.SetupRoutes()
 
 	n := negroni.New(&negroni.Recovery{
@@ -1504,6 +1538,13 @@ func (s *Server) shutdown(server httpShutdowner, timeout time.Duration) error {
 		if err := s.OwnerStore.Close(); err != nil {
 			s.Logger.Err("while releasing pull request ownership: %v", err)
 		}
+	}
+	if s.executionInstance != nil {
+		instanceCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		if err := s.executionInstance.Stop(instanceCtx); err != nil {
+			s.Logger.Err("while stopping execution instance %v", err)
+		}
+		cancel()
 	}
 	if err := s.closeDatabase(1 * time.Second); err != nil {
 		s.Logger.Err("while closing database: %v", err)
@@ -1699,6 +1740,13 @@ func (s *Server) Readyz(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.OwnerStore != nil {
 		if err := s.OwnerStore.Ready(ctx); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write(fmt.Appendf(nil, `{"status":"error","error":%q}`, err.Error())) // nolint: errcheck
+			return
+		}
+	}
+	if s.executionInstance != nil {
+		if err := s.executionInstance.Ready(ctx); err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			w.Write(fmt.Appendf(nil, `{"status":"error","error":%q}`, err.Error())) // nolint: errcheck
 			return

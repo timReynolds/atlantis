@@ -128,6 +128,7 @@ type UserConfig struct {
 	RedisUsername                   string `mapstructure:"redis-username"`
 	RedisClusterAddresses           string `mapstructure:"redis-cluster-addresses"`
 	ReplicaAdvertiseURL             string `mapstructure:"replica-advertise-url"`
+	ReplicaDeploymentID             string `mapstructure:"replica-deployment-id"`
 	ReplicaID                       string `mapstructure:"replica-id"`
 	RepoConfig                      string `mapstructure:"repo-config"`
 	RepoConfigJSON                  string `mapstructure:"repo-config-json"`
@@ -179,7 +180,11 @@ type UserConfig struct {
 // replicaRoutingConfigured reports whether a routing-only setting was supplied.
 // OwnershipTTLSeconds is excluded because it has a non-zero default.
 func (u UserConfig) replicaRoutingConfigured() bool {
-	return u.ReplicaID != "" || u.ReplicaAdvertiseURL != "" || u.InternalCommandToken != ""
+	return u.ReplicaID != "" || u.ReplicaDeploymentID != "" || u.ReplicaAdvertiseURL != "" || u.InternalCommandToken != ""
+}
+
+func (u UserConfig) durableHAConfigured() bool {
+	return strings.TrimSpace(u.ReplicaDeploymentID) != ""
 }
 
 // ValidateReplicaRouting validates the multi-replica routing contract when any
@@ -206,6 +211,14 @@ func (u UserConfig) ValidateReplicaRouting() error {
 	}
 	if u.OwnershipTTLSeconds < 10 {
 		return errors.New("--ownership-ttl-seconds must be at least 10")
+	}
+	if u.durableHAConfigured() {
+		if u.RunStoreType != RunStorePostgres {
+			return errors.New("--replica-deployment-id requires --run-store-type=postgres")
+		}
+		if !u.EnableExternalStores {
+			return errors.New("--replica-deployment-id requires --enable-external-stores")
+		}
 	}
 	return nil
 }

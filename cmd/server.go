@@ -135,6 +135,7 @@ const (
 	RedisUsername                    = "redis-username"
 	RedisClusterAddresses            = "redis-cluster-addresses"
 	ReplicaAdvertiseURLFlag          = "replica-advertise-url"
+	ReplicaDeploymentIDFlag          = "replica-deployment-id"
 	ReplicaIDFlag                    = "replica-id"
 	RepoConfigFlag                   = "repo-config"
 	RepoConfigJSONFlag               = "repo-config-json"
@@ -469,6 +470,9 @@ var stringFlags = map[string]stringFlag{
 	},
 	ReplicaAdvertiseURLFlag: {
 		description: "Internal HTTP(S) URL used by other Atlantis replicas to forward commands to this replica. Configuring it activates replica routing.",
+	},
+	ReplicaDeploymentIDFlag: {
+		description: "Stable identifier for one durable HA deployment. Configuring it activates durable replica identity and requires PostgreSQL run history plus S3 plan storage.",
 	},
 	ReplicaIDFlag: {
 		description: "Optional stable unique identifier override for this Atlantis replica. Defaults to the process hostname. Configuring it activates replica routing.",
@@ -845,6 +849,7 @@ type ServerCmd struct {
 	// Useful for testing to keep the logs clean.
 	SilenceOutput   bool
 	AtlantisVersion string
+	AtlantisCommit  string
 	Logger          logging.SimpleLogging
 }
 
@@ -1012,6 +1017,7 @@ func (s *ServerCmd) run() error {
 		AllowForkPRsFlag:          AllowForkPRsFlag,
 		AtlantisURLFlag:           AtlantisURLFlag,
 		AtlantisVersion:           s.AtlantisVersion,
+		AtlantisCommit:            s.AtlantisCommit,
 		DefaultTFDistributionFlag: DefaultTFDistributionFlag,
 		DefaultTFVersionFlag:      DefaultTFVersionFlag,
 		RepoConfigJSONFlag:        RepoConfigJSONFlag,

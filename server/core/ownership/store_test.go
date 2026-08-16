@@ -51,3 +51,15 @@ func TestKey_CanonicalRejectsIncompleteIdentity(t *testing.T) {
 		require.Error(t, err)
 	}
 }
+
+func TestKey_ConcurrencyKeyIsPostgresSafeAndDeploymentScoped(t *testing.T) {
+	key := ownership.Key{VCSHostname: "github.com", RepoFullName: "owner/repo", PullNum: 1}
+	first, err := key.ConcurrencyKey("prod-eu")
+	require.NoError(t, err)
+	second, err := key.ConcurrencyKey("staging-eu")
+	require.NoError(t, err)
+
+	require.Regexp(t, `^sha256:[0-9a-f]{64}$`, first)
+	require.NotEqual(t, first, second)
+	require.NotContains(t, first, "\x00")
+}

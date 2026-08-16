@@ -177,6 +177,19 @@ func TestSave_Success(t *testing.T) {
 	assert.Equal(t, "abc123def456", mock.putInput.Metadata["head-commit"])
 }
 
+func TestSave_AcceptsSyntheticPullIdentity(t *testing.T) {
+	mock := &mockS3Client{}
+	store := planstore.NewS3PlanStoreWithClient(mock, "my-bucket", "", logging.NewNoopLogger(t))
+	ctx := testProjectContext()
+	ctx.Pull.Num = -42
+	planPath := filepath.Join(t.TempDir(), "test.tfplan")
+	require.NoError(t, os.WriteFile(planPath, []byte("plan-content"), 0o600))
+
+	require.NoError(t, store.Save(ctx, planPath))
+	require.Equal(t, "-42", mock.putInput.Metadata["atlantis-pull-number"])
+	require.Contains(t, aws.ToString(mock.putInput.Key), "/-42/")
+}
+
 func TestSave_S3Error(t *testing.T) {
 	mock := &mockS3Client{putErr: errors.New("access denied")}
 	store := planstore.NewS3PlanStoreWithClient(mock, "bucket", "", logging.NewNoopLogger(t))

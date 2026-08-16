@@ -61,6 +61,27 @@ func TestRunHistoryPlanStoreRecordsExternalArtifactMetadata(t *testing.T) {
 	}
 }
 
+func TestRunHistoryPlanStoreRecordsPlanInsideAPIApplyLifecycle(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	runCtx := testRunContext(t)
+	runCtx.API = true
+	lifecycle := history.Begin(runCtx, runs.CommandApply, runs.TriggerAPI)
+	defer lifecycle.Finish()
+	projectCtx := history.beginProject(command.ProjectContext{
+		RunID: runCtx.RunID, ProjectName: "network", RepoRelDir: "terraform/network",
+		Workspace: "production", WorkflowIdentity: testWorkflowIdentity, Log: runCtx.Log,
+	})
+	planPath := filepath.Join(t.TempDir(), "network.tfplan")
+	require.NoError(t, os.WriteFile(planPath, []byte("api apply plan"), 0o600))
+	delegate := &externalPlanStore{key: "plans/api-apply/network.tfplan"}
+	store := NewRunHistoryPlanStore(delegate, history, logging.NewNoopLogger(t))
+
+	require.NoError(t, store.Save(projectCtx, planPath))
+	require.True(t, delegate.saved)
+	require.Len(t, writer.artifactUpdates, 1)
+}
+
 func TestRunHistoryPlanStoreLeavesLocalStoreUnwrapped(t *testing.T) {
 	local := &runtime.LocalPlanStore{}
 	store := NewRunHistoryPlanStore(local, NewRunHistory(&recordingRunWriter{}, logging.NewNoopLogger(t)), logging.NewNoopLogger(t))
@@ -95,6 +116,7 @@ func TestRunHistoryPlanStoreLoadValidatesIndependentDurableChecksum(t *testing.T
 		BaseRepo:    models.Repo{Owner: "org", Name: "repo", FullName: "org/repo"},
 		Pull:        models.PullRequest{Num: 42, HeadCommit: "abc123"},
 		ProjectName: "network", RepoRelDir: "terraform/network", Workspace: "production",
+		ProjectRunID:      "0198a0df-85f1-7d83-a60b-2e57b725c621",
 		RepoConfigVersion: 3, WorkflowIdentity: testWorkflowIdentity,
 	}
 	delegate := &externalPlanStore{key: "plans/org/repo/42/production/network.tfplan", loadContent: content}
@@ -109,10 +131,25 @@ func TestRunHistoryPlanStoreLoadValidatesIndependentDurableChecksum(t *testing.T
 
 	require.NoError(t, store.Load(ctx, planPath))
 	require.True(t, delegate.loaded)
+	require.Equal(t, ctx.ProjectRunID, writer.artifactLookup.ProjectRunID)
 
 	writer.artifactResult.Artifact.Checksum = testPlanChecksum
 	err := store.Load(ctx, planPath)
 	require.ErrorContains(t, err, "checksum does not match durable history")
+	require.NoFileExists(t, planPath)
+}
+
+func TestRunHistoryPlanStoreRemovesRestoredFileWhenDelegateValidationFails(t *testing.T) {
+	planPath := filepath.Join(t.TempDir(), "rejected.tfplan")
+	delegate := &externalPlanStore{
+		key: "plans/rejected.tfplan", loadContent: []byte("previously restored plan"),
+		loadErr: errors.New("S3 object identity does not match"),
+	}
+	store := NewRunHistoryPlanStore(delegate, NewRunHistory(&recordingRunWriter{}, logging.NewNoopLogger(t)), logging.NewNoopLogger(t))
+
+	err := store.Load(command.ProjectContext{}, planPath)
+
+	require.ErrorContains(t, err, "S3 object identity does not match")
 	require.NoFileExists(t, planPath)
 }
 
@@ -121,6 +158,7 @@ type externalPlanStore struct {
 	saved       bool
 	loaded      bool
 	loadContent []byte
+	loadErr     error
 }
 
 func (s *externalPlanStore) ArtifactKey(command.ProjectContext, string) string { return s.key }
@@ -131,9 +169,12 @@ func (s *externalPlanStore) Save(command.ProjectContext, string) error {
 func (s *externalPlanStore) Load(_ command.ProjectContext, path string) error {
 	s.loaded = true
 	if s.loadContent == nil {
-		return nil
+		return s.loadErr
 	}
-	return os.WriteFile(path, s.loadContent, 0o600)
+	if err := os.WriteFile(path, s.loadContent, 0o600); err != nil {
+		return err
+	}
+	return s.loadErr
 }
 func (s *externalPlanStore) Remove(command.ProjectContext, string) error { return nil }
 func (s *externalPlanStore) ListWorkspaces(string, string, int) ([]string, error) {

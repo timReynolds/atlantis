@@ -44,7 +44,7 @@ func TestStoreConformance(t *testing.T) {
 	pull := 17
 	run := runs.Run{
 		ID: runID, Repository: "example/infrastructure", PullNumber: &pull,
-		Command: runs.CommandPlan, Trigger: runs.TriggerComment, Actor: "operator",
+		Command: runs.CommandApply, Trigger: runs.TriggerComment, Actor: "operator",
 		BaseRef: "main", HeadRef: "feature", HeadSHA: "deadbeef",
 		Status: runs.StatusPending, CreatedAt: createdAt,
 		Metadata: runs.Metadata(`{"source":"conformance"}`),
@@ -215,7 +215,7 @@ func TestStoreConformance(t *testing.T) {
 
 	runPage, err := store.ListRuns(ctx, runs.RunFilter{
 		Repository: run.Repository, PullNumber: &pull,
-		Commands: []runs.Command{runs.CommandPlan}, Statuses: []runs.Status{runs.StatusUnknown},
+		Commands: []runs.Command{runs.CommandApply}, Statuses: []runs.Status{runs.StatusUnknown},
 	}, runs.PageRequest{Limit: 1})
 	require.NoError(t, err)
 	require.Len(t, runPage.Runs, 1)

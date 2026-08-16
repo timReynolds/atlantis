@@ -62,14 +62,14 @@ func (s *RunHistoryPlanStore) Save(ctx command.ProjectContext, planPath string) 
 }
 
 func (s *RunHistoryPlanStore) Load(ctx command.ProjectContext, planPath string) error {
-	if err := s.PlanStore.Load(ctx, planPath); err != nil {
-		return err
-	}
 	reject := func(err error) error {
 		if removeErr := os.Remove(planPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 			return fmt.Errorf("%w; removing rejected plan: %v", err, removeErr)
 		}
 		return err
+	}
+	if err := s.PlanStore.Load(ctx, planPath); err != nil {
+		return reject(err)
 	}
 	if s.history.planArtifacts == nil {
 		return reject(errors.New("restoring an external plan requires durable artifact history"))
@@ -77,6 +77,7 @@ func (s *RunHistoryPlanStore) Load(ctx command.ProjectContext, planPath string) 
 	expected, err := s.history.planArtifacts.FindPlanArtifact(context.Background(), runs.PlanArtifactLookup{
 		Repository: ctx.BaseRepo.ID(), PullNumber: ctx.Pull.Num, HeadSHA: ctx.Pull.HeadCommit,
 		ProjectName: ctx.ProjectName, Directory: ctx.RepoRelDir, Workspace: ctx.Workspace,
+		ProjectRunID: ctx.ProjectRunID,
 	})
 	if err != nil {
 		return reject(fmt.Errorf("finding durable plan artifact expectation: %w", err))

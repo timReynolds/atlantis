@@ -57,18 +57,24 @@ func (u ProjectPlanArtifactUpdate) Validate() error {
 // PlanArtifactLookup selects the last expected plan for one exact project
 // identity and pull-request revision.
 type PlanArtifactLookup struct {
-	Repository  string
-	PullNumber  int
-	HeadSHA     string
-	ProjectName string
-	Directory   string
-	Workspace   string
+	Repository   string
+	PullNumber   int
+	HeadSHA      string
+	ProjectRunID ID
+	ProjectName  string
+	Directory    string
+	Workspace    string
 }
 
 // Validate checks a plan lookup before querying durable history.
 func (l PlanArtifactLookup) Validate() error {
-	if strings.TrimSpace(l.Repository) == "" || l.PullNumber <= 0 || strings.TrimSpace(l.HeadSHA) == "" {
+	if strings.TrimSpace(l.Repository) == "" || l.PullNumber == 0 || strings.TrimSpace(l.HeadSHA) == "" {
 		return fmt.Errorf("plan artifact repository, pull number, and head SHA are required")
+	}
+	if l.PullNumber < 0 {
+		if _, err := ParseID(string(l.ProjectRunID)); err != nil {
+			return fmt.Errorf("synthetic pull plan artifact requires a valid ProjectRun ID: %w", err)
+		}
 	}
 	if strings.TrimSpace(l.Directory) == "" || strings.TrimSpace(l.Workspace) == "" {
 		return fmt.Errorf("plan artifact directory and workspace are required")

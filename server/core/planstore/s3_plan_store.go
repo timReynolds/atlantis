@@ -230,7 +230,7 @@ func (s *S3PlanStore) Load(ctx command.ProjectContext, planPath string) error {
 }
 
 func planObjectMetadata(ctx command.ProjectContext, checksum string) (map[string]string, error) {
-	if ctx.Pull.Num <= 0 || ctx.RepoConfigVersion < 0 || !validPlanChecksum(ctx.WorkflowIdentity) {
+	if ctx.Pull.Num == 0 || ctx.RepoConfigVersion < 0 || !validPlanChecksum(ctx.WorkflowIdentity) {
 		return nil, fmt.Errorf("external plan execution identity is invalid")
 	}
 	values := map[string]string{

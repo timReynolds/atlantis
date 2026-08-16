@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/hashicorp/go-version"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/terraform"
 	"github.com/runatlantis/atlantis/server/core/terraform/tfclient"
@@ -227,15 +228,32 @@ func (cb *PolicyCheckProjectCommandContextBuilder) BuildProjectContext(
 func detectProjectTerraformVersion(ctx *command.Context, prjCfg *valid.MergedProjectCfg, repoDir string, terraformClient tfclient.Client) {
 	// If TerraformVersion is not defined in the repo config, look for a
 	// required_version setting in the project's Terraform/OpenTofu config.
-	if prjCfg.TerraformVersion != nil {
-		return
+	if prjCfg.TerraformVersion == nil {
+		var tfDistribution terraform.Distribution
+		if prjCfg.TerraformDistribution != nil {
+			tfDistribution = terraform.NewDistribution(*prjCfg.TerraformDistribution)
+		}
+		prjCfg.TerraformVersion = terraformClient.DetectVersion(ctx.Log, tfDistribution, filepath.Join(repoDir, prjCfg.RepoRelDir))
 	}
+	if defaults, ok := terraformClient.(interface {
+		DefaultDistribution() terraform.Distribution
+		DefaultVersion() *version.Version
+	}); ok {
+		applyTerraformDefaults(prjCfg, defaults.DefaultDistribution(), defaults.DefaultVersion())
+	}
+}
 
-	var tfDistribution terraform.Distribution
-	if prjCfg.TerraformDistribution != nil {
-		tfDistribution = terraform.NewDistribution(*prjCfg.TerraformDistribution)
+func applyTerraformDefaults(prjCfg *valid.MergedProjectCfg, distribution terraform.Distribution, defaultVersion *version.Version) {
+	if prjCfg.TerraformDistribution == nil && distribution != nil {
+		name := "terraform"
+		if distribution.BinName() == "tofu" {
+			name = "opentofu"
+		}
+		prjCfg.TerraformDistribution = &name
 	}
-	prjCfg.TerraformVersion = terraformClient.DetectVersion(ctx.Log, tfDistribution, filepath.Join(repoDir, prjCfg.RepoRelDir))
+	if prjCfg.TerraformVersion == nil {
+		prjCfg.TerraformVersion = defaultVersion
+	}
 }
 
 // newProjectCommandContext is a initializer method that handles constructing the

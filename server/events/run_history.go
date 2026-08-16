@@ -813,9 +813,9 @@ func (h *RunHistory) RecordPlanArtifact(ctx command.ProjectContext, artifact run
 	if !ok {
 		return errors.New("plan artifact has no active plan Run")
 	}
-	commandName := value.(*runSession).run.Command
-	if commandName != runs.CommandPlan && commandName != runs.CommandDriftDetection {
-		return errors.New("plan artifact has no active plan Run")
+	runCommand := value.(*runSession).run.Command
+	if runCommand != runs.CommandPlan && runCommand != runs.CommandApply && runCommand != runs.CommandDriftDetection {
+		return errors.New("plan artifact has no active plan-capable Run")
 	}
 	project := h.project(ctx)
 	if project == nil {

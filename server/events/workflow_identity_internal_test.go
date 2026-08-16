@@ -7,7 +7,9 @@ import (
 	"regexp"
 	"testing"
 
+	"github.com/hashicorp/go-version"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
+	"github.com/runatlantis/atlantis/server/core/terraform"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,4 +31,25 @@ func TestResolvedWorkflowIdentityIsStableAndConfigurationSensitive(t *testing.T)
 	changed = cfg
 	changed.ApplyRequirements = []string{"approved", "mergeable"}
 	require.NotEqual(t, first, resolvedWorkflowIdentity(changed))
+}
+
+func TestResolvedWorkflowIdentityIncludesEffectiveTerraformDefaults(t *testing.T) {
+	cfg := valid.MergedProjectCfg{
+		Name: "network", RepoRelDir: "network", Workspace: "default",
+		Workflow: valid.Workflow{Name: "default"},
+	}
+	terraformVersion, err := version.NewVersion("1.11.1")
+	require.NoError(t, err)
+	applyTerraformDefaults(&cfg, terraform.NewDistributionTerraform(), terraformVersion)
+	terraformIdentity := resolvedWorkflowIdentity(cfg)
+
+	opentofuVersion, err := version.NewVersion("1.9.0")
+	require.NoError(t, err)
+	cfg.TerraformDistribution = nil
+	cfg.TerraformVersion = nil
+	applyTerraformDefaults(&cfg, terraform.NewDistributionOpenTofu(), opentofuVersion)
+
+	require.NotEqual(t, terraformIdentity, resolvedWorkflowIdentity(cfg))
+	require.Equal(t, "opentofu", *cfg.TerraformDistribution)
+	require.Equal(t, "1.9.0", cfg.TerraformVersion.String())
 }

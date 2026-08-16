@@ -591,6 +591,7 @@ type recordingRunWriter struct {
 	takeoverErr          error
 	artifactUpdates      []runs.ProjectPlanArtifactUpdate
 	artifactResult       runs.PlanArtifactExpectation
+	artifactLookup       runs.PlanArtifactLookup
 	artifactErr          error
 }
 
@@ -767,6 +768,7 @@ func (w *recordingRunWriter) RecordProjectPlanArtifact(_ context.Context, update
 	return nil
 }
 
-func (w *recordingRunWriter) FindPlanArtifact(context.Context, runs.PlanArtifactLookup) (runs.PlanArtifactExpectation, error) {
+func (w *recordingRunWriter) FindPlanArtifact(_ context.Context, lookup runs.PlanArtifactLookup) (runs.PlanArtifactExpectation, error) {
+	w.artifactLookup = lookup
 	return w.artifactResult, w.artifactErr
 }

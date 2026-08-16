@@ -210,4 +210,5 @@ type Store interface {
 	Writer
 	Reader
 	Retainer
+	ExecutionStore
 }

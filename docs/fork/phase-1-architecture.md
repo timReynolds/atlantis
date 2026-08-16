@@ -68,7 +68,7 @@ The read-only, server-rendered history surface follows existing Atlantis UI conv
 - `/runs/{run-id}/projects/{project-id}` provides summary counts, artifact metadata, and paginated typed output.
 - `/audit` provides repository, pull request, actor, event, and date-range filters.
 
-When authenticated durable history is enabled, non-verbose VCS comments for commands returning 50 or more project results become bounded summaries. The summary retains aggregate success, unchanged, and failure counts plus existing plan apply/unlock instructions, and links to the authenticated Run page. Smaller runs, verbose requests, and deployments without authenticated history keep the upstream renderer unchanged. Existing `hide-unchanged-plan-comments`, `hide-prev-plan-comments`, and repository `silence_pr_comments` behavior is applied first.
+When authenticated durable history is enabled, non-verbose VCS comments for commands returning 50 or more project results become bounded summaries. The summary retains aggregate success, unchanged, and failure counts plus existing plan apply/unlock instructions, and links to the authenticated Run page. Smaller runs, verbose requests, and deployments without authenticated history keep the upstream renderer unchanged. Existing `hide-unchanged-plan-comments`, `hide-prev-plan-comments`, and repository `silence_pr_comments` behavior is applied first. Successful `import` and `state rm` commands are deliberate exceptions: they always use the standard renderer so destructive-command output and operator guidance remain visible, even when that produces an unbounded comment.
 
 ## Initial relational model
 

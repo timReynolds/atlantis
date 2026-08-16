@@ -29,7 +29,7 @@ func TestStoreDoesNotPersistPlanOutput(t *testing.T) {
 		},
 		PlanOutput: "sensitive plan text", LastChecked: checkedAt, Error: "partial failure",
 	}
-	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO drift_status")).
+	mock.ExpectQuery(regexp.QuoteMeta("WITH stored AS (")).
 		WithArgs(
 			driftIdentityDigest("example/infrastructure", projectDrift),
 			digestValues("example/infrastructure"),
@@ -37,7 +37,7 @@ func TestStoreDoesNotPersistPlanOutput(t *testing.T) {
 			"main", "main", "deadbeef", "detection-1", true, 1, 2, 3, 4, 5,
 			"1 to add", true, "partial failure", normalizeTime(checkedAt),
 		).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+		WillReturnRows(sqlmock.NewRows([]string{"stored", "identity_matches"}).AddRow(true, true))
 
 	store := New(db, time.Second)
 	require.NoError(t, store.Store("example/infrastructure", projectDrift))
@@ -49,11 +49,23 @@ func TestStoreRejectsIdentityDigestCollision(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 	projectDrift := models.ProjectDrift{ProjectName: "network", Ref: "main", LastChecked: time.Now()}
-	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO drift_status")).
-		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(regexp.QuoteMeta("WITH stored AS (")).
+		WillReturnRows(sqlmock.NewRows([]string{"stored", "identity_matches"}).AddRow(false, false))
 
 	err = New(db, time.Second).Store("example/infrastructure", projectDrift)
 	require.EqualError(t, err, "storing PostgreSQL drift status: identity digest collision")
+}
+
+func TestStoreIgnoresOlderResultForSameIdentity(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	projectDrift := models.ProjectDrift{ProjectName: "network", Ref: "main", LastChecked: time.Now()}
+	mock.ExpectQuery(regexp.QuoteMeta("WITH stored AS (")).
+		WillReturnRows(sqlmock.NewRows([]string{"stored", "identity_matches"}).AddRow(false, true))
+
+	require.NoError(t, New(db, time.Second).Store("example/infrastructure", projectDrift))
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestBuildWherePreservesWildcardAndExactSemantics(t *testing.T) {

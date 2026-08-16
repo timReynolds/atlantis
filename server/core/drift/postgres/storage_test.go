@@ -85,6 +85,16 @@ func TestStorageConformance(t *testing.T) {
 	require.Len(t, results, 1)
 	require.False(t, results[0].Drift.HasDrift, "same identity must overwrite latest state")
 
+	stale := first
+	stale.Drift = models.DriftSummary{HasDrift: true, Summary: "stale drift"}
+	stale.LastChecked = checkedAt.Add(time.Second)
+	require.NoError(t, storage.Store("example/infrastructure", stale))
+	results, err = storage.Get("example/infrastructure", drift.GetOptions{ProjectName: "network"})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.False(t, results[0].Drift.HasDrift, "older concurrent result must not overwrite latest state")
+	require.Equal(t, updated.LastChecked, results[0].LastChecked)
+
 	all, err := storage.GetAll()
 	require.NoError(t, err)
 	require.Len(t, all["example/infrastructure"], 2)

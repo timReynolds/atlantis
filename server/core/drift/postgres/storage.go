@@ -40,18 +40,20 @@ func New(db *sql.DB, operationTimeout time.Duration) *Storage {
 func (s *Storage) Store(repository string, projectDrift models.ProjectDrift) error {
 	ctx, cancel := s.operationContext()
 	defer cancel()
-	result, err := s.db.ExecContext(ctx, `
-INSERT INTO drift_status (
+	var stored, identityMatches bool
+	err := s.db.QueryRowContext(ctx, `
+WITH stored AS (
+  INSERT INTO drift_status (
     identity_hash, repository_hash,
     repository, project_name, directory, workspace, ref, base_branch,
     resolved_commit, detection_id, has_drift, additions, changes,
     destructions, imports, forgets, summary, changes_outside, error, last_checked
-) VALUES (
+  ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
-)
-ON CONFLICT (identity_hash)
-DO UPDATE SET
+  )
+  ON CONFLICT (identity_hash)
+  DO UPDATE SET
     resolved_commit = EXCLUDED.resolved_commit,
     detection_id = EXCLUDED.detection_id,
     has_drift = EXCLUDED.has_drift,
@@ -64,12 +66,27 @@ DO UPDATE SET
     changes_outside = EXCLUDED.changes_outside,
     error = EXCLUDED.error,
     last_checked = EXCLUDED.last_checked
-WHERE drift_status.repository = EXCLUDED.repository
-  AND drift_status.project_name = EXCLUDED.project_name
-  AND drift_status.directory = EXCLUDED.directory
-  AND drift_status.workspace = EXCLUDED.workspace
-  AND drift_status.ref = EXCLUDED.ref
-  AND drift_status.base_branch = EXCLUDED.base_branch`,
+	WHERE drift_status.repository = EXCLUDED.repository
+	  AND drift_status.project_name = EXCLUDED.project_name
+	  AND drift_status.directory = EXCLUDED.directory
+	  AND drift_status.workspace = EXCLUDED.workspace
+	  AND drift_status.ref = EXCLUDED.ref
+	  AND drift_status.base_branch = EXCLUDED.base_branch
+	  AND drift_status.last_checked <= EXCLUDED.last_checked
+	RETURNING TRUE
+)
+SELECT
+  EXISTS (SELECT 1 FROM stored),
+  EXISTS (
+    SELECT 1 FROM drift_status
+    WHERE identity_hash = $1
+      AND repository = $3
+      AND project_name = $4
+      AND directory = $5
+      AND workspace = $6
+      AND ref = $7
+      AND base_branch = $8
+  )`,
 		driftIdentityDigest(repository, projectDrift),
 		digestValues(repository),
 		repository,
@@ -90,15 +107,11 @@ WHERE drift_status.repository = EXCLUDED.repository
 		projectDrift.Drift.ChangesOutside,
 		projectDrift.Error,
 		normalizeTime(projectDrift.LastChecked),
-	)
+	).Scan(&stored, &identityMatches)
 	if err != nil {
 		return fmt.Errorf("storing PostgreSQL drift status: %w", err)
 	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("checking stored PostgreSQL drift status: %w", err)
-	}
-	if affected != 1 {
+	if !stored && !identityMatches {
 		return fmt.Errorf("storing PostgreSQL drift status: identity digest collision")
 	}
 	return nil

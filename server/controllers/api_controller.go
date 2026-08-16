@@ -1814,7 +1814,11 @@ func (a *APIController) GetRemediationResult(w http.ResponseWriter, r *http.Requ
 	// Get the result only after the requested repository has been authorized.
 	result, err := a.RemediationService.GetResult(id)
 	if err != nil {
-		responder.NotFound(w, r, fmt.Sprintf("remediation result not found: %v", err))
+		if errors.Is(err, drift.ErrRemediationResultNotFound) {
+			responder.NotFound(w, r, err.Error())
+			return
+		}
+		responder.InternalError(w, r, err)
 		return
 	}
 	if !remediationResultMatchesRepo(result, baseRepo.ID(), repository) {
@@ -2006,7 +2010,12 @@ func driftProjectsFromCommandResult(result *command.Result, ref, baseBranch, res
 			continue
 		}
 		projectDrift := newProjectDriftFromResult(pr, ref, baseBranch, resolvedCommit, detectionID)
-		indexByIdentity[newDriftProjectIdentity(projectDrift)] = len(projects)
+		identity := newDriftProjectIdentity(projectDrift)
+		if idx, ok := indexByIdentity[identity]; ok {
+			projects[idx] = projectDrift
+			continue
+		}
+		indexByIdentity[identity] = len(projects)
 		projects = append(projects, projectDrift)
 	}
 

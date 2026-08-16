@@ -3571,7 +3571,7 @@ func TestAPIController_GetRemediationResult_NotFound(t *testing.T) {
 	ac, _, _ := setup(t)
 
 	remediationService := driftmocks.NewMockRemediationService()
-	When(remediationService.GetResult(Eq("nonexistent-id"))).ThenReturn(nil, fmt.Errorf("remediation result not found: nonexistent-id"))
+	When(remediationService.GetResult(Eq("nonexistent-id"))).ThenReturn(nil, fmt.Errorf("%w: nonexistent-id", drift.ErrRemediationResultNotFound))
 	ac.RemediationService = remediationService
 
 	req, _ := http.NewRequest("GET", "/api/drift/remediate/nonexistent-id?repository=owner/repo&type=Github", nil)
@@ -3585,6 +3585,25 @@ func TestAPIController_GetRemediationResult_NotFound(t *testing.T) {
 	response, _ := io.ReadAll(w.Result().Body)
 	apiErr := parseAPIError(t, response)
 	Equals(t, controllers.ErrCodeNotFound, apiErr.Code)
+}
+
+func TestAPIController_GetRemediationResult_StoreFailure(t *testing.T) {
+	ac, _, _ := setup(t)
+
+	remediationService := driftmocks.NewMockRemediationService()
+	When(remediationService.GetResult(Eq("test-id"))).ThenReturn(nil, errors.New("store unavailable"))
+	ac.RemediationService = remediationService
+
+	req, _ := http.NewRequest("GET", "/api/drift/remediate/test-id?repository=owner/repo&type=Github", nil)
+	req = mux.SetURLVars(req, map[string]string{"id": "test-id"})
+	req.Header.Set(atlantisTokenHeader, atlantisToken)
+	w := httptest.NewRecorder()
+	ac.GetRemediationResult(w, req)
+
+	Equals(t, http.StatusInternalServerError, w.Code)
+	response, _ := io.ReadAll(w.Result().Body)
+	apiErr := parseAPIError(t, response)
+	Equals(t, controllers.ErrCodeInternal, apiErr.Code)
 }
 
 func TestAPIController_GetRemediationResult_RequiresRepositoryScope(t *testing.T) {

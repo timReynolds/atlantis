@@ -48,6 +48,11 @@ func TestInMemoryRemediationResultStoreDefensiveCopies(t *testing.T) {
 	require.Equal(t, "network", again.Projects[0].ProjectName)
 }
 
+func TestInMemoryRemediationResultStoreReturnsTypedNotFound(t *testing.T) {
+	_, err := drift.NewInMemoryRemediationResultStore().GetResult("missing")
+	require.ErrorIs(t, err, drift.ErrRemediationResultNotFound)
+}
+
 func TestRemediationServiceUsesPreallocatedRunID(t *testing.T) {
 	store := drift.NewInMemoryRemediationResultStore()
 	service := drift.NewRemediationService(nil, store)

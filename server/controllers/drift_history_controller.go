@@ -152,8 +152,12 @@ func (c *DriftHistoryController) GetRemediation(w http.ResponseWriter, r *http.R
 		return
 	}
 	result, err := c.Remediations.GetResult(id)
-	if err != nil {
+	if errors.Is(err, drift.ErrRemediationResultNotFound) {
 		c.respondError(w, r, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
+		c.respondError(w, r, http.StatusInternalServerError, err)
 		return
 	}
 	projects := make([]web_templates.DriftRemediationProject, 0, len(result.Projects))

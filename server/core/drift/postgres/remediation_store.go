@@ -118,7 +118,7 @@ FROM drift_remediations WHERE id = $1`, id).Scan(
 		&result.TotalProjects, &result.SuccessCount, &result.FailureCount, &result.Error,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("remediation result not found: %s", id)
+		return nil, fmt.Errorf("%w: %s", drift.ErrRemediationResultNotFound, id)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("querying PostgreSQL remediation: %w", err)

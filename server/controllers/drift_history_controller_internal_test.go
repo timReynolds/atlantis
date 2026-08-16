@@ -5,6 +5,7 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -111,6 +112,28 @@ func TestDriftHistoryControllerRemediationOmitsRawOutput(t *testing.T) {
 	require.Equal(t, "/runs/"+string(id), data.RunPath)
 }
 
+func TestDriftHistoryControllerDistinguishesMissingRemediationFromStoreFailure(t *testing.T) {
+	id := mustRunHistoryID(t)
+	request := mux.SetURLVars(httptest.NewRequest(http.MethodGet, "/drift/remediations/id", nil), map[string]string{
+		"remediation-id": string(id),
+	})
+	request.SetBasicAuth("operator", "password")
+
+	missing := testDriftHistoryController(t, &recordingDriftHistoryReader{}, drift.NewInMemoryRemediationResultStore())
+	missing.WebAuthentication = true
+	missingRecorder := httptest.NewRecorder()
+	missing.GetRemediation(missingRecorder, request)
+	require.Equal(t, http.StatusNotFound, missingRecorder.Code)
+
+	unavailable := testDriftHistoryController(t, &recordingDriftHistoryReader{}, errorRemediationStore{
+		err: errors.New("store unavailable"),
+	})
+	unavailable.WebAuthentication = true
+	unavailableRecorder := httptest.NewRecorder()
+	unavailable.GetRemediation(unavailableRecorder, request)
+	require.Equal(t, http.StatusInternalServerError, unavailableRecorder.Code)
+}
+
 func testDriftHistoryController(t *testing.T, reader drift.HistoryReader, remediationStore drift.RemediationResultStore) *DriftHistoryController {
 	t.Helper()
 	list := &recordingHistoryTemplate{}
@@ -161,3 +184,21 @@ func (r *recordingDriftHistoryReader) GetDetection(context.Context, string, drif
 }
 
 var _ drift.HistoryReader = (*recordingDriftHistoryReader)(nil)
+
+type errorRemediationStore struct {
+	err error
+}
+
+func (s errorRemediationStore) Put(*models.RemediationResult) error {
+	return s.err
+}
+
+func (s errorRemediationStore) GetResult(string) (*models.RemediationResult, error) {
+	return nil, s.err
+}
+
+func (s errorRemediationStore) ListResults(string, int) ([]*models.RemediationResult, error) {
+	return nil, s.err
+}
+
+var _ drift.RemediationResultStore = errorRemediationStore{}

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/runatlantis/atlantis/server/core/drift"
+	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/stretchr/testify/require"
 )
@@ -51,4 +52,26 @@ func TestNewDriftDetectionRecordMarksRunLevelFailure(t *testing.T) {
 
 	require.Equal(t, drift.DetectionStatusFailed, record.Run.Status)
 	require.Equal(t, drift.DetectionOutcomeClean, record.Projects[0].Outcome)
+}
+
+func TestDriftProjectsFromCommandResultDeduplicatesProjectIdentity(t *testing.T) {
+	result := &command.Result{ProjectResults: []command.ProjectResult{
+		{
+			Command: command.Plan, ProjectName: "network", RepoRelDir: "terraform/network",
+			Workspace: "production", ProjectCommandOutput: command.ProjectCommandOutput{
+				PlanSuccess: &models.PlanSuccess{TerraformOutput: "stale plan"},
+			},
+		},
+		{
+			Command: command.Plan, ProjectName: "network", RepoRelDir: "terraform/network",
+			Workspace: "production", ProjectCommandOutput: command.ProjectCommandOutput{
+				Failure: "latest execution failed",
+			},
+		},
+	}}
+
+	projects := driftProjectsFromCommandResult(result, "main", "main", "deadbeef", "detection-1")
+
+	require.Len(t, projects, 1)
+	require.Equal(t, "latest execution failed", projects[0].Error)
 }

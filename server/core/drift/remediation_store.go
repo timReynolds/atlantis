@@ -4,12 +4,16 @@
 package drift
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
 
 	"github.com/runatlantis/atlantis/server/events/models"
 )
+
+// ErrRemediationResultNotFound is returned when a remediation ID is unknown.
+var ErrRemediationResultNotFound = errors.New("remediation result not found")
 
 // RemediationResultStore owns remediation result persistence independently of
 // latest-state drift storage.
@@ -54,7 +58,7 @@ func (s *InMemoryRemediationResultStore) GetResult(id string) (*models.Remediati
 	defer s.mu.RUnlock()
 	result, ok := s.results[id]
 	if !ok {
-		return nil, fmt.Errorf("remediation result not found: %s", id)
+		return nil, fmt.Errorf("%w: %s", ErrRemediationResultNotFound, id)
 	}
 	return cloneRemediationResult(result), nil
 }

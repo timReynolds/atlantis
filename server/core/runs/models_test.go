@@ -59,6 +59,10 @@ func TestRunValidate(t *testing.T) {
 		Metadata:   runs.Metadata(`{"source":"comment"}`),
 	}
 	Ok(t, run.Validate())
+	invalidPull := 0
+	run.PullNumber = &invalidPull
+	Assert(t, run.Validate() != nil, "nonpositive run pull number must be rejected")
+	run.PullNumber = nil
 
 	run.Status = runs.StatusSucceeded
 	Assert(t, run.Validate() != nil, "completed run without completed time must be rejected")
@@ -69,6 +73,20 @@ func TestRunValidate(t *testing.T) {
 
 	run.Metadata = runs.Metadata(`[]`)
 	Assert(t, run.Validate() != nil, "metadata arrays must be rejected")
+}
+
+func TestAuditEventValidateRejectsNonpositivePullNumber(t *testing.T) {
+	id, err := runs.NewID()
+	Ok(t, err)
+	invalidPull := -1
+	event := runs.AuditEvent{
+		ID: id, Repository: "runatlantis/atlantis", PullNumber: &invalidPull,
+		EventType: "plan.requested", CreatedAt: time.Now(),
+	}
+
+	Assert(t, event.Validate() != nil, "nonpositive audit pull number must be rejected")
+	event.PullNumber = nil
+	Ok(t, event.Validate())
 }
 
 func TestProjectRunValidatePreservesAllPlanCounts(t *testing.T) {

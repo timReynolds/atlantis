@@ -103,6 +103,9 @@ func (r Run) Validate() error {
 	if r.Repository == "" {
 		return fmt.Errorf("repository is required")
 	}
+	if err := validatePullNumber(r.PullNumber); err != nil {
+		return err
+	}
 	if !r.Command.valid() {
 		return fmt.Errorf("unknown run command %q", r.Command)
 	}
@@ -258,6 +261,9 @@ func (a AuditEvent) Validate() error {
 	if a.Repository == "" {
 		return fmt.Errorf("repository is required")
 	}
+	if err := validatePullNumber(a.PullNumber); err != nil {
+		return err
+	}
 	if a.EventType == "" {
 		return fmt.Errorf("event type is required")
 	}
@@ -265,6 +271,13 @@ func (a AuditEvent) Validate() error {
 		return fmt.Errorf("created time is required")
 	}
 	return validateMetadata(a.Metadata)
+}
+
+func validatePullNumber(number *int) error {
+	if number != nil && *number <= 0 {
+		return fmt.Errorf("pull number must be positive")
+	}
+	return nil
 }
 
 func (c Command) valid() bool {

@@ -76,6 +76,7 @@ func TestStoreConformance(t *testing.T) {
 	projectCompletion := runs.ProjectRunCompletion{
 		ID: projectRunID, Status: runs.StatusSucceeded, Additions: 1, Changes: 2,
 		CompletedAt: completedAt,
+		Metadata:    runs.Metadata(`{"phases":["plan","policy_check"]}`),
 		PlanArtifact: &runs.ArtifactReference{
 			Key: "plans/example/17/network.tfplan", Checksum: "sha256:abc",
 			CreatedAt: artifactCreatedAt, ExpiresAt: &artifactExpiresAt,
@@ -103,6 +104,7 @@ func TestStoreConformance(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, projectCompletion.Additions, storedProject.Additions)
 	require.Equal(t, projectCompletion.PlanArtifact, storedProject.PlanArtifact)
+	require.JSONEq(t, string(projectCompletion.Metadata), string(storedProject.Metadata))
 
 	runPage, err := store.ListRuns(ctx, runs.RunFilter{
 		Repository: run.Repository, PullNumber: &pull,

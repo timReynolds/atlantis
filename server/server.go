@@ -450,6 +450,21 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		ProjectJobsViewRouteName:  ProjectJobsViewRouteName,
 		Underlying:                underlyingRouter,
 	}
+	runStore, runStoreHealth, runStoreCloser, err := initializeRunStore(userConfig, logger)
+	if err != nil {
+		return nil, err
+	}
+	closeRunStoreOnError := runStoreCloser != nil
+	defer func() {
+		if closeRunStoreOnError {
+			runStoreCloser.Close() // nolint: errcheck
+		}
+	}()
+	runStoreRetention := newRunStoreRetentionService(runStore, userConfig, logger)
+	var runHistory *events.RunHistory
+	if userConfig.RunStoreType == RunStorePostgres {
+		runHistory = events.NewRunHistory(runStore, logger)
+	}
 
 	var projectCmdOutputHandler jobs.ProjectCommandOutputHandler
 
@@ -462,6 +477,11 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 			projectCmdOutput,
 			logger,
 		)
+	}
+	if runHistory != nil {
+		persistentOutputHandler := jobs.NewPersistentProjectCommandOutputHandler(projectCmdOutputHandler, runStore, logger)
+		projectCmdOutputHandler = persistentOutputHandler
+		runHistory.SetOutputFinalizer(persistentOutputHandler)
 	}
 
 	distribution := terraform.NewDistribution(userConfig.DefaultTFDistribution)
@@ -724,6 +744,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	} else {
 		planStore = &runtime.LocalPlanStore{}
 	}
+	planStore = events.NewRunHistoryPlanStore(planStore, runHistory, logger)
 
 	deleteLockCommand.PlanStore = planStore
 
@@ -867,9 +888,10 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		ProjectCommandRunner: projectCommandRunner,
 		JobURLSetter:         jobs.NewJobURLSetter(router, commitStatusUpdater),
 	}
+	historyProjectCommandRunner := events.NewRunHistoryProjectCommandRunner(runHistory, projectOutputWrapper)
 	instrumentedProjectCmdRunner := events.NewInstrumentedProjectCommandRunner(
 		statsScope,
-		projectOutputWrapper,
+		historyProjectCommandRunner,
 	)
 
 	policyCheckCommandRunner := events.NewPolicyCheckCommandRunner(
@@ -979,13 +1001,13 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	)
 
 	commentCommandRunnerByCmd := map[command.Name]events.CommentCommandRunner{
-		command.Plan:            planCommandRunner,
-		command.Apply:           applyCommandRunner,
+		command.Plan:            events.NewRunHistoryCommandRunner(runHistory, planCommandRunner, runs.CommandPlan),
+		command.Apply:           events.NewRunHistoryCommandRunner(runHistory, applyCommandRunner, runs.CommandApply),
 		command.ApprovePolicies: approvePoliciesCommandRunner,
-		command.Unlock:          unlockCommandRunner,
+		command.Unlock:          events.NewRunHistoryCommandRunner(runHistory, unlockCommandRunner, runs.CommandUnlock),
 		command.Version:         versionCommandRunner,
-		command.Import:          importCommandRunner,
-		command.State:           stateCommandRunner,
+		command.Import:          events.NewRunHistoryCommandRunner(runHistory, importCommandRunner, runs.CommandImport),
+		command.State:           events.NewRunHistoryCommandRunner(runHistory, stateCommandRunner, runs.CommandStateRemove),
 		command.Cancel:          cancelCommandRunner,
 	}
 
@@ -1101,6 +1123,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		PullStatusFetcher:               database,
 		LivePullHeadFetcher:             livePullHeadFetcher,
 		SilenceVCSStatusNoProjects:      userConfig.SilenceVCSStatusNoProjects,
+		RunHistory:                      runHistory,
 	}
 
 	if userConfig.EnableDriftDetection {
@@ -1147,12 +1170,6 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		GithubHostname:      userConfig.GithubHostname,
 		GithubOrg:           userConfig.GithubOrg,
 	}
-	runStore, runStoreHealth, runStoreCloser, err := initializeRunStore(userConfig, logger)
-	if err != nil {
-		return nil, err
-	}
-	runStoreRetention := newRunStoreRetentionService(runStore, userConfig, logger)
-
 	server := &Server{
 		AtlantisVersion:                config.AtlantisVersion,
 		AtlantisURL:                    parsedURL,
@@ -1198,11 +1215,9 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 
 	err = validate.Struct(server)
 	if err != nil {
-		if runStoreCloser != nil {
-			runStoreCloser.Close() // nolint: errcheck
-		}
 		return nil, err
 	} else {
+		closeRunStoreOnError = false
 		return server, nil
 	}
 }

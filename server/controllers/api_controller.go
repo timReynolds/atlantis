@@ -25,6 +25,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/runatlantis/atlantis/server/core/drift"
 	"github.com/runatlantis/atlantis/server/core/locking"
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
@@ -53,6 +54,7 @@ type APIController struct {
 	ProjectPlanCommandRunner        events.ProjectPlanCommandRunner `validate:"required"`
 	ProjectPolicyCheckCommandRunner events.ProjectPolicyCheckCommandRunner
 	ProjectApplyCommandRunner       events.ProjectApplyCommandRunner `validate:"required"`
+	RunHistory                      *events.RunHistory
 	FailOnPreWorkflowHookError      bool
 	PreWorkflowHooksCommandRunner   events.PreWorkflowHooksCommandRunner  `validate:"required"`
 	PostWorkflowHooksCommandRunner  events.PostWorkflowHooksCommandRunner `validate:"required"`
@@ -294,18 +296,24 @@ func (a *APIController) Plan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer a.cleanupNonPRWorkingDir(ctx)
+	lifecycle := a.RunHistory.Begin(ctx, runs.CommandPlan, runs.TriggerAPI)
+	defer lifecycle.FinishRecovering()
 
 	result, err := a.apiPlan(request, ctx)
 	if err != nil {
+		lifecycle.Fail()
 		a.apiReportLegacyError(w, apiErrorStatusCode(err), err)
 		return
 	}
 	if !ctx.CommandSkipped {
 		defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+	} else {
+		lifecycle.Skip()
 	}
 
 	statusCode := http.StatusOK
 	if result.HasErrors() {
+		ctx.CommandHasErrors = true
 		statusCode = http.StatusInternalServerError
 	}
 	responder.writeJSON(w, statusCode, result)
@@ -327,16 +335,23 @@ func (a *APIController) Apply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer a.cleanupNonPRWorkingDir(ctx)
+	lifecycle := a.RunHistory.Begin(ctx, runs.CommandApply, runs.TriggerAPI)
+	defer lifecycle.FinishRecovering()
 
 	// We must first make the plan for all projects
 	result, err := a.apiPlan(request, ctx)
 	if err != nil {
+		lifecycle.Fail()
 		a.apiReportLegacyError(w, apiErrorStatusCode(err), err)
 		return
 	}
 	if ctx.CommandSkipped {
+		lifecycle.Skip()
 		responder.writeJSON(w, http.StatusOK, result)
 		return
+	}
+	if result.HasErrors() {
+		ctx.CommandHasErrors = true
 	}
 	defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
 
@@ -348,12 +363,14 @@ func (a *APIController) Apply(w http.ResponseWriter, r *http.Request) {
 	// We can now prepare and run the apply step
 	result, err = a.apiApply(request, ctx)
 	if err != nil {
+		lifecycle.Fail()
 		a.apiReportLegacyError(w, apiErrorStatusCode(err), err)
 		return
 	}
 
 	statusCode := http.StatusOK
 	if result.HasErrors() {
+		ctx.CommandHasErrors = true
 		statusCode = http.StatusInternalServerError
 	}
 	responder.writeJSON(w, statusCode, result)

@@ -10,6 +10,7 @@ import (
 
 	"github.com/hashicorp/go-version"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/logging"
 	tally "github.com/uber-go/tally/v4"
@@ -22,8 +23,12 @@ const (
 // ProjectContext defines the context for a plan or apply stage that will
 // be executed for a project.
 type ProjectContext struct {
-	CommandName Name
-	SubCommand  string
+	// RunID and ProjectRunID link execution to optional durable history. They
+	// are empty when durable history is disabled.
+	RunID        runs.ID
+	ProjectRunID runs.ID
+	CommandName  Name
+	SubCommand   string
 	// ApplyCmd is the command that users should run to apply this plan. If
 	// this is an apply then this will be empty.
 	ApplyCmd string

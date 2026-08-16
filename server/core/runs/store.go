@@ -50,6 +50,7 @@ type ProjectRunCompletion struct {
 	CompletedAt  time.Time
 	ErrorSummary string
 	PlanArtifact *ArtifactReference
+	Metadata     Metadata
 }
 
 // Validate checks completion invariants before a Store adapter writes them.
@@ -76,7 +77,7 @@ func (c ProjectRunCompletion) Validate() error {
 			return errors.New("plan artifact expiry precedes its created time")
 		}
 	}
-	return nil
+	return validateMetadata(c.Metadata)
 }
 
 // Writer is the execution-facing seam for durable run history. Implementations

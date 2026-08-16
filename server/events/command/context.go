@@ -4,6 +4,7 @@
 package command
 
 import (
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/logging"
 	tally "github.com/uber-go/tally/v4"
@@ -23,6 +24,9 @@ const (
 // Context represents the context of a command that should be executed
 // for a pull request.
 type Context struct {
+	// RunID links this command to optional durable run history. It is empty
+	// when durable history is disabled or the command is outside its scope.
+	RunID runs.ID
 	// HeadRepo is the repository that is getting merged into the BaseRepo.
 	// If the pull request branch is from the same repository then HeadRepo will
 	// be the same as BaseRepo.

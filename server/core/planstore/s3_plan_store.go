@@ -436,9 +436,15 @@ func (s *S3PlanStore) s3Key(ctx command.ProjectContext, planPath string) string 
 	return strings.Join(parts, "/")
 }
 
+// ArtifactKey returns the opaque object key used for plan metadata. Callers
+// must not derive S3 layout independently from the PlanStore.
+func (s *S3PlanStore) ArtifactKey(ctx command.ProjectContext, planPath string) string {
+	return s.s3Key(ctx, planPath)
+}
+
 // TestS3Key is exported for testing only.
 func (s *S3PlanStore) TestS3Key(ctx command.ProjectContext, planPath string) string {
-	return s.s3Key(ctx, planPath)
+	return s.ArtifactKey(ctx, planPath)
 }
 
 func (s *S3PlanStore) DeletePlanForProject(owner, repo string, pullNum int, workspace, repoRelDir, projectName string) error {

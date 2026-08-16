@@ -232,15 +232,16 @@ func (s *Store) CompleteProjectRun(ctx context.Context, completion runs.ProjectR
         SET status = $2, additions = $3, changes = $4, destructions = $5, imports = $6,
             forgets = $7, completed_at = $8, error_summary = $9,
             plan_artifact_key = $10, plan_artifact_checksum = $11,
-            plan_artifact_created_at = $12, plan_artifact_expires_at = $13
+            plan_artifact_created_at = $12, plan_artifact_expires_at = $13,
+            metadata = $14
         WHERE id = $1
-          AND ((status = $14 AND started_at IS NOT NULL) OR
-               (status = $15 AND $2 IN ($16, $17)))
+          AND ((status = $15 AND started_at IS NOT NULL) OR
+               (status = $16 AND $2 IN ($17, $18)))
           AND completed_at IS NULL`,
 		completion.ID, completion.Status, completion.Additions, completion.Changes,
 		completion.Destructions, completion.Imports, completion.Forgets, completion.CompletedAt,
 		completion.ErrorSummary, artifact.key, artifact.checksum, artifact.createdAt,
-		artifact.expiresAt, runs.StatusRunning, runs.StatusPending, runs.StatusSkipped,
+		artifact.expiresAt, []byte(completion.Metadata), runs.StatusRunning, runs.StatusPending, runs.StatusSkipped,
 		runs.StatusCancelled,
 	)
 	if err != nil {
@@ -421,6 +422,7 @@ func normalizeProjectRun(projectRun runs.ProjectRun) runs.ProjectRun {
 
 func normalizeProjectRunCompletion(completion runs.ProjectRunCompletion) runs.ProjectRunCompletion {
 	completion.CompletedAt = normalizeTime(completion.CompletedAt)
+	completion.Metadata = normalizeMetadata(completion.Metadata)
 	if completion.PlanArtifact != nil {
 		artifact := *completion.PlanArtifact
 		artifact.CreatedAt = normalizeTime(artifact.CreatedAt)
@@ -485,5 +487,6 @@ func projectCompletionMatches(projectRun runs.ProjectRun, completion runs.Projec
 		projectRun.Forgets == completion.Forgets &&
 		projectRun.CompletedAt != nil && projectRun.CompletedAt.Equal(completion.CompletedAt) &&
 		projectRun.ErrorSummary == completion.ErrorSummary &&
-		reflect.DeepEqual(projectRun.PlanArtifact, completion.PlanArtifact)
+		reflect.DeepEqual(projectRun.PlanArtifact, completion.PlanArtifact) &&
+		reflect.DeepEqual(projectRun.Metadata, completion.Metadata)
 }

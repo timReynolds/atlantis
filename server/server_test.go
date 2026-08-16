@@ -389,6 +389,8 @@ func TestSetupRoutes_APIRoutesRegistered(t *testing.T) {
 		{"GET", "/runs/019c0000-0000-7000-8000-000000000000/projects/019c0000-0000-7000-8000-000000000001"},
 		{"GET", "/repos/example/infrastructure"},
 		{"GET", "/repos/example/infrastructure/pulls/42"},
+		{"GET", "/repos/group/subgroup/infrastructure"},
+		{"GET", "/repos/group/subgroup/infrastructure/pulls/42"},
 		{"GET", "/audit"},
 	}
 

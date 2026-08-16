@@ -1268,8 +1268,8 @@ func (s *Server) SetupRoutes() {
 	s.Router.HandleFunc("/jobs/{job-id}/ws", s.JobsController.GetProjectJobsWS).Methods("GET")
 	if s.RunHistoryController != nil {
 		s.Router.HandleFunc("/runs", s.RunHistoryController.ListRuns).Methods("GET")
-		s.Router.HandleFunc("/repos/{owner}/{repo}", s.RunHistoryController.ListRuns).Methods("GET")
-		s.Router.HandleFunc("/repos/{owner}/{repo}/pulls/{pull-number}", s.RunHistoryController.ListRuns).Methods("GET")
+		s.Router.HandleFunc("/repos/{repository:.+}/pulls/{pull-number:[0-9]+}", s.RunHistoryController.ListRuns).Methods("GET")
+		s.Router.HandleFunc("/repos/{repository:.+}", s.RunHistoryController.ListRuns).Methods("GET")
 		s.Router.HandleFunc("/runs/{run-id}", s.RunHistoryController.GetRun).Methods("GET").Name(RunHistoryViewRouteName)
 		s.Router.HandleFunc("/runs/{run-id}/projects/{project-id}", s.RunHistoryController.GetProject).Methods("GET")
 		s.Router.HandleFunc("/audit", s.RunHistoryController.ListAudit).Methods("GET")

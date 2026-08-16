@@ -76,6 +76,22 @@ func TestRunHistoryControllerListsFilteredRuns(t *testing.T) {
 	require.NotContains(t, data.NextPath, "cursor=old")
 }
 
+func TestRunHistoryControllerPreservesNestedRepositoryNamespaces(t *testing.T) {
+	pull := 42
+	run := runs.Run{Repository: "group/subgroup/repo", PullNumber: &pull}
+	presented := presentRun(run)
+	require.Equal(t, "/repos/group/subgroup/repo", presented.RepositoryPath)
+	require.Equal(t, "/repos/group/subgroup/repo/pulls/42", presented.PullHistoryPath)
+
+	request := mux.SetURLVars(httptest.NewRequest(http.MethodGet, presented.PullHistoryPath, nil), map[string]string{
+		"repository": "group/subgroup/repo", "pull-number": "42",
+	})
+	filter, _, _, err := parseRunHistoryFilter(request)
+	require.NoError(t, err)
+	require.Equal(t, run.Repository, filter.Repository)
+	require.Equal(t, pull, *filter.PullNumber)
+}
+
 func TestRunHistoryControllerDoesNotExposeProjectOutputWithoutAuthentication(t *testing.T) {
 	reader := &recordingRunReader{failOnRead: true}
 	controller := testRunHistoryController(t, reader, &recordingHistoryTemplate{})

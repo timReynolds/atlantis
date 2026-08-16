@@ -32,6 +32,11 @@ func validateRunStoreConfig(userConfig UserConfig) error {
 		if strings.TrimSpace(userConfig.RunStorePostgresURL) == "" {
 			return errors.New("run store PostgreSQL URL is required")
 		}
+		if userConfig.WebBasicAuth &&
+			(strings.TrimSpace(userConfig.WebUsername) == "" || userConfig.WebUsername == DefaultWebUsername ||
+				strings.TrimSpace(userConfig.WebPassword) == "" || userConfig.WebPassword == DefaultWebPassword) {
+			return errors.New("postgres run history requires non-default web basic-auth credentials")
+		}
 	default:
 		return fmt.Errorf("unknown run store type %q", userConfig.RunStoreType)
 	}

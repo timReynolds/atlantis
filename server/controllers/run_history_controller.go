@@ -291,12 +291,11 @@ func parseRunHistoryFilter(r *http.Request) (runs.RunFilter, web_templates.RunHi
 	}
 	vars := mux.Vars(r)
 	title := "Run history"
-	if owner, hasOwner := vars["owner"]; hasOwner {
-		repo, hasRepo := vars["repo"]
-		if !hasRepo || owner == "" || repo == "" {
+	if repository, hasRepository := vars["repository"]; hasRepository {
+		if repository == "" {
 			return filter, presentation, title, errors.New("repository route is incomplete")
 		}
-		filter.Repository = owner + "/" + repo
+		filter.Repository = repository
 		presentation.Repository = filter.Repository
 		title = filter.Repository + " run history"
 	}
@@ -477,13 +476,28 @@ func presentRun(run runs.Run) web_templates.RunHistoryRun {
 	if json.Unmarshal(run.Metadata, &metadata) == nil {
 		item.PullURL = metadata.PullURL
 	}
-	if owner, repository, ok := strings.Cut(run.Repository, "/"); ok && owner != "" && repository != "" {
-		item.RepositoryPath = "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(repository)
+	if repositoryPath := repositoryHistoryPath(run.Repository); repositoryPath != "" {
+		item.RepositoryPath = repositoryPath
 		if item.PullNumber > 0 {
 			item.PullHistoryPath = item.RepositoryPath + "/pulls/" + strconv.Itoa(item.PullNumber)
 		}
 	}
 	return item
+}
+
+func repositoryHistoryPath(repository string) string {
+	parts := strings.Split(repository, "/")
+	if len(parts) == 0 {
+		return ""
+	}
+	escaped := make([]string, len(parts))
+	for i, part := range parts {
+		if part == "" {
+			return ""
+		}
+		escaped[i] = url.PathEscape(part)
+	}
+	return "/repos/" + strings.Join(escaped, "/")
 }
 
 func presentProject(project runs.ProjectRun) web_templates.RunHistoryProject {

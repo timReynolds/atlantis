@@ -27,6 +27,7 @@ func TestImportCommandRunner_Run(t *testing.T) {
 		projectCmds   []command.ProjectContext
 		expComment    string
 		expNoComment  bool
+		expHasErrors  bool
 	}{
 		{
 			name: "success with zero projects",
@@ -43,8 +44,9 @@ func TestImportCommandRunner_Run(t *testing.T) {
 				ApprovalStatus:  models.ApprovalStatus{IsApproved: true},
 				MergeableStatus: models.MergeableStatus{IsMergeable: true},
 			},
-			projectCmds: []command.ProjectContext{{}, {}},
-			expComment:  "**Import Failed**: import cannot run on multiple projects. please specify one project.",
+			projectCmds:  []command.ProjectContext{{}, {}},
+			expComment:   "**Import Failed**: import cannot run on multiple projects. please specify one project.",
+			expHasErrors: true,
 		},
 		{
 			name: "no comment with zero projects and silencing",
@@ -81,6 +83,7 @@ func TestImportCommandRunner_Run(t *testing.T) {
 			importCommandRunner.Run(ctx, cmd)
 
 			Assert(t, ctx.PullRequestStatus.MergeableStatus.IsMergeable == true, "PullRequestStatus must be set for import_requirements")
+			Equals(t, tt.expHasErrors, ctx.CommandHasErrors)
 			if tt.expNoComment {
 				vcsClient.VerifyWasCalled(Never()).CreateComment(
 					Any[logging.SimpleLogging](), Any[models.Repo](), Any[int](), Any[string](), Any[string]())

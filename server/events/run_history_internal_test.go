@@ -180,6 +180,18 @@ func TestRunHistoryLeavesRunIncompleteWhenFinalOutputCannotPersist(t *testing.T)
 	require.Empty(t, writer.runsCompleted, "the running record must remain visibly incomplete")
 }
 
+func TestRunHistoryDoesNotAuditCompletionWhenRunCompletionCannotPersist(t *testing.T) {
+	writer := &recordingRunWriter{completeRunErr: errors.New("store unavailable")}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+
+	lifecycle.Finish()
+
+	require.Empty(t, writer.runsCompleted, "the running record must remain visibly incomplete")
+	require.Equal(t, []string{"plan.requested"}, writer.auditTypes())
+}
+
 func TestRunLifecycleFinishRecoveringMarksPanicFailed(t *testing.T) {
 	writer := &recordingRunWriter{}
 	history := newTestRunHistory(t, writer)
@@ -229,6 +241,7 @@ type recordingRunWriter struct {
 	projectsCompleted  []runs.ProjectRunCompletion
 	output             []runs.OutputChunk
 	audit              []runs.AuditEvent
+	completeRunErr     error
 	completeProjectErr error
 }
 
@@ -242,6 +255,9 @@ func (w *recordingRunWriter) CreateRun(_ context.Context, run runs.Run) error {
 func (w *recordingRunWriter) StartRun(context.Context, runs.ID, time.Time) error { return nil }
 
 func (w *recordingRunWriter) CompleteRun(_ context.Context, completion runs.RunCompletion) error {
+	if w.completeRunErr != nil {
+		return w.completeRunErr
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.runsCompleted = append(w.runsCompleted, completion)

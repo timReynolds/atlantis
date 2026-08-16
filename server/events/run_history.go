@@ -191,6 +191,7 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 		})
 	}); err != nil {
 		h.logError(lifecycle.ctx.Log, "completing run history", err)
+		return
 	}
 	h.appendAudit(lifecycle.ctx.Log, session, string(session.run.Command)+".completed", map[string]any{
 		"status": status, "projects_succeeded": succeeded, "projects_failed": failed,

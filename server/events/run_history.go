@@ -479,7 +479,11 @@ func (h *RunHistory) RecordPlanArtifact(ctx command.ProjectContext, artifact run
 		return
 	}
 	value, ok := h.sessions.Load(ctx.RunID)
-	if !ok || value.(*runSession).run.Command != runs.CommandPlan {
+	if !ok {
+		return
+	}
+	commandName := value.(*runSession).run.Command
+	if commandName != runs.CommandPlan && commandName != runs.CommandDriftDetection {
 		return
 	}
 	project := h.project(ctx)

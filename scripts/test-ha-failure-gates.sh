@@ -21,14 +21,14 @@ docker run --rm -d \
   -e POSTGRES_PASSWORD=atlantis_test \
   -e POSTGRES_DB=atlantis_test \
   -p 127.0.0.1::5432 \
-  postgres:16-alpine >/dev/null
+  postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685 >/dev/null
 docker run --rm -d \
   --name "${gate_minio}" \
   --network "${gate_network}" \
   -e MINIO_ROOT_USER=minioadmin \
   -e MINIO_ROOT_PASSWORD=minioadmin \
   -p 127.0.0.1::9000 \
-  minio/minio:latest server /data >/dev/null
+  minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data >/dev/null
 
 for attempt in $(seq 1 30); do
   if docker exec "${gate_postgres}" pg_isready -U postgres -d atlantis_test >/dev/null 2>&1 && \
@@ -45,7 +45,8 @@ done
 docker run --rm \
   --network "${gate_network}" \
   -e "MC_HOST_gate=http://minioadmin:minioadmin@${gate_minio}:9000" \
-  minio/mc:latest mb --ignore-existing "gate/${gate_bucket}" >/dev/null
+  minio/mc:latest@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 \
+  mb --ignore-existing "gate/${gate_bucket}" >/dev/null
 
 postgres_port="$(docker port "${gate_postgres}" 5432/tcp | sed -E 's/.*:([0-9]+)$/\1/')"
 minio_port="$(docker port "${gate_minio}" 9000/tcp | sed -E 's/.*:([0-9]+)$/\1/')"

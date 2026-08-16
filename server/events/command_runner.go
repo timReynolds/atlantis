@@ -621,7 +621,7 @@ func (c *DefaultCommandRunner) runCommentCommand(baseRepo models.Repo, maybeHead
 		return
 	}
 	cmdRunner.Run(ctx, cmd)
-	if ctx.CommandSkipped {
+	if ctx.CommandSkipped || ctx.CommandSuperseded {
 		return
 	}
 

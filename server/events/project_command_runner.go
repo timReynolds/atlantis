@@ -183,7 +183,7 @@ type ProjectOutputWrapper struct {
 
 func (p *ProjectOutputWrapper) Plan(ctx command.ProjectContext) command.ProjectCommandOutput {
 	result := p.updateProjectPRStatus(command.Plan, ctx, p.ProjectCommandRunner.Plan)
-	if !ctx.SuppressJobOutput {
+	if !ctx.SuppressJobOutput && !result.OwnershipLost {
 		p.JobMessageSender.Send(ctx, "", OperationComplete)
 	}
 	return result
@@ -191,7 +191,7 @@ func (p *ProjectOutputWrapper) Plan(ctx command.ProjectContext) command.ProjectC
 
 func (p *ProjectOutputWrapper) Apply(ctx command.ProjectContext) command.ProjectCommandOutput {
 	result := p.updateProjectPRStatus(command.Apply, ctx, p.ProjectCommandRunner.Apply)
-	if !ctx.SuppressJobOutput {
+	if !ctx.SuppressJobOutput && !result.OwnershipLost {
 		p.JobMessageSender.Send(ctx, "", OperationComplete)
 	}
 	return result
@@ -211,6 +211,17 @@ func (p *ProjectOutputWrapper) updateProjectPRStatus(commandName command.Name, c
 
 	// ensures we are differentiating between project level command and overall command
 	result := execute(ctx)
+	if result.OwnershipLost {
+		return result
+	}
+	// Fence publication as well as execution. A long Terraform command can
+	// finish after this replica has lost the pull ownership lease.
+	if err := admitProjectExecution(ctx); err != nil {
+		result = projectAdmissionFailure(err)
+		if result.OwnershipLost {
+			return result
+		}
+	}
 
 	if result.Error != nil || result.Failure != "" {
 		if err := p.JobURLSetter.SetJobURLWithStatus(ctx, commandName, models.FailedCommitStatus, &result); err != nil {
@@ -364,9 +375,10 @@ func (p *DefaultProjectCommandRunner) workingDirLockMetadata(ctx command.Project
 func (p *DefaultProjectCommandRunner) Plan(ctx command.ProjectContext) command.ProjectCommandOutput {
 	planSuccess, failure, err := p.doPlan(ctx)
 	return command.ProjectCommandOutput{
-		PlanSuccess: planSuccess,
-		Error:       err,
-		Failure:     failure,
+		PlanSuccess:   planSuccess,
+		Error:         err,
+		Failure:       failure,
+		OwnershipLost: errors.Is(err, ErrOwnershipChanged),
 	}
 }
 
@@ -377,6 +389,7 @@ func (p *DefaultProjectCommandRunner) PolicyCheck(ctx command.ProjectContext) co
 		PolicyCheckResults: policySuccess,
 		Error:              err,
 		Failure:            failure,
+		OwnershipLost:      errors.Is(err, ErrOwnershipChanged),
 	}
 }
 
@@ -388,6 +401,7 @@ func (p *DefaultProjectCommandRunner) Apply(ctx command.ProjectContext) command.
 		Error:           err,
 		ApplySuccess:    applyOut,
 		ApplySuccessURL: applyURL,
+		OwnershipLost:   errors.Is(err, ErrOwnershipChanged),
 	}
 }
 
@@ -397,6 +411,7 @@ func (p *DefaultProjectCommandRunner) ApprovePolicies(ctx command.ProjectContext
 		Failure:            failure,
 		Error:              err,
 		PolicyCheckResults: approvedOut,
+		OwnershipLost:      errors.Is(err, ErrOwnershipChanged),
 	}
 }
 
@@ -406,6 +421,7 @@ func (p *DefaultProjectCommandRunner) Version(ctx command.ProjectContext) comman
 		Failure:        failure,
 		Error:          err,
 		VersionSuccess: versionOut,
+		OwnershipLost:  errors.Is(err, ErrOwnershipChanged),
 	}
 }
 
@@ -416,6 +432,7 @@ func (p *DefaultProjectCommandRunner) Import(ctx command.ProjectContext) command
 		ImportSuccess: importSuccess,
 		Error:         err,
 		Failure:       failure,
+		OwnershipLost: errors.Is(err, ErrOwnershipChanged),
 	}
 }
 
@@ -426,6 +443,7 @@ func (p *DefaultProjectCommandRunner) StateRm(ctx command.ProjectContext) comman
 		StateRmSuccess: stateRmSuccess,
 		Error:          err,
 		Failure:        failure,
+		OwnershipLost:  errors.Is(err, ErrOwnershipChanged),
 	}
 }
 
@@ -446,6 +464,9 @@ func (p *DefaultProjectCommandRunner) doApprovePolicies(ctx command.ProjectConte
 		return nil, "", err
 	}
 	defer unlockFn()
+	if err := p.admitExecution(ctx); err != nil {
+		return nil, "", err
+	}
 
 	teams := []string{}
 
@@ -982,7 +1003,10 @@ func (p *DefaultProjectCommandRunner) doApply(ctx command.ProjectContext) (apply
 		}
 	}
 
-	if !ctx.SuppressApplyWebhooks && p.Webhooks != nil {
+	if err == nil {
+		err = p.admitExecution(ctx)
+	}
+	if !errors.Is(err, ErrOwnershipChanged) && !ctx.SuppressApplyWebhooks && p.Webhooks != nil {
 		p.Webhooks.Send(ctx.Log, webhooks.ApplyResult{ // nolint: errcheck
 			Workspace:   ctx.Workspace,
 			User:        ctx.User,
@@ -1026,7 +1050,7 @@ func (p *DefaultProjectCommandRunner) doVersion(ctx command.ProjectContext) (ver
 
 	outputs, err := p.runSteps(ctx.Steps, ctx, absPath)
 	if err != nil {
-		return "", "", fmt.Errorf("%s\n%s", err, strings.Join(outputs, "\n"))
+		return "", "", errorWithStepOutput(err, outputs)
 	}
 
 	return strings.Join(outputs, "\n"), "", nil
@@ -1076,7 +1100,7 @@ func (p *DefaultProjectCommandRunner) doImport(ctx command.ProjectContext) (out 
 
 	outputs, err := p.runSteps(ctx.Steps, ctx, projAbsPath)
 	if err != nil {
-		return nil, "", fmt.Errorf("%s\n%s", err, strings.Join(outputs, "\n"))
+		return nil, "", errorWithStepOutput(err, outputs)
 	}
 
 	// after import, re-plan command is required without import args
@@ -1126,7 +1150,7 @@ func (p *DefaultProjectCommandRunner) doStateRm(ctx command.ProjectContext) (out
 
 	outputs, err := p.runSteps(ctx.Steps, ctx, projAbsPath)
 	if err != nil {
-		return nil, "", fmt.Errorf("%s\n%s", err, strings.Join(outputs, "\n"))
+		return nil, "", errorWithStepOutput(err, outputs)
 	}
 
 	// after state rm, re-plan command is required without state rm args
@@ -1163,6 +1187,10 @@ func (p *DefaultProjectCommandRunner) ensurePlanLoaded(ctx command.ProjectContex
 // when this replica no longer owns the claim. When no lease is attached (routing
 // disabled) it is a no-op.
 func (p *DefaultProjectCommandRunner) admitExecution(ctx command.ProjectContext) error {
+	return admitProjectExecution(ctx)
+}
+
+func admitProjectExecution(ctx command.ProjectContext) error {
 	if ctx.ExecutionLease == nil {
 		return nil
 	}
@@ -1170,6 +1198,13 @@ func (p *DefaultProjectCommandRunner) admitExecution(ctx command.ProjectContext)
 		return fmt.Errorf("admitting project execution: %w", err)
 	}
 	return nil
+}
+
+func projectAdmissionFailure(err error) command.ProjectCommandOutput {
+	return command.ProjectCommandOutput{
+		Error:         err,
+		OwnershipLost: errors.Is(err, ErrOwnershipChanged),
+	}
 }
 
 func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.ProjectContext, absPath string) ([]string, error) {

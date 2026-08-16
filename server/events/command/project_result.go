@@ -18,8 +18,12 @@ type ProjectResult struct {
 
 // ProjectCommandOutput is the output of a plan/policy_check/apply for a specific project.
 type ProjectCommandOutput struct {
-	Error              error
-	Failure            string
+	Error   error
+	Failure string
+	// OwnershipLost marks a result rejected by the distributed execution
+	// fence. It is control-plane state and must never be rendered or persisted
+	// as an ordinary Terraform failure.
+	OwnershipLost      bool `json:"-"`
 	PlanSuccess        *models.PlanSuccess
 	PolicyCheckResults *models.PolicyCheckResults
 	ApplySuccess       string

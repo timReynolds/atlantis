@@ -247,6 +247,25 @@ func TestRunHistoryRecordsSkippedOutcomeWithoutSuppressingHooks(t *testing.T) {
 	require.Equal(t, runs.StatusSkipped, writer.runsCompleted[0].Status)
 }
 
+func TestRunHistoryRecordsSupersededOwnershipAsCancelled(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+	projectCtx := history.beginProject(command.ProjectContext{
+		RunID: ctx.RunID, ProjectName: "network", RepoRelDir: "terraform/network",
+		Workspace: "production", Log: ctx.Log,
+	})
+	history.recordProject(projectCtx, command.Plan, command.ProjectCommandOutput{
+		Error: errors.New("ownership changed"), OwnershipLost: true,
+	})
+	ctx.CommandSuperseded = true
+	lifecycle.Finish()
+
+	require.Equal(t, runs.StatusCancelled, writer.projectsCompleted[0].Status)
+	require.Equal(t, runs.StatusCancelled, writer.runsCompleted[0].Status)
+}
+
 func TestRunHistoryRetainsVCSDeliveryID(t *testing.T) {
 	writer := &recordingRunWriter{}
 	history := newTestRunHistory(t, writer)

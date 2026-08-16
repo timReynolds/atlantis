@@ -127,6 +127,10 @@ type Context struct {
 	// itself must stop before post-workflow hooks.
 	CommandOutcomeSkipped bool
 
+	// Set true when distributed ownership changed while this command was
+	// queued or executing. Superseded generations must not publish results.
+	CommandSuperseded bool
+
 	// PreferLocalRepoCfgForTargetedIgnore makes targeted ignore checks read a
 	// cloned repo config before falling back to VCS content. This is used after
 	// pre-workflow hooks may have generated or updated atlantis.yaml.

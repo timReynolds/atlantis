@@ -161,6 +161,7 @@ func TestDefaultProjectCommandRunner_PlanRejectsLostOwnershipBeforeClone(t *test
 	res := runner.Plan(ctx)
 
 	Assert(t, errors.Is(res.Error, leaseErr), "got: %v", res.Error)
+	Assert(t, res.OwnershipLost, "expected ownership loss to be marked for publication suppression")
 	Assert(t, unlocked, "expected the project lock to be released after ownership loss")
 	// Fencing before Clone means a replica that lost its lease never mutates the
 	// working directory: no clone, no merge, no Git read lock, no steps.
@@ -202,9 +203,9 @@ func TestDefaultProjectCommandRunner_RejectsLostOwnershipBeforeSteps(t *testing.
 	res := runner.Version(ctx)
 
 	// Read-only paths have no pre-clone fence; runSteps admits after taking the
-	// Git read lock, so the lease loss surfaces there. doVersion wraps the
-	// runSteps error with %s, so match on the message rather than the sentinel.
-	Assert(t, res.Error != nil && strings.Contains(res.Error.Error(), leaseErr.Error()), "got: %v", res.Error)
+	// Git read lock, so the lease loss surfaces there.
+	Assert(t, errors.Is(res.Error, leaseErr), "got: %v", res.Error)
+	Assert(t, res.OwnershipLost, "expected ownership loss to be marked for publication suppression")
 	Assert(t, !locked, "expected the Git read lock to be released")
 	mockWorkingDir.VerifyWasCalledOnce().GitReadLock(Any[models.Repo](), Any[models.PullRequest](), Any[string]())
 	mockVersion.VerifyWasCalled(Never()).Run(Any[command.ProjectContext](), Any[[]string](), Any[string](), Any[map[string]string]())
@@ -517,6 +518,29 @@ func TestProjectOutputWrapper_DefersRemoteApplyURLSuccessStatus(t *testing.T) {
 	}}}, models.SuccessCommitStatus)
 
 	mockJobURLSetter.VerifyWasCalled(Once()).SetJobURLWithStatus(ctx, command.Apply, models.SuccessCommitStatus, &prjResult)
+}
+
+func TestProjectOutputWrapperDoesNotPublishOwnershipRejection(t *testing.T) {
+	RegisterMockTestingT(t)
+	ctx := command.ProjectContext{Log: logging.NewNoopLogger(t)}
+	mockJobURLSetter := mocks.NewMockJobURLSetter()
+	mockJobMessageSender := mocks.NewMockJobMessageSender()
+	mockProjectCommandRunner := mocks.NewMockProjectCommandRunner()
+	rejected := command.ProjectCommandOutput{Error: events.ErrOwnershipChanged, OwnershipLost: true}
+	When(mockProjectCommandRunner.Plan(ctx)).ThenReturn(rejected)
+	runner := &events.ProjectOutputWrapper{
+		JobURLSetter: mockJobURLSetter, JobMessageSender: mockJobMessageSender,
+		ProjectCommandRunner: mockProjectCommandRunner,
+	}
+
+	result := runner.Plan(ctx)
+
+	Assert(t, result.OwnershipLost, "expected rejected ownership result")
+	mockJobURLSetter.VerifyWasCalledOnce().SetJobURLWithStatus(ctx, command.Plan, models.PendingCommitStatus, nil)
+	mockJobURLSetter.VerifyWasCalled(Once()).SetJobURLWithStatus(
+		Any[command.ProjectContext](), Any[command.Name](), Any[models.CommitStatus](), Any[*command.ProjectCommandOutput](),
+	)
+	mockJobMessageSender.VerifyWasCalled(Never()).Send(Any[command.ProjectContext](), Any[string](), Any[bool]())
 }
 
 func TestProjectOutputWrapperSuppressesJobOutput(t *testing.T) {
@@ -3349,6 +3373,47 @@ func TestDefaultProjectCommandRunner_ApplySuppressesApplyWebhooks(t *testing.T) 
 	mockSender.VerifyWasCalled(Never()).Send(Any[logging.SimpleLogging](), Any[webhooks.ApplyResult]())
 }
 
+func TestDefaultProjectCommandRunner_ApplyDoesNotPublishWebhookAfterOwnershipLoss(t *testing.T) {
+	RegisterMockTestingT(t)
+	mockApply := mocks.NewMockStepRunner()
+	mockWorkingDir := mocks.NewMockWorkingDir()
+	mockLocker := mocks.NewMockProjectLocker()
+	mockSender := mocks.NewMockWebhooksSender()
+	runner := events.DefaultProjectCommandRunner{
+		Locker: mockLocker, ApplyStepRunner: mockApply, WorkingDir: mockWorkingDir,
+		WorkingDirLocker:          events.NewDefaultWorkingDirLocker(),
+		CommandRequirementHandler: &events.DefaultCommandRequirementHandler{WorkingDir: mockWorkingDir},
+		Webhooks:                  mockSender,
+	}
+	repoDir := t.TempDir()
+	When(mockWorkingDir.GetWorkingDir(Any[models.Repo](), Any[models.PullRequest](), Any[string]())).ThenReturn(repoDir, nil)
+	When(mockWorkingDir.GitReadLock(Any[models.Repo](), Any[models.PullRequest](), Any[string]())).ThenReturn(func() {})
+	When(mockLocker.TryLock(
+		Any[logging.SimpleLogging](), Any[models.PullRequest](), Any[models.User](), Any[string](),
+		Any[models.Project](), AnyBool(),
+	)).ThenReturn(&events.TryLockResponse{LockAcquired: true, LockKey: "lock-key"}, nil)
+	admissions := 0
+	lease := executionLeaseFunc(func(context.Context) error {
+		admissions++
+		if admissions == 2 {
+			return events.ErrOwnershipChanged
+		}
+		return nil
+	})
+	ctx := command.ProjectContext{
+		Log: logging.NewNoopLogger(t), Steps: []valid.Step{{StepName: "apply"}},
+		Workspace: "default", RepoRelDir: ".", ExecutionLease: lease,
+	}
+	When(mockApply.Run(ctx, nil, repoDir, map[string]string{})).ThenReturn("apply", nil)
+
+	result := runner.Apply(ctx)
+
+	Equals(t, 2, admissions)
+	Assert(t, result.OwnershipLost, "expected final publication fence to reject the stale apply result")
+	Assert(t, errors.Is(result.Error, events.ErrOwnershipChanged), "got: %v", result.Error)
+	mockSender.VerifyWasCalled(Never()).Send(Any[logging.SimpleLogging](), Any[webhooks.ApplyResult]())
+}
+
 // Test run and env steps. We don't use mocks for this test since we're
 // not running any Terraform.
 func TestDefaultProjectCommandRunner_RunEnvSteps(t *testing.T) {
@@ -4854,6 +4919,35 @@ func TestDefaultProjectCommandRunner_ApprovePolicies_DuplicateApproval(t *testin
 	Equals(t, 1, len(res.PolicyCheckResults.PolicySetResults))
 	result := res.PolicyCheckResults.PolicySetResults[0]
 	Equals(t, 1, result.GetCurApprovals())
+}
+
+func TestDefaultProjectCommandRunner_ApprovePoliciesRejectsLostOwnershipAfterWorkingDirLock(t *testing.T) {
+	RegisterMockTestingT(t)
+	mockLocker := mocks.NewMockProjectLocker()
+	When(mockLocker.TryLock(
+		Any[logging.SimpleLogging](), Any[models.PullRequest](), Any[models.User](), Any[string](),
+		Any[models.Project](), AnyBool(),
+	)).ThenReturn(&events.TryLockResponse{LockAcquired: true, LockKey: "lock-key"}, nil)
+	policyStatus := []models.PolicySetStatus{{PolicySetName: "production"}}
+	lease := executionLeaseFunc(func(context.Context) error { return events.ErrOwnershipChanged })
+	runner := events.DefaultProjectCommandRunner{
+		Locker: mockLocker, WorkingDirLocker: events.NewDefaultWorkingDirLocker(),
+	}
+	ctx := command.ProjectContext{
+		User: testdata.User, Log: logging.NewNoopLogger(t), Pull: testdata.Pull,
+		Workspace: "default", RepoRelDir: ".", ExecutionLease: lease,
+		PolicySets: valid.PolicySets{
+			Owners:     valid.PolicyOwners{Users: []string{testdata.User.Username}},
+			PolicySets: []valid.PolicySet{{Name: "production", ApproveCount: 1}},
+		},
+		ProjectPolicyStatus: policyStatus,
+	}
+
+	result := runner.ApprovePolicies(ctx)
+
+	Assert(t, errors.Is(result.Error, events.ErrOwnershipChanged), "got: %v", result.Error)
+	Assert(t, result.OwnershipLost, "expected ownership loss to suppress approval publication")
+	Equals(t, []models.PolicySetApproval(nil), policyStatus[0].Approvals)
 }
 
 // Test that sticky carry-over preserves all approvals (including dormant ones

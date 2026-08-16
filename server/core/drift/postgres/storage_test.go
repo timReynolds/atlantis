@@ -74,6 +74,8 @@ func TestStorageConformance(t *testing.T) {
 	byName := indexByProject(results)
 	require.Equal(t, "", byName["network"].PlanOutput)
 	require.Equal(t, first.Drift, byName["network"].Drift)
+	require.Equal(t, checkedAt, *byName["network"].LastSuccessfulChecked)
+	require.Nil(t, byName["database"].LastSuccessfulChecked)
 	require.Equal(t, partial.Error, byName["database"].Error)
 
 	updated := first

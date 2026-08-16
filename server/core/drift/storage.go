@@ -117,6 +117,14 @@ func (s *InMemoryStorage) Store(repository string, drift models.ProjectDrift) er
 	}
 
 	key := driftKey(drift)
+	if drift.Error == "" {
+		checked := drift.LastChecked
+		drift.LastSuccessfulChecked = &checked
+	} else if drift.LastSuccessfulChecked == nil {
+		if previous, ok := s.data[repository][key]; ok {
+			drift.LastSuccessfulChecked = previous.LastSuccessfulChecked
+		}
+	}
 	s.data[repository][key] = drift
 	return nil
 }

@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Drift history · atlantis</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/normalize.css">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/skeleton.css">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/custom.css">
+  <link rel="icon" type="image/png" href="{{ .CleanedBasePath }}/static/images/atlantis-icon.png">
+</head>
+<body>
+<div class="container history-page">
+  <nav class="history-nav"><a href="{{ .CleanedBasePath }}/">Atlantis</a><a href="{{ .CleanedBasePath }}/runs">Runs</a><a href="{{ .CleanedBasePath }}/audit">Audit</a><a class="active" href="{{ .CleanedBasePath }}/drift">Drift</a></nav>
+  <header class="history-header">
+    <p class="history-eyebrow">Durable drift</p>
+    <h2>Current project status</h2>
+    <p>Oldest checks appear first. Stale marks a project that has not been checked successfully in the last 24 hours.</p>
+  </header>
+
+  <form class="history-filter" method="get">
+    <label>Repository<input name="repository" placeholder="owner/repository" value="{{ .Filter.Repository }}"></label>
+    <label>Ref<input name="ref" value="{{ .Filter.Ref }}"></label>
+    <label>Outcome<input name="outcome" placeholder="drifted,failed,locked" value="{{ .Filter.Outcome }}"></label>
+    <label>Project<input name="project" value="{{ .Filter.Project }}"></label>
+    <label>Directory<input name="directory" value="{{ .Filter.Directory }}"></label>
+    <label>Workspace<input name="workspace" value="{{ .Filter.Workspace }}"></label>
+    <div class="history-filter-actions"><button class="button-primary" type="submit">Filter</button><a href="{{ .CleanedBasePath }}/drift">Clear</a></div>
+  </form>
+
+  {{ if .Projects }}
+  <div class="history-table-wrap"><table class="u-full-width history-table">
+    <thead><tr><th>Repository / project</th><th>Ref / commit</th><th>Changes</th><th>Outcome</th><th>Checked</th><th>Remediation</th></tr></thead>
+    <tbody>{{ $basePath := .CleanedBasePath }}{{ range .Projects }}
+      <tr>
+        <td>{{ .Repository }}<br><strong>{{ if .ProjectName }}{{ .ProjectName }}{{ else }}unnamed{{ end }}</strong><br><code>{{ .Directory }}</code> · <code>{{ .Workspace }}</code>{{ if .Error }}<br><span class="history-error">{{ .Error }}</span>{{ end }}</td>
+        <td><code>{{ .Ref }}</code><br><code class="history-sha">{{ .ResolvedCommit }}</code></td>
+        <td><span class="history-change-add">+{{ .Additions }}</span> <span class="history-change-update">~{{ .Changes }}</span> <span class="history-change-destroy">-{{ .Destructions }}</span>{{ if .Imports }} <span>↳{{ .Imports }}</span>{{ end }}{{ if .Forgets }} <span>forget {{ .Forgets }}</span>{{ end }}{{ if .Summary }}<br><span class="history-muted">{{ .Summary }}</span>{{ end }}</td>
+        <td><span class="history-status history-status-{{ .Outcome }}">{{ .Outcome }}</span>{{ if .Stale }}<br><span class="history-status history-status-failed">stale</span>{{ end }}</td>
+        <td class="history-nowrap">Attempt: {{ if .DetectionPath }}<a href="{{ $basePath }}{{ .DetectionPath }}">{{ .LastChecked }}</a>{{ else }}{{ .LastChecked }}{{ end }}<br><span class="history-muted">Successful: {{ if .LastSuccessfulChecked }}{{ .LastSuccessfulChecked }}{{ else }}never{{ end }}</span></td>
+        <td>{{ if .LastRemediationID }}<a href="{{ $basePath }}{{ .LastRemediationPath }}">{{ .LastRemediationStatus }}</a><br><span class="history-muted">{{ .LastRemediationAt }}</span>{{ else }}<span class="history-muted">not attempted</span>{{ end }}</td>
+      </tr>
+    {{ end }}</tbody>
+  </table></div>
+  {{ else }}<div class="history-empty">No current drift status matches these filters.</div>{{ end }}
+  <p>{{ if .PreviousPath }}<a class="button" href="{{ .CleanedBasePath }}{{ .PreviousPath }}">Previous</a>{{ end }} {{ if .NextPath }}<a class="button" href="{{ .CleanedBasePath }}{{ .NextPath }}">Next 100 projects</a>{{ end }}</p>
+
+  <section class="history-section">
+    <div class="history-section-title"><h4>Recent detection runs</h4><span>Append-only history</span></div>
+    {{ if .Detections }}<div class="history-table-wrap"><table class="u-full-width history-table">
+      <thead><tr><th>Detection</th><th>Repository / ref</th><th>Projects</th><th>Outcome</th><th>Completed</th></tr></thead>
+      <tbody>{{ $basePath := .CleanedBasePath }}{{ range .Detections }}<tr>
+        <td><a class="history-id" href="{{ $basePath }}{{ .DetailPath }}">{{ .ID }}</a></td>
+        <td>{{ .Repository }}<br><code>{{ .Ref }}</code> · <code class="history-sha">{{ .ResolvedCommit }}</code></td>
+        <td>{{ .TotalProjects }} total · {{ .ProjectsWithDrift }} drifted · {{ .FailedProjects }} failed · {{ .LockedProjects }} locked · {{ .SkippedProjects }} skipped</td>
+        <td><span class="history-status history-status-{{ .Status }}">{{ .Status }}</span></td><td class="history-nowrap">{{ .CompletedAt }}</td>
+      </tr>{{ end }}</tbody>
+    </table></div>{{ else }}<div class="history-empty">No detection history matches this repository filter.</div>{{ end }}
+    <p>{{ if .DetectionPreviousPath }}<a class="button" href="{{ .CleanedBasePath }}{{ .DetectionPreviousPath }}">Newer detections</a>{{ end }} {{ if .DetectionNextPath }}<a class="button" href="{{ .CleanedBasePath }}{{ .DetectionNextPath }}">Older detections</a>{{ end }}</p>
+  </section>
+</div>
+<footer>{{ .AtlantisVersion }}</footer>
+</body>
+</html>

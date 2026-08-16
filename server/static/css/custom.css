@@ -300,9 +300,9 @@ tbody {
   font-weight: 700;
   padding: .25rem .75rem;
 }
-.history-status-succeeded, .history-status-unchanged { background: #e5f7ed; color: #176b3a; }
+.history-status-succeeded, .history-status-success, .history-status-unchanged, .history-status-clean { background: #e5f7ed; color: #176b3a; }
 .history-status-failed, .history-status-cancelled { background: #fde9e8; color: #a12622; }
-.history-status-partial { background: #fff0d5; color: #8b5700; }
+.history-status-partial, .history-status-drifted, .history-status-locked { background: #fff0d5; color: #8b5700; }
 .history-status-pending, .history-status-running { background: #e4f4fb; color: #126989; }
 .history-status-skipped { background: #edf0f2; color: #59676f; }
 .history-muted { color: #7b8b95; }

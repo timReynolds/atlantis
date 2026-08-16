@@ -45,6 +45,7 @@ type APIController struct {
 	APISecret                       []byte
 	Locker                          locking.Locker `validate:"required"`
 	DriftStorage                    drift.Storage
+	DriftHistory                    drift.HistoryWriter
 	RemediationService              drift.RemediationService
 	ApplyLockChecker                locking.ApplyLockChecker
 	EnableDriftRemediation          bool
@@ -1208,6 +1209,17 @@ func (a *APIController) Remediate(w http.ResponseWriter, r *http.Request) {
 	request.ExecutionRef = executionRef
 	request.BaseBranch = apiRequestBaseBranch(executionRef, request.BaseBranch)
 	request.StorageRepository = baseRepo.ID()
+	historyCtx := &command.Context{
+		HeadRepo: baseRepo,
+		Pull: models.PullRequest{
+			BaseRepo: baseRepo, BaseBranch: request.BaseBranch,
+			HeadBranch: request.Ref, HeadCommit: executionRef,
+		},
+		Log: a.Logger, Scope: a.Scope, API: true,
+	}
+	lifecycle := a.RunHistory.Begin(historyCtx, runs.CommandDriftRemediation, runs.TriggerAPI)
+	defer lifecycle.FinishRecovering()
+	request.RunID = string(historyCtx.RunID)
 
 	// Create executor that bridges to existing plan/apply infrastructure
 	executor := &apiRemediationExecutor{
@@ -1215,14 +1227,20 @@ func (a *APIController) Remediate(w http.ResponseWriter, r *http.Request) {
 		baseRepo:   baseRepo,
 		baseBranch: request.BaseBranch,
 		logger:     a.Logger,
+		runID:      historyCtx.RunID,
 	}
 
 	// Execute remediation
 	result, err := a.RemediationService.Remediate(request, executor)
 	if err != nil {
+		lifecycle.Fail()
 		responder.InternalError(w, r, err)
 		return
 	}
+	if result.Status == models.RemediationStatusFailed || result.Status == models.RemediationStatusPartial {
+		historyCtx.CommandHasErrors = true
+	}
+	lifecycle.Finish()
 
 	// Convert to API DTO and return
 	apiResult := NewRemediationResultAPI(result)
@@ -1248,6 +1266,7 @@ type apiRemediationExecutor struct {
 	baseRepo   models.Repo
 	baseBranch string
 	logger     logging.SimpleLogging
+	runID      runs.ID
 }
 
 // ExecutePlan runs a plan for the given project using the API infrastructure.
@@ -1271,6 +1290,7 @@ func (e *apiRemediationExecutor) ExecutePlan(repository, ref, vcsType, projectNa
 
 	// Build the command context
 	ctx := &command.Context{
+		RunID:    e.runID,
 		HeadRepo: e.baseRepo,
 		Pull: models.PullRequest{
 			Num:                      nextNonPRPullNum(), // Synthetic non-PR workflow ID.
@@ -1346,6 +1366,7 @@ func (e *apiRemediationExecutor) ExecuteApplyProjects(repository, ref, vcsType s
 	}
 
 	ctx := &command.Context{
+		RunID:    e.runID,
 		HeadRepo: e.baseRepo,
 		Pull: models.PullRequest{
 			Num:                      nextNonPRPullNum(), // Synthetic non-PR workflow ID.
@@ -1440,6 +1461,7 @@ func (e *apiRemediationExecutor) ExecuteApply(repository, ref, vcsType, projectN
 
 	// Build the command context
 	ctx := &command.Context{
+		RunID:    e.runID,
 		HeadRepo: e.baseRepo,
 		Pull: models.PullRequest{
 			Num:                      nextNonPRPullNum(), // Synthetic non-PR workflow ID.
@@ -2028,6 +2050,10 @@ func newProjectDriftFromResult(pr command.ProjectResult, ref, baseBranch, resolv
 		projectDrift.Drift = models.NewDriftSummaryFromPlanSuccess(pr.PlanSuccess)
 		projectDrift.PlanOutput = pr.PlanSuccess.TerraformOutput
 	}
+	if projectDrift.Error == "" {
+		checked := projectDrift.LastChecked
+		projectDrift.LastSuccessfulChecked = &checked
+	}
 
 	return projectDrift
 }
@@ -2056,6 +2082,51 @@ func driftDetectionHasErrors(result *models.DriftDetectionResult) bool {
 		}
 	}
 	return false
+}
+
+func newDriftDetectionRecord(
+	result *models.DriftDetectionResult,
+	repository string,
+	ref string,
+	baseBranch string,
+	resolvedCommit string,
+	runID string,
+	startedAt time.Time,
+	completedAt time.Time,
+	runFailed bool,
+) drift.DetectionRecord {
+	record := drift.DetectionRecord{Run: drift.DetectionRun{
+		ID: result.ID, RunID: runID, Repository: repository,
+		DisplayRepository: result.Repository, Ref: ref, BaseBranch: baseBranch,
+		ResolvedCommit: resolvedCommit, StartedAt: startedAt, CompletedAt: completedAt,
+		TotalProjects: result.TotalProjects, ProjectsWithDrift: result.ProjectsWithDrift,
+	}}
+	for ordinal, project := range result.Projects {
+		outcome := drift.OutcomeForProject(project)
+		switch outcome {
+		case drift.DetectionOutcomeFailed:
+			record.Run.FailedProjects++
+		case drift.DetectionOutcomeLocked:
+			record.Run.LockedProjects++
+		case drift.DetectionOutcomeSkipped:
+			record.Run.SkippedProjects++
+		}
+		record.Projects = append(record.Projects, drift.DetectionProject{
+			DetectionID: result.ID, Ordinal: ordinal, Project: project, Outcome: outcome,
+		})
+	}
+	problemProjects := record.Run.FailedProjects + record.Run.LockedProjects + record.Run.SkippedProjects
+	switch {
+	case runFailed && problemProjects == 0:
+		record.Run.Status = drift.DetectionStatusFailed
+	case problemProjects == 0:
+		record.Run.Status = drift.DetectionStatusSucceeded
+	case problemProjects >= record.Run.TotalProjects:
+		record.Run.Status = drift.DetectionStatusFailed
+	default:
+		record.Run.Status = drift.DetectionStatusPartial
+	}
+	return record
 }
 
 func (a *APIController) reconcileDriftStorage(repository, ref, baseBranch string, detected map[driftProjectIdentity]struct{}, startedAt time.Time) error {
@@ -2207,6 +2278,22 @@ func (a *APIController) DetectDrift(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer a.cleanupNonPRWorkingDir(ctx)
+	lifecycle := a.RunHistory.Begin(ctx, runs.CommandDriftDetection, runs.TriggerAPI)
+	defer lifecycle.FinishRecovering()
+	detectionResult := models.NewDriftDetectionResult(request.Repository)
+	if ctx.RunID != "" {
+		detectionResult.ID = string(ctx.RunID)
+	}
+	detectionResult.DetectedAt = detectionStartedAt
+	recordDetectionHistory := func(runFailed bool) error {
+		if a.DriftHistory == nil {
+			return nil
+		}
+		return a.DriftHistory.RecordDetection(r.Context(), newDriftDetectionRecord(
+			detectionResult, baseRepo.ID(), normalizedRef, normalizedBaseBranch,
+			ctx.Pull.HeadCommit, string(ctx.RunID), detectionStartedAt, time.Now(), runFailed,
+		))
+	}
 
 	// Run pre-workflow hooks before project discovery so hooks can
 	// dynamically generate atlantis.yaml or other config files.
@@ -2215,6 +2302,11 @@ func (a *APIController) DetectDrift(w http.ResponseWriter, r *http.Request) {
 	if err := a.PreWorkflowHooksCommandRunner.RunPreHooks(ctx, preHookCmd); err != nil {
 		preHookFailed = true
 		if a.FailOnPreWorkflowHookError {
+			lifecycle.Fail()
+			lifecycle.Finish()
+			if historyErr := recordDetectionHistory(true); historyErr != nil {
+				a.Logger.Warn("failed to store drift detection history: %v", historyErr)
+			}
 			responder.InternalError(w, r, fmt.Errorf("pre-workflow hook failed: %w", err))
 			return
 		}
@@ -2224,6 +2316,11 @@ func (a *APIController) DetectDrift(w http.ResponseWriter, r *http.Request) {
 
 	result, err := a.apiPlan(apiRequest, ctx)
 	if err != nil {
+		lifecycle.Fail()
+		lifecycle.Finish()
+		if historyErr := recordDetectionHistory(true); historyErr != nil {
+			a.Logger.Warn("failed to store drift detection history: %v", historyErr)
+		}
 		if errors.Is(err, events.ErrTeamAllowlistDenied) {
 			responder.Forbidden(w, r, err.Error())
 			return
@@ -2234,7 +2331,6 @@ func (a *APIController) DetectDrift(w http.ResponseWriter, r *http.Request) {
 	defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
 
 	// Process results and store drift data
-	detectionResult := models.NewDriftDetectionResult(request.Repository)
 	detectedProjects := map[driftProjectIdentity]struct{}{}
 	storeFailed := false
 	projectDrifts := driftProjectsFromCommandResult(result, normalizedRef, normalizedBaseBranch, ctx.Pull.HeadCommit, detectionResult.ID)
@@ -2253,6 +2349,26 @@ func (a *APIController) DetectDrift(w http.ResponseWriter, r *http.Request) {
 	if fullDetection && !storeFailed && !preHookFailed && !driftDetectionHasErrors(detectionResult) {
 		if err := a.reconcileDriftStorage(baseRepo.ID(), normalizedRef, normalizedBaseBranch, detectedProjects, detectionStartedAt); err != nil {
 			a.Logger.Warn("failed to reconcile drift data: %v", err)
+		}
+	}
+	if preHookFailed || storeFailed || driftDetectionHasErrors(detectionResult) {
+		ctx.CommandHasErrors = true
+	}
+	lifecycle.Finish()
+
+	if a.DriftHistory != nil {
+		if err := recordDetectionHistory(ctx.CommandHasErrors); err != nil {
+			a.Logger.Warn("failed to store drift detection history: %v", err)
+			if len(detectionResult.Projects) == 0 {
+				responder.InternalError(w, r, fmt.Errorf("storing drift detection history: %w", err))
+				return
+			}
+			for i := range detectionResult.Projects {
+				detectionResult.Projects[i].Error = appendDriftProjectError(
+					detectionResult.Projects[i].Error,
+					fmt.Sprintf("storing drift detection history: %v", err),
+				)
+			}
 		}
 	}
 

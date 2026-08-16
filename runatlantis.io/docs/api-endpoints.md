@@ -299,6 +299,19 @@ The drift detection, drift status, remediation, remediation history, and drift w
 Drift detection runs Terraform plan workflows and can execute configured hooks or custom plan steps. Destructive remediation apply requires both `--enable-drift-detection` and `--enable-drift-remediation`.
 :::
 
+When `--run-store-type=postgres` is configured, detection and remediation IDs
+are UUIDv7 Run IDs. Atlantis stores latest drift status, append-only project
+outcomes, remediation summaries, and the last successful check across restarts.
+Authenticated read-only views are available under `/drift` when web Basic Auth
+is enabled. Raw plan/apply output is retained only in the permissioned Run UI;
+it is not duplicated in drift status or durable remediation summary tables.
+
+Atlantis does not add an internal drift scheduler. Invoke `POST /api/drift/detect`
+from cron or a cloud-neutral external scheduler, partitioning
+large repositories with `projects` or `paths` as needed. This does not enable
+unattended apply; remediation apply remains behind its existing explicit flag
+and safety checks.
+
 ### POST /api/drift/remediate
 
 #### Description
@@ -685,6 +698,11 @@ Set `include_plan_output: true` on the request to have the response include `pla
 ::: warning Plan Output May Contain Sensitive Data
 Before this field existed, `POST /api/drift/detect` only returned numeric drift counts. With `include_plan_output: true`, responses can include resource attribute values and, for custom `run`-step workflows, arbitrary command output. The endpoint's auth boundary is unchanged (the same API token as other drift/remediation endpoints), so this is not a new authorization gap, but the data sensitivity of the response changes materially when this field is enabled. Only `run`-step filter-regex redaction (if configured) applies to plan output; it is not otherwise scrubbed.
 :::
+
+Each project includes `last_checked` for the latest attempt. PostgreSQL-backed
+status also includes `last_successful_checked`; failed or locked attempts update
+the former without erasing the latter, allowing schedulers and the Drift UI to
+identify stale projects.
 
 #### Sample Response (Success)
 

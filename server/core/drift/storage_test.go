@@ -62,6 +62,26 @@ func TestInMemoryStorage_StoreStripsPlanOutput(t *testing.T) {
 	Equals(t, "", results[0].PlanOutput)
 }
 
+func TestInMemoryStorage_PreservesLastSuccessfulCheckAcrossFailure(t *testing.T) {
+	storage := drift.NewInMemoryStorage()
+	checkedAt := time.Now().UTC().Add(-time.Hour)
+	project := models.ProjectDrift{
+		ProjectName: "test-project", Path: "modules/vpc", Workspace: "default",
+		Ref: "main", LastChecked: checkedAt,
+	}
+	Ok(t, storage.Store("owner/repo", project))
+	project.LastChecked = checkedAt.Add(time.Hour)
+	project.Error = "provider unavailable"
+	Ok(t, storage.Store("owner/repo", project))
+
+	results, err := storage.Get("owner/repo", drift.GetOptions{})
+	Ok(t, err)
+	Equals(t, 1, len(results))
+	Assert(t, results[0].LastSuccessfulChecked != nil, "expected last successful check")
+	Equals(t, checkedAt, *results[0].LastSuccessfulChecked)
+	Equals(t, project.LastChecked, results[0].LastChecked)
+}
+
 func TestInMemoryStorage_StoreOverwrite(t *testing.T) {
 	storage := drift.NewInMemoryStorage()
 

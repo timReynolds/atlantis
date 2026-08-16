@@ -36,7 +36,7 @@ func TestStoreDoesNotPersistPlanOutput(t *testing.T) {
 			digestValues("example/infrastructure"),
 			"example/infrastructure", "network", "terraform/network", "production",
 			"main", "main", "deadbeef", "detection-1", true, 1, 2, 3, 4, 5,
-			"1 to add", true, "partial failure", normalizeTime(checkedAt),
+			"1 to add", true, "partial failure", normalizeTime(checkedAt), nil,
 		).
 		WillReturnRows(sqlmock.NewRows([]string{"stored"}).AddRow(true))
 

@@ -48,10 +48,11 @@ WITH stored AS (
     identity_hash, repository_hash,
     repository, project_name, directory, workspace, ref, base_branch,
     resolved_commit, detection_id, has_drift, additions, changes,
-    destructions, imports, forgets, summary, changes_outside, error, last_checked
+    destructions, imports, forgets, summary, changes_outside, error, last_checked,
+    last_successful_checked
   ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21
   )
   ON CONFLICT (identity_hash)
   DO UPDATE SET
@@ -66,15 +67,16 @@ WITH stored AS (
     summary = EXCLUDED.summary,
     changes_outside = EXCLUDED.changes_outside,
     error = EXCLUDED.error,
-    last_checked = EXCLUDED.last_checked
-	WHERE drift_status.repository = EXCLUDED.repository
-	  AND drift_status.project_name = EXCLUDED.project_name
-	  AND drift_status.directory = EXCLUDED.directory
-	  AND drift_status.workspace = EXCLUDED.workspace
-	  AND drift_status.ref = EXCLUDED.ref
-	  AND drift_status.base_branch = EXCLUDED.base_branch
-	  AND drift_status.last_checked <= EXCLUDED.last_checked
-	RETURNING TRUE
+    last_checked = EXCLUDED.last_checked,
+    last_successful_checked = COALESCE(EXCLUDED.last_successful_checked, drift_status.last_successful_checked)
+  WHERE drift_status.repository = EXCLUDED.repository
+    AND drift_status.project_name = EXCLUDED.project_name
+    AND drift_status.directory = EXCLUDED.directory
+    AND drift_status.workspace = EXCLUDED.workspace
+    AND drift_status.ref = EXCLUDED.ref
+    AND drift_status.base_branch = EXCLUDED.base_branch
+    AND drift_status.last_checked <= EXCLUDED.last_checked
+  RETURNING TRUE
 )
 SELECT TRUE FROM stored`,
 		driftIdentityDigest(repository, projectDrift),
@@ -97,6 +99,7 @@ SELECT TRUE FROM stored`,
 		projectDrift.Drift.ChangesOutside,
 		projectDrift.Error,
 		normalizeTime(projectDrift.LastChecked),
+		successfulCheckedAt(projectDrift),
 	).Scan(&stored)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("storing PostgreSQL drift status: %w", err)
@@ -193,7 +196,8 @@ func (s *Storage) GetAll() (map[string][]models.ProjectDrift, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT repository, project_name, directory, workspace, ref, base_branch,
        resolved_commit, detection_id, has_drift, additions, changes,
-       destructions, imports, forgets, summary, changes_outside, error, last_checked
+       destructions, imports, forgets, summary, changes_outside, error, last_checked,
+       last_successful_checked
 FROM drift_status
 ORDER BY repository, last_checked DESC, project_name, directory, workspace`)
 	if err != nil {
@@ -205,6 +209,7 @@ ORDER BY repository, last_checked DESC, project_name, directory, workspace`)
 	for rows.Next() {
 		var repository string
 		var projectDrift models.ProjectDrift
+		var lastSuccessful sql.NullTime
 		if err := rows.Scan(
 			&repository,
 			&projectDrift.ProjectName,
@@ -224,10 +229,15 @@ ORDER BY repository, last_checked DESC, project_name, directory, workspace`)
 			&projectDrift.Drift.ChangesOutside,
 			&projectDrift.Error,
 			&projectDrift.LastChecked,
+			&lastSuccessful,
 		); err != nil {
 			return nil, fmt.Errorf("scanning all PostgreSQL drift status: %w", err)
 		}
 		projectDrift.LastChecked = normalizeTime(projectDrift.LastChecked)
+		if lastSuccessful.Valid {
+			checked := normalizeTime(lastSuccessful.Time)
+			projectDrift.LastSuccessfulChecked = &checked
+		}
 		results[repository] = append(results[repository], projectDrift)
 	}
 	if err := rows.Err(); err != nil {
@@ -254,7 +264,8 @@ func buildSelect(repository string, opts drift.GetOptions) (string, []any) {
 	return `
 SELECT project_name, directory, workspace, ref, base_branch,
        resolved_commit, detection_id, has_drift, additions, changes,
-       destructions, imports, forgets, summary, changes_outside, error, last_checked
+       destructions, imports, forgets, summary, changes_outside, error, last_checked,
+       last_successful_checked
 FROM drift_status ` + where + `
 ORDER BY last_checked DESC, project_name, directory, workspace`, args
 }
@@ -319,6 +330,7 @@ type rowScanner interface {
 }
 
 func scanProjectDrift(row rowScanner, projectDrift *models.ProjectDrift) error {
+	var lastSuccessful sql.NullTime
 	if err := row.Scan(
 		&projectDrift.ProjectName,
 		&projectDrift.Path,
@@ -337,10 +349,25 @@ func scanProjectDrift(row rowScanner, projectDrift *models.ProjectDrift) error {
 		&projectDrift.Drift.ChangesOutside,
 		&projectDrift.Error,
 		&projectDrift.LastChecked,
+		&lastSuccessful,
 	); err != nil {
 		return err
 	}
 	projectDrift.LastChecked = normalizeTime(projectDrift.LastChecked)
+	if lastSuccessful.Valid {
+		checked := normalizeTime(lastSuccessful.Time)
+		projectDrift.LastSuccessfulChecked = &checked
+	}
+	return nil
+}
+
+func successfulCheckedAt(projectDrift models.ProjectDrift) any {
+	if projectDrift.Error == "" {
+		return normalizeTime(projectDrift.LastChecked)
+	}
+	if projectDrift.LastSuccessfulChecked != nil {
+		return normalizeTime(*projectDrift.LastSuccessfulChecked)
+	}
 	return nil
 }
 

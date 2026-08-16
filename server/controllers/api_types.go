@@ -170,6 +170,8 @@ type DriftProjectAPI struct {
 	PlanOutput string `json:"plan_output,omitempty"`
 	// LastChecked is when drift was last checked.
 	LastChecked time.Time `json:"last_checked"`
+	// LastSuccessfulChecked is the latest error-free project check.
+	LastSuccessfulChecked *time.Time `json:"last_successful_checked,omitempty"`
 	// Error contains any error message if detection failed.
 	Error string `json:"error,omitempty"`
 }
@@ -200,16 +202,17 @@ type DriftDetailsAPI struct {
 // result.PlanOutput explicitly after calling this function.
 func NewDriftProjectAPI(pd models.ProjectDrift) DriftProjectAPI {
 	result := DriftProjectAPI{
-		ProjectName:    pd.ProjectName,
-		Directory:      pd.Path,
-		Workspace:      pd.Workspace,
-		Ref:            pd.Ref,
-		BaseBranch:     pd.BaseBranch,
-		ResolvedCommit: pd.ResolvedCommit,
-		DetectionID:    pd.DetectionID,
-		HasDrift:       pd.Drift.HasDrift,
-		LastChecked:    pd.LastChecked,
-		Error:          pd.Error,
+		ProjectName:           pd.ProjectName,
+		Directory:             pd.Path,
+		Workspace:             pd.Workspace,
+		Ref:                   pd.Ref,
+		BaseBranch:            pd.BaseBranch,
+		ResolvedCommit:        pd.ResolvedCommit,
+		DetectionID:           pd.DetectionID,
+		HasDrift:              pd.Drift.HasDrift,
+		LastChecked:           pd.LastChecked,
+		LastSuccessfulChecked: pd.LastSuccessfulChecked,
+		Error:                 pd.Error,
 	}
 
 	if pd.Drift.HasDrift {

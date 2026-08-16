@@ -318,13 +318,17 @@ type ProjectDrift struct {
 	// run step can put arbitrary, unnormalized output here instead, so exact
 	// content depends on the configured workflow. This is transient: it is
 	// populated for the immediate detect response only. The storage layer
-	// (InMemoryStorage.Store) strips it before persisting, so it is never
-	// persisted regardless of what a caller passes in. Not tagged for JSON
+	// strips it before persisting, so it is never persisted regardless of what
+	// a caller passes in. Not tagged for JSON
 	// since it is never marshaled directly; the API layer copies it onto
 	// DriftProjectAPI explicitly when the caller opts in via IncludePlanOutput.
 	PlanOutput string `json:"-"`
 	// LastChecked is when the drift was last detected.
 	LastChecked time.Time `json:"last_checked"`
+	// LastSuccessfulChecked is the most recent check that completed without a
+	// project error. Failed attempts update LastChecked without hiding how long
+	// the project has gone without a successful check.
+	LastSuccessfulChecked *time.Time `json:"last_successful_checked,omitempty"`
 	// Error contains any error message if drift detection failed for this project.
 	Error string `json:"error,omitempty"`
 }
@@ -459,8 +463,12 @@ type DriftDetectionResult struct {
 
 // NewDriftDetectionResult creates a new DriftDetectionResult with a generated ID.
 func NewDriftDetectionResult(repository string) *DriftDetectionResult {
+	id, err := uuid.NewV7()
+	if err != nil {
+		id = uuid.New()
+	}
 	return &DriftDetectionResult{
-		ID:         uuid.New().String(),
+		ID:         id.String(),
 		Repository: repository,
 		Projects:   []ProjectDrift{},
 		DetectedAt: time.Now(),

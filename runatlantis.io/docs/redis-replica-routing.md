@@ -60,7 +60,9 @@ Without `--enable-external-stores`, plan files stay beneath the owner's local `-
 
 ### External Plans
 
-With `--enable-external-stores` and a valid server-side `external_stores.plan_store` configuration, Atlantis saves plans through the external PlanStore. After takeover, the new owner clears its local state, ensures the default checkout and every plan-bearing project workspace exist, and restores plans before discovery. Targeted applies also ensure the selected project's resolved workspace exists before loading its plan. Recovery runs for a new local ownership generation even when a pre-workflow hook already recreated the pull directory. Missing, stale, or unavailable external plans fail the command and require a new plan.
+With `--enable-external-stores` and a valid server-side `external_stores.plan_store` configuration, Atlantis saves plans through the external PlanStore. Before upload, durable HA records the expected object key, SHA-256 checksum, repository, pull request, commit, project, directory, workspace, repo-config version, and a digest of the resolved Atlantis workflow in PostgreSQL. S3 object metadata carries the same identity and a body checksum. This ordering means a process killed immediately after upload leaves a recoverable expectation; a process killed before upload leaves a harmless missing-object reference that fails closed.
+
+After takeover, the new owner clears its local state, ensures the default checkout and every plan-bearing project workspace exist, and restores plans before discovery. Targeted applies also ensure the selected project's resolved workspace exists before loading its plan. Recovery runs for a new local ownership generation even when a pre-workflow hook already recreated the pull directory. Before apply, Atlantis verifies S3 metadata and body checksum and then compares the restored key, checksum, commit, project identity, repo-config version, and resolved workflow digest with PostgreSQL. Missing, stale, changed, or unavailable external plans fail the command and require a new plan.
 
 ## Failure Behavior
 

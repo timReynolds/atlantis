@@ -21,6 +21,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const (
+	testPlanChecksum     = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testWorkflowIdentity = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+)
+
 func TestRunHistoryAggregatesPlanAndPolicyIntoOneProjectRun(t *testing.T) {
 	writer := &recordingRunWriter{}
 	history := newTestRunHistory(t, writer)
@@ -34,7 +39,7 @@ func TestRunHistoryAggregatesPlanAndPolicyIntoOneProjectRun(t *testing.T) {
 
 	projectCtx := history.beginProject(command.ProjectContext{
 		RunID: ctx.RunID, ProjectName: "network", RepoRelDir: "terraform/network",
-		Workspace: "production", Log: ctx.Log,
+		Workspace: "production", WorkflowIdentity: testWorkflowIdentity, Log: ctx.Log,
 	})
 	history.recordProject(projectCtx, command.Plan, command.ProjectCommandOutput{
 		PlanSuccess: &models.PlanSuccess{TerraformOutput: "Plan: 1 to import, 2 to add, 3 to change, 4 to destroy, 5 to forget."},
@@ -50,9 +55,9 @@ func TestRunHistoryAggregatesPlanAndPolicyIntoOneProjectRun(t *testing.T) {
 			{PolicySetName: "production", Passed: false},
 		}},
 	})
-	history.RecordPlanArtifact(projectCtx, runs.ArtifactReference{
-		Key: "plans/network.tfplan", Checksum: "sha256:abc", CreatedAt: testHistoryTime,
-	})
+	require.NoError(t, history.RecordPlanArtifact(projectCtx, runs.ArtifactReference{
+		Key: "plans/network.tfplan", Checksum: testPlanChecksum, CreatedAt: testHistoryTime,
+	}))
 	ctx.CommandHasErrors = true
 	lifecycle.Finish()
 
@@ -584,6 +589,9 @@ type recordingRunWriter struct {
 	takeoverRequests     []runs.AttemptTakeoverRequest
 	takeoverResult       runs.AttemptTakeoverResult
 	takeoverErr          error
+	artifactUpdates      []runs.ProjectPlanArtifactUpdate
+	artifactResult       runs.PlanArtifactExpectation
+	artifactErr          error
 }
 
 func (w *recordingRunWriter) CreateRun(_ context.Context, run runs.Run) error {
@@ -745,3 +753,20 @@ func (r *recordingAdmissionFailureReporter) ReportRunAdmissionFailure(_ *command
 
 var _ CommentCommandRunner = (*recordingCommentCommandRunner)(nil)
 var _ RunAdmissionFailureReporter = (*recordingAdmissionFailureReporter)(nil)
+
+func (w *recordingRunWriter) RecordProjectPlanArtifact(_ context.Context, update runs.ProjectPlanArtifactUpdate) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.artifactErr != nil {
+		return w.artifactErr
+	}
+	if err := update.Validate(); err != nil {
+		return err
+	}
+	w.artifactUpdates = append(w.artifactUpdates, update)
+	return nil
+}
+
+func (w *recordingRunWriter) FindPlanArtifact(context.Context, runs.PlanArtifactLookup) (runs.PlanArtifactExpectation, error) {
+	return w.artifactResult, w.artifactErr
+}

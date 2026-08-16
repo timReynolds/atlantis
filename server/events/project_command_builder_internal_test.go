@@ -733,6 +733,8 @@ projects:
 
 					// Job ID cannot be compared since its generated at random
 					ctx.JobID = ""
+					Assert(t, ctx.WorkflowIdentity != "", "resolved workflow identity must be populated")
+					c.expCtx.WorkflowIdentity = ctx.WorkflowIdentity
 
 					Equals(t, c.expCtx, ctx)
 					// Equals() doesn't compare TF version properly so have to
@@ -954,6 +956,8 @@ projects:
 
 					// Job ID cannot be compared since its generated at random
 					ctx.JobID = ""
+					Assert(t, ctx.WorkflowIdentity != "", "resolved workflow identity must be populated")
+					c.expCtx.WorkflowIdentity = ctx.WorkflowIdentity
 
 					Equals(t, c.expCtx, ctx)
 					// Equals() doesn't compare TF version properly so have to
@@ -1199,6 +1203,8 @@ workflows:
 
 				// Job ID cannot be compared since its generated at random
 				ctx.JobID = ""
+				Assert(t, ctx.WorkflowIdentity != "", "resolved workflow identity must be populated")
+				c.expCtx.WorkflowIdentity = ctx.WorkflowIdentity
 
 				Equals(t, c.expCtx, ctx)
 				// Equals() doesn't compare TF version properly so have to

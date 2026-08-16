@@ -50,6 +50,14 @@ func (NoopStore) PrepareAttemptTakeover(context.Context, AttemptTakeoverRequest)
 	return AttemptTakeoverResult{}, nil
 }
 
+func (NoopStore) RecordProjectPlanArtifact(context.Context, ProjectPlanArtifactUpdate) error {
+	return nil
+}
+
+func (NoopStore) FindPlanArtifact(context.Context, PlanArtifactLookup) (PlanArtifactExpectation, error) {
+	return PlanArtifactExpectation{}, ErrNotFound
+}
+
 func (NoopStore) GetRun(context.Context, ID) (Run, error) {
 	return Run{}, ErrNotFound
 }

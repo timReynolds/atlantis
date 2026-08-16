@@ -41,9 +41,11 @@ func TestLoadMigrations(t *testing.T) {
 	require.Equal(t, int64(5), migrations[4].version)
 	require.Contains(t, migrations[4].sql, "'unknown'")
 	require.Contains(t, migrations[4].sql, "ALTER TABLE project_runs")
-	require.Equal(t, int64(6), migrations[len(migrations)-1].version)
-	require.Contains(t, migrations[len(migrations)-1].sql, "attempt_id")
-	require.Contains(t, migrations[len(migrations)-1].sql, "UPDATE project_runs AS project")
+	require.Equal(t, int64(6), migrations[5].version)
+	require.Contains(t, migrations[5].sql, "attempt_id")
+	require.Contains(t, migrations[5].sql, "UPDATE project_runs AS project")
+	require.Equal(t, int64(7), migrations[len(migrations)-1].version)
+	require.Contains(t, migrations[len(migrations)-1].sql, "plan_workflow_checksum")
 }
 
 func TestRegisterExecutionInstance(t *testing.T) {

@@ -160,14 +160,26 @@ func TestStoreConformance(t *testing.T) {
 	completedAt := startedAt.Add(time.Second)
 	artifactCreatedAt := startedAt
 	artifactExpiresAt := completedAt.Add(24 * time.Hour)
+	artifact := &runs.ArtifactReference{
+		Key:       "plans/example/17/network.tfplan",
+		Checksum:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		CreatedAt: artifactCreatedAt, ExpiresAt: &artifactExpiresAt,
+	}
+	artifactIdentity := runs.PlanArtifactIdentity{
+		RepoConfigVersion: 3,
+		WorkflowChecksum:  "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	}
+	require.NoError(t, store.RecordProjectPlanArtifact(ctx, runs.ProjectPlanArtifactUpdate{
+		ProjectRunID: projectRunID, Artifact: *artifact, Identity: artifactIdentity,
+	}))
+	require.NoError(t, store.RecordProjectPlanArtifact(ctx, runs.ProjectPlanArtifactUpdate{
+		ProjectRunID: projectRunID, Artifact: *artifact, Identity: artifactIdentity,
+	}), "artifact replay must be idempotent")
 	projectCompletion := runs.ProjectRunCompletion{
 		ID: projectRunID, Status: runs.StatusSucceeded, Additions: 1, Changes: 2,
-		CompletedAt: completedAt,
-		Metadata:    runs.Metadata(`{"phases":["plan","policy_check"]}`),
-		PlanArtifact: &runs.ArtifactReference{
-			Key: "plans/example/17/network.tfplan", Checksum: "sha256:abc",
-			CreatedAt: artifactCreatedAt, ExpiresAt: &artifactExpiresAt,
-		},
+		CompletedAt:  completedAt,
+		Metadata:     runs.Metadata(`{"phases":["plan","policy_check"]}`),
+		PlanArtifact: artifact,
 	}
 	require.NoError(t, store.CompleteProjectRun(ctx, projectCompletion))
 	require.NoError(t, store.CompleteProjectRun(ctx, projectCompletion), "completion replay must be idempotent")
@@ -192,6 +204,14 @@ func TestStoreConformance(t *testing.T) {
 	require.Equal(t, projectCompletion.Additions, storedProject.Additions)
 	require.Equal(t, projectCompletion.PlanArtifact, storedProject.PlanArtifact)
 	require.JSONEq(t, string(projectCompletion.Metadata), string(storedProject.Metadata))
+	expectedArtifact, err := store.FindPlanArtifact(ctx, runs.PlanArtifactLookup{
+		Repository: run.Repository, PullNumber: pull, HeadSHA: run.HeadSHA,
+		ProjectName: projectRun.ProjectName, Directory: projectRun.Directory, Workspace: projectRun.Workspace,
+	})
+	require.NoError(t, err)
+	require.Equal(t, projectRunID, expectedArtifact.ProjectRunID)
+	require.Equal(t, *artifact, expectedArtifact.Artifact)
+	require.Equal(t, artifactIdentity, expectedArtifact.Identity)
 
 	runPage, err := store.ListRuns(ctx, runs.RunFilter{
 		Repository: run.Repository, PullNumber: &pull,

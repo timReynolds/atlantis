@@ -212,4 +212,5 @@ type Store interface {
 	Reader
 	Retainer
 	ExecutionStore
+	PlanArtifactStore
 }

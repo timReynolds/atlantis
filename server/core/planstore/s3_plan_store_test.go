@@ -6,7 +6,9 @@ package planstore_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -98,14 +100,28 @@ func (m *mockS3Client) ListObjectsV2(_ context.Context, _ *s3.ListObjectsV2Input
 func testProjectContext() command.ProjectContext {
 	return command.ProjectContext{
 		BaseRepo: models.Repo{
-			Owner: "acme",
-			Name:  "infra",
+			Owner: "acme", Name: "infra", FullName: "acme/infra",
 		},
 		Pull: models.PullRequest{
-			Num: 42,
+			Num: 42, HeadCommit: "abc123",
 		},
-		Workspace:  "default",
-		RepoRelDir: "modules/vpc",
+		ProjectName: "network", Workspace: "default", RepoRelDir: "modules/vpc",
+		RepoConfigVersion: 3,
+		WorkflowIdentity:  "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	}
+}
+
+func testPlanMetadata(ctx command.ProjectContext, content []byte) map[string]string {
+	return map[string]string{
+		"Head-Commit":                  ctx.Pull.HeadCommit,
+		"Atlantis-Repository":          ctx.BaseRepo.ID(),
+		"Atlantis-Pull-Number":         fmt.Sprint(ctx.Pull.Num),
+		"Atlantis-Project":             ctx.ProjectID(),
+		"Atlantis-Directory":           ctx.RepoRelDir,
+		"Atlantis-Workspace":           ctx.Workspace,
+		"Atlantis-Repo-Config-Version": fmt.Sprint(ctx.RepoConfigVersion),
+		"Atlantis-Workflow-Checksum":   ctx.WorkflowIdentity,
+		"Atlantis-Plan-Sha256":         fmt.Sprintf("sha256:%x", sha256.Sum256(content)),
 	}
 }
 
@@ -184,13 +200,12 @@ func TestSave_FileOpenError(t *testing.T) {
 
 func TestLoad_Success(t *testing.T) {
 	planContent := []byte("downloaded-plan-data")
+	ctx := testProjectContext()
 	mock := &mockS3Client{
 		getBody:     planContent,
-		getMetadata: map[string]string{"Head-Commit": "abc123"},
+		getMetadata: testPlanMetadata(ctx, planContent),
 	}
 	store := planstore.NewS3PlanStoreWithClient(mock, "bucket", "pfx", logging.NewNoopLogger(t))
-	ctx := testProjectContext()
-	ctx.Pull.HeadCommit = "abc123"
 
 	planDir := t.TempDir()
 	planPath := filepath.Join(planDir, "subdir", "test.tfplan")
@@ -204,9 +219,11 @@ func TestLoad_Success(t *testing.T) {
 }
 
 func TestLoad_StalePlanRejected(t *testing.T) {
+	oldCtx := testProjectContext()
+	oldCtx.Pull.HeadCommit = "oldcommit"
 	mock := &mockS3Client{
 		getBody:     []byte("old-plan"),
-		getMetadata: map[string]string{"Head-Commit": "oldcommit"},
+		getMetadata: testPlanMetadata(oldCtx, []byte("old-plan")),
 	}
 	store := planstore.NewS3PlanStoreWithClient(mock, "bucket", "", logging.NewNoopLogger(t))
 	ctx := testProjectContext()
@@ -227,6 +244,21 @@ func TestLoad_MissingMetadataRejected(t *testing.T) {
 
 	err := store.Load(ctx, filepath.Join(t.TempDir(), "plan.tfplan"))
 	assert.ErrorContains(t, err, "no head-commit metadata")
+}
+
+func TestLoad_TamperedPlanBodyRejectedAndRemoved(t *testing.T) {
+	ctx := testProjectContext()
+	mock := &mockS3Client{
+		getBody: []byte("tampered-plan"), getMetadata: testPlanMetadata(ctx, []byte("original-plan")),
+	}
+	store := planstore.NewS3PlanStoreWithClient(mock, "bucket", "", logging.NewNoopLogger(t))
+	planPath := filepath.Join(t.TempDir(), "plan.tfplan")
+
+	err := store.Load(ctx, planPath)
+
+	assert.ErrorContains(t, err, "plan body checksum does not match S3 metadata")
+	_, statErr := os.Stat(planPath)
+	assert.ErrorIs(t, statErr, os.ErrNotExist)
 }
 
 func TestLoad_S3Error(t *testing.T) {

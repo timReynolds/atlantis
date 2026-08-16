@@ -44,6 +44,7 @@ type RunHistory struct {
 	writer            runs.Writer
 	executionWriter   runs.ExecutionWriter
 	executionRecovery runs.ExecutionRecovery
+	planArtifacts     runs.PlanArtifactStore
 	logger            logging.SimpleLogging
 	now               func() time.Time
 	newID             func() (runs.ID, error)
@@ -57,9 +58,11 @@ type RunHistory struct {
 func NewRunHistory(writer runs.Writer, logger logging.SimpleLogging) *RunHistory {
 	executionWriter, _ := writer.(runs.ExecutionWriter)
 	executionRecovery, _ := writer.(runs.ExecutionRecovery)
+	planArtifacts, _ := writer.(runs.PlanArtifactStore)
 	return &RunHistory{
 		writer: writer, executionWriter: executionWriter, executionRecovery: executionRecovery,
-		logger: logger, now: time.Now, newID: runs.NewID,
+		planArtifacts: planArtifacts,
+		logger:        logger, now: time.Now, newID: runs.NewID,
 		attemptHeartbeat: defaultAttemptHeartbeat, attemptStaleAfter: defaultAttemptStaleAfter,
 	}
 }
@@ -800,27 +803,44 @@ func (p *projectObservation) resultOutputChunks(output command.ProjectCommandOut
 	return chunks
 }
 
-// RecordPlanArtifact associates opaque S3 plan metadata with its Project Run.
-func (h *RunHistory) RecordPlanArtifact(ctx command.ProjectContext, artifact runs.ArtifactReference) {
+// RecordPlanArtifact durably associates an expected S3 object with its Project
+// Run before upload, closing the process-loss window after S3 accepts it.
+func (h *RunHistory) RecordPlanArtifact(ctx command.ProjectContext, artifact runs.ArtifactReference) error {
 	if h == nil || artifact.Key == "" {
-		return
+		return errors.New("run history plan artifact context is incomplete")
 	}
 	value, ok := h.sessions.Load(ctx.RunID)
 	if !ok {
-		return
+		return errors.New("plan artifact has no active plan Run")
 	}
 	commandName := value.(*runSession).run.Command
 	if commandName != runs.CommandPlan && commandName != runs.CommandDriftDetection {
-		return
+		return errors.New("plan artifact has no active plan Run")
 	}
 	project := h.project(ctx)
 	if project == nil {
-		return
+		return errors.New("plan artifact has no active ProjectRun")
+	}
+	if h.planArtifacts == nil {
+		return errors.New("durable plan artifact store is required")
+	}
+	update := runs.ProjectPlanArtifactUpdate{
+		ProjectRunID: ctx.ProjectRunID, Artifact: artifact,
+		Identity: runs.PlanArtifactIdentity{
+			RepoConfigVersion: ctx.RepoConfigVersion, WorkflowChecksum: ctx.WorkflowIdentity,
+		},
+	}
+	if err := writeRunHistory(func(writeCtx context.Context) error {
+		return h.planArtifacts.RecordProjectPlanArtifact(writeCtx, update)
+	}); err != nil {
+		h.markPersistenceFailed(ctx.Log, value.(*runSession), "recording plan artifact expectation", err)
+		return err
 	}
 	artifactCopy := artifact
 	project.mu.Lock()
 	project.artifact = &artifactCopy
 	project.mu.Unlock()
+	return nil
 }
 
 func (h *RunHistory) project(ctx command.ProjectContext) *projectObservation {

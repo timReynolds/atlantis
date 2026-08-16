@@ -22,7 +22,7 @@ func TestPullUpdaterUsesLargeRunSummaryOnlyWhenDurableUIIsAvailable(t *testing.T
 	require.NoError(t, err)
 	updater := &PullUpdater{
 		RunHistoryURLGenerator:   staticRunHistoryURLGenerator{},
-		RunHistoryCompleteness:   staticRunHistoryCompleteness{complete: true},
+		RunHistoryFinalizer:      &staticRunHistoryFinalizer{},
 		LargeRunSummaryThreshold: 50,
 	}
 	ctx := &command.Context{RunID: runID}
@@ -39,9 +39,9 @@ func TestPullUpdaterUsesLargeRunSummaryOnlyWhenDurableUIIsAvailable(t *testing.T
 	result.Error = errors.New("command failed")
 	require.False(t, updater.shouldUseLargeRunSummary(ctx, result, cmd))
 	result.Error = nil
-	updater.RunHistoryCompleteness = staticRunHistoryCompleteness{complete: false}
+	updater.RunHistoryFinalizer = nil
 	require.False(t, updater.shouldUseLargeRunSummary(ctx, result, cmd))
-	updater.RunHistoryCompleteness = staticRunHistoryCompleteness{complete: true}
+	updater.RunHistoryFinalizer = &staticRunHistoryFinalizer{}
 	ctx.RunID = ""
 	require.False(t, updater.shouldUseLargeRunSummary(ctx, result, cmd))
 }
@@ -51,10 +51,11 @@ func TestPullUpdaterPostsOneBoundedLargeRunComment(t *testing.T) {
 	client := vcsmocks.NewMockClient()
 	When(client.CreateComment(Any[logging.SimpleLogging](), Any[models.Repo](), Any[int](), Any[string](), Any[string]())).ThenReturn(nil)
 	renderer := NewMarkdownRenderer(false, false, false, false, false, false, "", "atlantis", false, false)
+	finalizer := &staticRunHistoryFinalizer{}
 	updater := &PullUpdater{
 		VCSClient: client, MarkdownRenderer: renderer,
 		RunHistoryURLGenerator: staticRunHistoryURLGenerator{},
-		RunHistoryCompleteness: staticRunHistoryCompleteness{complete: true}, LargeRunSummaryThreshold: 50,
+		RunHistoryFinalizer:    finalizer, LargeRunSummaryThreshold: 50,
 	}
 	runID, err := runs.NewID()
 	require.NoError(t, err)
@@ -76,6 +77,9 @@ func TestPullUpdaterPostsOneBoundedLargeRunComment(t *testing.T) {
 	}
 
 	updater.updatePull(ctx, &CommentCommand{Name: command.Plan}, command.Result{ProjectResults: results})
+	client.VerifyWasCalled(Never()).CreateComment(
+		Any[logging.SimpleLogging](), Any[models.Repo](), Any[int](), Any[string](), Any[string]())
+	finalizer.finish(true)
 
 	_, _, _, comment, commandName := client.VerifyWasCalledOnce().CreateComment(
 		Any[logging.SimpleLogging](), Eq(ctx.Pull.BaseRepo), Eq(42), AnyString(), Eq("plan"),
@@ -88,6 +92,39 @@ func TestPullUpdaterPostsOneBoundedLargeRunComment(t *testing.T) {
 	require.Equal(t, 1, strings.Count(comment, "View full project results"))
 }
 
+func TestPullUpdaterRetainsFullOutputWhenFinalHistoryPersistenceFails(t *testing.T) {
+	RegisterMockTestingT(t)
+	client := vcsmocks.NewMockClient()
+	When(client.CreateComment(Any[logging.SimpleLogging](), Any[models.Repo](), Any[int](), Any[string](), Any[string]())).ThenReturn(nil)
+	finalizer := &staticRunHistoryFinalizer{}
+	updater := &PullUpdater{
+		VCSClient:              client,
+		MarkdownRenderer:       NewMarkdownRenderer(false, false, false, false, false, false, "", "atlantis", false, false),
+		RunHistoryURLGenerator: staticRunHistoryURLGenerator{},
+		RunHistoryFinalizer:    finalizer, LargeRunSummaryThreshold: 1,
+	}
+	runID, err := runs.NewID()
+	require.NoError(t, err)
+	ctx := &command.Context{RunID: runID, Log: logging.NewNoopLogger(t).WithHistory(), Pull: models.PullRequest{
+		Num: 42, BaseRepo: models.Repo{Owner: "org", Name: "repo", FullName: "org/repo"},
+	}}
+	result := command.Result{ProjectResults: []command.ProjectResult{{
+		RepoRelDir: "terraform/project", Workspace: "default",
+		ProjectCommandOutput: command.ProjectCommandOutput{
+			PlanSuccess: &models.PlanSuccess{TerraformOutput: "only durable copy\nPlan: 1 to add, 0 to change, 0 to destroy."},
+		},
+	}}}
+
+	updater.updatePull(ctx, &CommentCommand{Name: command.Plan}, result)
+	finalizer.finish(false)
+
+	_, _, _, comment, _ := client.VerifyWasCalledOnce().CreateComment(
+		Any[logging.SimpleLogging](), Eq(ctx.Pull.BaseRepo), Eq(42), AnyString(), Eq("plan"),
+	).GetCapturedArguments()
+	require.Contains(t, comment, "only durable copy")
+	require.NotContains(t, comment, "View full project results")
+}
+
 type staticRunHistoryURLGenerator struct{}
 
 func (staticRunHistoryURLGenerator) GenerateRunHistoryURL(runs.ID) (string, error) {
@@ -96,8 +133,17 @@ func (staticRunHistoryURLGenerator) GenerateRunHistoryURL(runs.ID) (string, erro
 
 var _ RunHistoryURLGenerator = staticRunHistoryURLGenerator{}
 
-type staticRunHistoryCompleteness struct{ complete bool }
+type staticRunHistoryFinalizer struct {
+	callback func(bool)
+}
 
-func (s staticRunHistoryCompleteness) IsRunHistoryComplete(runs.ID) bool { return s.complete }
+func (s *staticRunHistoryFinalizer) DeferRunComment(_ runs.ID, callback func(bool)) bool {
+	s.callback = callback
+	return true
+}
 
-var _ RunHistoryCompletenessChecker = staticRunHistoryCompleteness{}
+func (s *staticRunHistoryFinalizer) finish(complete bool) {
+	s.callback(complete)
+}
+
+var _ RunHistoryCommentFinalizer = (*staticRunHistoryFinalizer)(nil)

@@ -25,6 +25,10 @@ func TestRunHistoryAggregatesPlanAndPolicyIntoOneProjectRun(t *testing.T) {
 	ctx := testRunContext(t)
 	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
 	require.NotEmpty(t, ctx.RunID)
+	commentFinalized := false
+	require.True(t, history.DeferRunComment(ctx.RunID, func(complete bool) {
+		commentFinalized = complete
+	}))
 
 	projectCtx := history.beginProject(command.ProjectContext{
 		RunID: ctx.RunID, ProjectName: "network", RepoRelDir: "terraform/network",
@@ -76,6 +80,7 @@ func TestRunHistoryAggregatesPlanAndPolicyIntoOneProjectRun(t *testing.T) {
 	require.False(t, metadata.PolicySets[0].Passed)
 	require.Equal(t, runs.StatusFailed, writer.runsCompleted[0].Status)
 	require.Equal(t, []string{"plan.requested", "plan.completed"}, writer.auditTypes())
+	require.True(t, commentFinalized)
 }
 
 func TestRunHistoryReportsIncompleteProjectPersistence(t *testing.T) {
@@ -83,6 +88,12 @@ func TestRunHistoryReportsIncompleteProjectPersistence(t *testing.T) {
 	history := newTestRunHistory(t, writer)
 	ctx := testRunContext(t)
 	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+	commentFinalized := false
+	commentComplete := true
+	require.True(t, history.DeferRunComment(ctx.RunID, func(complete bool) {
+		commentFinalized = true
+		commentComplete = complete
+	}))
 	require.True(t, history.IsRunHistoryComplete(ctx.RunID))
 
 	history.beginProject(command.ProjectContext{
@@ -91,6 +102,8 @@ func TestRunHistoryReportsIncompleteProjectPersistence(t *testing.T) {
 	})
 	require.False(t, history.IsRunHistoryComplete(ctx.RunID))
 	lifecycle.Finish()
+	require.True(t, commentFinalized)
+	require.False(t, commentComplete)
 }
 
 func TestRunHistoryRepresentsHundredsOfProjectsInOneRun(t *testing.T) {

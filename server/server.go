@@ -885,7 +885,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	}
 	if runHistory != nil && userConfig.WebBasicAuth {
 		pullUpdater.RunHistoryURLGenerator = router
-		pullUpdater.RunHistoryCompleteness = runHistory
+		pullUpdater.RunHistoryFinalizer = runHistory
 		pullUpdater.LargeRunSummaryThreshold = largeRunSummaryProjectThreshold
 	}
 

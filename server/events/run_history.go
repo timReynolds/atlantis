@@ -64,6 +64,19 @@ func (h *RunHistory) IsRunHistoryComplete(runID runs.ID) bool {
 	return h.outputFinalizer == nil || h.outputFinalizer.RunOutputComplete(runID)
 }
 
+// DeferRunComment registers a comment decision that runs only after every
+// final durable write for the logical Run has been attempted.
+func (h *RunHistory) DeferRunComment(runID runs.ID, callback func(complete bool)) bool {
+	if h == nil || runID == "" || callback == nil {
+		return false
+	}
+	value, ok := h.sessions.Load(runID)
+	if !ok {
+		return false
+	}
+	return value.(*runSession).deferComment(callback)
+}
+
 // Begin creates a running logical Run and returns its completion scope.
 func (h *RunHistory) Begin(ctx *command.Context, runCommand runs.Command, trigger runs.Trigger) *RunLifecycle {
 	lifecycle := &RunLifecycle{history: h, ctx: ctx}
@@ -155,6 +168,7 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 		return
 	}
 	session := value.(*runSession)
+	defer func() { session.finalizeComments(!session.persistenceIncomplete.Load()) }()
 	if h.outputFinalizer != nil && !h.outputFinalizer.FinishRun(lifecycle.runID) {
 		session.persistenceIncomplete.Store(true)
 	}
@@ -243,7 +257,33 @@ type runSession struct {
 	run                   runs.Run
 	projects              sync.Map
 	persistenceIncomplete atomic.Bool
+	commentMu             sync.Mutex
+	comments              []func(bool)
+	commentsFinalized     bool
 }
+
+func (s *runSession) deferComment(callback func(bool)) bool {
+	s.commentMu.Lock()
+	defer s.commentMu.Unlock()
+	if s.commentsFinalized {
+		return false
+	}
+	s.comments = append(s.comments, callback)
+	return true
+}
+
+func (s *runSession) finalizeComments(complete bool) {
+	s.commentMu.Lock()
+	s.commentsFinalized = true
+	callbacks := append([]func(bool){}, s.comments...)
+	s.comments = nil
+	s.commentMu.Unlock()
+	for _, callback := range callbacks {
+		callback(complete)
+	}
+}
+
+var _ RunHistoryCommentFinalizer = (*RunHistory)(nil)
 
 type projectIdentity struct {
 	name, directory, workspace string

@@ -72,11 +72,26 @@ func TestStoreConformance(t *testing.T) {
 	attemptID := mustID(t)
 	attempt := runs.RunAttempt{
 		ID: attemptID, RunID: runID, InstanceID: instanceID,
+		DeploymentID:   "conformance",
 		ConcurrencyKey: "sha256:conformance-pull", OwnershipClaimID: "claim-1",
 		Status: runs.AttemptClaimed, ClaimedAt: createdAt, HeartbeatAt: createdAt,
 	}
 	require.NoError(t, store.CreateAttempt(ctx, attempt))
 	require.NoError(t, store.CreateAttempt(ctx, attempt), "attempt replay must be idempotent")
+	otherInstance := instance
+	otherInstance.ID = mustID(t)
+	otherInstance.ReplicaID = "atlantis-other-0"
+	otherInstance.DeploymentID = "other-deployment"
+	require.NoError(t, store.RegisterInstance(ctx, otherInstance))
+	otherAttempt := attempt
+	otherAttempt.ID = mustID(t)
+	otherAttempt.InstanceID = otherInstance.ID
+	otherAttempt.DeploymentID = otherInstance.DeploymentID
+	require.NoError(t, store.CreateAttempt(ctx, otherAttempt), "another deployment may use the same concurrency key")
+	require.NoError(t, store.CompleteAttempt(ctx, runs.AttemptCompletion{
+		ID: otherAttempt.ID, Status: runs.AttemptInterrupted, CompletedAt: startedAt,
+		FailureReason: "conformance cleanup before execution",
+	}))
 	require.NoError(t, store.StartAttempt(ctx, attemptID, startedAt))
 	sideEffectAt := startedAt.Add(250 * time.Millisecond)
 	require.NoError(t, store.MarkAttemptSideEffectStarted(ctx, attemptID, sideEffectAt))

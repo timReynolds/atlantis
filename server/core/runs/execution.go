@@ -68,6 +68,7 @@ type RunAttempt struct {
 	ID                    ID
 	RunID                 ID
 	InstanceID            ID
+	DeploymentID          string
 	ConcurrencyKey        string
 	OwnershipClaimID      string
 	Status                AttemptStatus
@@ -93,6 +94,9 @@ func (a RunAttempt) Validate() error {
 	}
 	if _, err := ParseID(string(a.InstanceID)); err != nil {
 		return fmt.Errorf("validating attempt instance ID: %w", err)
+	}
+	if strings.TrimSpace(a.DeploymentID) == "" {
+		return fmt.Errorf("attempt deployment ID is required")
 	}
 	if strings.TrimSpace(a.ConcurrencyKey) == "" {
 		return fmt.Errorf("attempt concurrency key is required")

@@ -35,6 +35,7 @@ func TestLoadMigrations(t *testing.T) {
 	require.Equal(t, int64(4), migrations[len(migrations)-1].version)
 	require.Contains(t, migrations[len(migrations)-1].sql, "CREATE TABLE run_attempts")
 	require.Contains(t, migrations[len(migrations)-1].sql, "run_attempts_one_active_concurrency_key_idx")
+	require.Contains(t, migrations[len(migrations)-1].sql, "ON run_attempts (deployment_id, concurrency_key)")
 }
 
 func TestRegisterExecutionInstance(t *testing.T) {
@@ -62,7 +63,7 @@ func TestCreateAttemptMapsActiveConcurrencyConflict(t *testing.T) {
 	attempt := claimedAttempt()
 	mock.ExpectExec("INSERT INTO run_attempts").
 		WithArgs(
-			attempt.ID, attempt.RunID, attempt.InstanceID, attempt.ConcurrencyKey,
+			attempt.ID, attempt.RunID, attempt.InstanceID, attempt.DeploymentID, attempt.ConcurrencyKey,
 			attempt.OwnershipClaimID, attempt.Status, attempt.ClaimedAt, nil,
 			attempt.HeartbeatAt, nil, nil, attempt.FailureReason, nil,
 			attempt.ReconciledBy, attempt.ReconciliationSummary, []byte(`{}`),
@@ -289,6 +290,7 @@ func pendingRun() runs.Run {
 func claimedAttempt() runs.RunAttempt {
 	return runs.RunAttempt{
 		ID: testAttemptID, RunID: testRunID, InstanceID: testInstanceID,
+		DeploymentID:   "prod-eu",
 		ConcurrencyKey: "sha256:pull-ownership-key", OwnershipClaimID: "claim-1",
 		Status: runs.AttemptClaimed, ClaimedAt: testTime, HeartbeatAt: testTime,
 	}

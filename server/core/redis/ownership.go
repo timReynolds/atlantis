@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	redislib "github.com/redis/go-redis/v9"
 	"github.com/runatlantis/atlantis/server/core/ownership"
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/logging"
 )
 
@@ -103,13 +104,17 @@ func NewOwnerStoreWithClient(client redislib.Cmdable, config OwnerStoreConfig, l
 	if config.TTL <= 0 {
 		return nil, errors.New("ownership TTL must be positive")
 	}
+	instanceID, err := runs.NewID()
+	if err != nil {
+		return nil, fmt.Errorf("generating ownership instance ID: %w", err)
+	}
 
 	loopCtx, cancel := context.WithCancel(context.Background())
 	store := &OwnerStore{
 		client:     client,
 		config:     config,
 		logger:     logger,
-		instanceID: uuid.NewString(),
+		instanceID: string(instanceID),
 		owned:      make(map[string]ownedRecord),
 		cancel:     cancel,
 		done:       make(chan struct{}),

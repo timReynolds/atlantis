@@ -17,7 +17,7 @@ import (
 const executionInstanceColumns = `id, replica_id, deployment_id, advertise_url,
     started_at, heartbeat_at, stopped_at, version, commit_sha, metadata`
 
-const runAttemptColumns = `id, run_id, instance_id, concurrency_key,
+const runAttemptColumns = `id, run_id, instance_id, deployment_id, concurrency_key,
     ownership_claim_id, status, claimed_at, started_at, heartbeat_at,
     side_effect_started_at, completed_at, failure_reason, reconciled_at,
     reconciled_by, reconciliation_summary, metadata`
@@ -145,13 +145,13 @@ func (s *Store) CreateAttempt(ctx context.Context, attempt runs.RunAttempt) erro
 	defer cancel()
 
 	result, err := s.db.ExecContext(opCtx, `INSERT INTO run_attempts (
-        id, run_id, instance_id, concurrency_key, ownership_claim_id, status,
+        id, run_id, instance_id, deployment_id, concurrency_key, ownership_claim_id, status,
         claimed_at, started_at, heartbeat_at, side_effect_started_at,
         completed_at, failure_reason, reconciled_at, reconciled_by,
         reconciliation_summary, metadata
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
     ON CONFLICT DO NOTHING`,
-		attempt.ID, attempt.RunID, attempt.InstanceID, attempt.ConcurrencyKey,
+		attempt.ID, attempt.RunID, attempt.InstanceID, attempt.DeploymentID, attempt.ConcurrencyKey,
 		attempt.OwnershipClaimID, attempt.Status, attempt.ClaimedAt, attempt.StartedAt,
 		attempt.HeartbeatAt, attempt.SideEffectStartedAt, attempt.CompletedAt,
 		attempt.FailureReason, attempt.ReconciledAt, attempt.ReconciledBy,
@@ -458,7 +458,7 @@ func scanRunAttempt(row rowScanner) (runs.RunAttempt, error) {
 	var startedAt, sideEffectStartedAt, completedAt, reconciledAt sql.NullTime
 	var metadata []byte
 	if err := row.Scan(
-		&attempt.ID, &attempt.RunID, &attempt.InstanceID, &attempt.ConcurrencyKey,
+		&attempt.ID, &attempt.RunID, &attempt.InstanceID, &attempt.DeploymentID, &attempt.ConcurrencyKey,
 		&attempt.OwnershipClaimID, &attempt.Status, &attempt.ClaimedAt, &startedAt,
 		&attempt.HeartbeatAt, &sideEffectStartedAt, &completedAt, &attempt.FailureReason,
 		&reconciledAt, &attempt.ReconciledBy, &attempt.ReconciliationSummary, &metadata,
@@ -520,6 +520,7 @@ func attemptAdmissionMatches(existing, admitted runs.RunAttempt) bool {
 	return existing.ID == admitted.ID &&
 		existing.RunID == admitted.RunID &&
 		existing.InstanceID == admitted.InstanceID &&
+		existing.DeploymentID == admitted.DeploymentID &&
 		existing.ConcurrencyKey == admitted.ConcurrencyKey &&
 		existing.OwnershipClaimID == admitted.OwnershipClaimID &&
 		existing.ClaimedAt.Equal(admitted.ClaimedAt) &&

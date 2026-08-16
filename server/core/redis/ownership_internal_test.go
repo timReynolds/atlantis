@@ -14,6 +14,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	redislib "github.com/redis/go-redis/v9"
 	"github.com/runatlantis/atlantis/server/core/ownership"
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/logging"
 	"github.com/stretchr/testify/require"
 )
@@ -81,6 +82,8 @@ func TestOwnerStore_ConcurrentClaimKeepsOneLiveOwner(t *testing.T) {
 	require.Equal(t, first.record, second.record)
 	require.NotEmpty(t, first.record.ClaimID)
 	require.NotEmpty(t, first.record.InstanceID)
+	_, err := runs.ParseID(first.record.InstanceID)
+	require.NoError(t, err)
 	require.NotEqual(t, storeA.Owns(key, first.record.ClaimID), storeB.Owns(key, first.record.ClaimID))
 }
 

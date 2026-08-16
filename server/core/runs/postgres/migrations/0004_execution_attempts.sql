@@ -11,6 +11,7 @@ CREATE TABLE execution_instances (
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     CONSTRAINT execution_instances_replica_nonempty CHECK (btrim(replica_id) <> ''),
     CONSTRAINT execution_instances_deployment_nonempty CHECK (btrim(deployment_id) <> ''),
+    CONSTRAINT execution_instances_id_deployment_unique UNIQUE (id, deployment_id),
     CONSTRAINT execution_instances_time_order_valid CHECK (
         heartbeat_at >= started_at AND
         (stopped_at IS NULL OR stopped_at >= started_at)
@@ -26,7 +27,8 @@ CREATE INDEX execution_instances_active_heartbeat_idx
 CREATE TABLE run_attempts (
     id uuid PRIMARY KEY,
     run_id uuid NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-    instance_id uuid NOT NULL REFERENCES execution_instances(id) ON DELETE RESTRICT,
+    instance_id uuid NOT NULL,
+    deployment_id text NOT NULL,
     concurrency_key text NOT NULL,
     ownership_claim_id text NOT NULL DEFAULT '',
     status text NOT NULL,
@@ -40,6 +42,9 @@ CREATE TABLE run_attempts (
     reconciled_by text NOT NULL DEFAULT '',
     reconciliation_summary text NOT NULL DEFAULT '',
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    CONSTRAINT run_attempts_instance_deployment_fk FOREIGN KEY (instance_id, deployment_id)
+        REFERENCES execution_instances(id, deployment_id) ON DELETE RESTRICT,
+    CONSTRAINT run_attempts_deployment_nonempty CHECK (btrim(deployment_id) <> ''),
     CONSTRAINT run_attempts_concurrency_key_nonempty CHECK (btrim(concurrency_key) <> ''),
     CONSTRAINT run_attempts_status_valid CHECK (status IN (
         'claimed', 'running', 'succeeded', 'failed', 'interrupted', 'unknown'
@@ -85,4 +90,4 @@ CREATE INDEX run_attempts_unknown_unreconciled_idx
 -- durable admission fence: takeover code must first classify the prior attempt
 -- as interrupted or unknown before admitting another process for the same key.
 CREATE UNIQUE INDEX run_attempts_one_active_concurrency_key_idx
-    ON run_attempts (concurrency_key) WHERE status IN ('claimed', 'running');
+    ON run_attempts (deployment_id, concurrency_key) WHERE status IN ('claimed', 'running');

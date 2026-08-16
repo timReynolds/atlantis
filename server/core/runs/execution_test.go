@@ -20,6 +20,7 @@ func TestRunAttemptValidationDistinguishesInterruptedAndUnknown(t *testing.T) {
 		ID:             "0198a0df-85f1-7d83-a60b-2e57b725c62c",
 		RunID:          "0198a0df-85f1-7d83-a60b-2e57b725c62a",
 		InstanceID:     "0198a0df-85f1-7d83-a60b-2e57b725c62d",
+		DeploymentID:   "prod-eu",
 		ConcurrencyKey: "sha256:pull-ownership-key", ClaimedAt: claimedAt,
 		StartedAt: &startedAt, HeartbeatAt: startedAt,
 		CompletedAt: &completedAt,
@@ -51,6 +52,7 @@ func TestUnknownAttemptReconciliationPreservesUnknownStatus(t *testing.T) {
 		ID:             "0198a0df-85f1-7d83-a60b-2e57b725c62c",
 		RunID:          "0198a0df-85f1-7d83-a60b-2e57b725c62a",
 		InstanceID:     "0198a0df-85f1-7d83-a60b-2e57b725c62d",
+		DeploymentID:   "prod-eu",
 		ConcurrencyKey: "sha256:pull-ownership-key",
 		Status:         runs.AttemptUnknown, ClaimedAt: claimedAt, StartedAt: &startedAt,
 		HeartbeatAt: sideEffectAt, SideEffectStartedAt: &sideEffectAt,
@@ -72,4 +74,17 @@ func TestExecutionInstanceRequiresDeploymentScopedIdentity(t *testing.T) {
 	require.NoError(t, instance.Validate())
 	instance.DeploymentID = ""
 	require.ErrorContains(t, instance.Validate(), "deployment ID")
+}
+
+func TestRunAttemptRequiresDeploymentScopedConcurrency(t *testing.T) {
+	claimedAt := time.Date(2026, 8, 16, 10, 0, 0, 0, time.UTC)
+	attempt := runs.RunAttempt{
+		ID: "0198a0df-85f1-7d83-a60b-2e57b725c62c", RunID: "0198a0df-85f1-7d83-a60b-2e57b725c62a",
+		InstanceID: "0198a0df-85f1-7d83-a60b-2e57b725c62d", ConcurrencyKey: "sha256:key",
+		Status: runs.AttemptClaimed, ClaimedAt: claimedAt, HeartbeatAt: claimedAt,
+	}
+
+	require.ErrorContains(t, attempt.Validate(), "deployment ID")
+	attempt.DeploymentID = "prod-eu"
+	require.NoError(t, attempt.Validate())
 }

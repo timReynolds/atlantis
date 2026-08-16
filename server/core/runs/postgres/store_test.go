@@ -688,7 +688,7 @@ func TestAttemptTakeoverFinalizesSupersededRun(t *testing.T) {
 	}
 }
 
-func newIsolatedStore(t *testing.T, ctx context.Context, rawURL string) (*postgres.Store, func()) {
+func newIsolatedStore(t testing.TB, ctx context.Context, rawURL string) (*postgres.Store, func()) {
 	t.Helper()
 	parsed, err := url.Parse(rawURL)
 	require.NoError(t, err)

@@ -54,15 +54,7 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening PostgreSQL run store: %w", err)
 	}
-	if cfg.MaxOpenConns > 0 {
-		db.SetMaxOpenConns(cfg.MaxOpenConns)
-	}
-	if cfg.MaxIdleConns > 0 {
-		db.SetMaxIdleConns(cfg.MaxIdleConns)
-	}
-	if cfg.ConnMaxLifetime > 0 {
-		db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
-	}
+	configureConnectionPool(db, cfg)
 
 	store := newStore(db, cfg.OperationTimeout)
 	opCtx, cancel := store.operationContext(ctx)
@@ -76,6 +68,16 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 		return nil, err
 	}
 	return store, nil
+}
+
+func configureConnectionPool(db *sql.DB, cfg Config) {
+	if cfg.MaxOpenConns > 0 {
+		db.SetMaxOpenConns(cfg.MaxOpenConns)
+	}
+	db.SetMaxIdleConns(cfg.MaxIdleConns)
+	if cfg.ConnMaxLifetime > 0 {
+		db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
+	}
 }
 
 func newStore(db *sql.DB, operationTimeout time.Duration) *Store {

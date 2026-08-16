@@ -127,27 +127,39 @@ func TestApplyRetentionKeepsCutoffsIndependent(t *testing.T) {
 	outputBefore := testTime
 	auditBefore := testTime.Add(time.Hour)
 	runBefore := testTime.Add(2 * time.Hour)
-	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM run_output_chunks WHERE created_at < $1")).
-		WithArgs(outputBefore).WillReturnResult(sqlmock.NewResult(0, 4))
-	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM audit_events WHERE created_at < $1")).
-		WithArgs(auditBefore).WillReturnResult(sqlmock.NewResult(0, 2))
-	mock.ExpectQuery("SELECT.*count\\(DISTINCT project_runs.id\\), count\\(run_output_chunks.id\\)").
-		WithArgs(runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped).
-		WillReturnRows(sqlmock.NewRows([]string{"projects", "output"}).AddRow(3, 5))
-	mock.ExpectExec("DELETE FROM runs").
-		WithArgs(runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectCommit()
+	mock.ExpectExec("WITH retained_output AS").
+		WithArgs(outputBefore, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, retentionBatchSize))
+	mock.ExpectExec("WITH retained_output AS").
+		WithArgs(outputBefore, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 4))
+	mock.ExpectExec("WITH retained_events AS").
+		WithArgs(auditBefore, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectQuery("WITH retained_runs AS").
+		WithArgs(runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, retentionBatchSize).
+		WillReturnRows(sqlmock.NewRows([]string{"runs", "projects", "output"}).AddRow(retentionBatchSize, 3, 5))
+	mock.ExpectQuery("WITH retained_runs AS").
+		WithArgs(runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, retentionBatchSize).
+		WillReturnRows(sqlmock.NewRows([]string{"runs", "projects", "output"}).AddRow(1, 2, 3))
 
 	result, err := store.ApplyRetention(context.Background(), runs.RetentionPolicy{
 		RunMetadataBefore: &runBefore, OutputBefore: &outputBefore, AuditEventsBefore: &auditBefore,
 	})
 	require.NoError(t, err)
 	require.Equal(t, runs.RetentionResult{
-		RunsDeleted: 1, ProjectRunsDeleted: 3, OutputChunksDeleted: 9, AuditEventsDeleted: 2,
+		RunsDeleted: retentionBatchSize + 1, ProjectRunsDeleted: 5,
+		OutputChunksDeleted: retentionBatchSize + 12, AuditEventsDeleted: 2,
 	}, result)
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestConfigureConnectionPoolHonorsZeroMaxIdleConnections(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	require.Positive(t, db.Stats().Idle)
+	mock.ExpectClose()
+	configureConnectionPool(db, Config{MaxIdleConns: 0})
+	require.Zero(t, db.Stats().Idle)
+	require.NoError(t, mock.ExpectationsWereMet())
+	require.NoError(t, db.Close())
 }
 
 func TestGetRunMapsNotFound(t *testing.T) {

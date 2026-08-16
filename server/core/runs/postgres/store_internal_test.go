@@ -6,6 +6,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"regexp"
 	"testing"
@@ -133,12 +134,19 @@ func TestApplyRetentionKeepsCutoffsIndependent(t *testing.T) {
 		WithArgs(outputBefore, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 4))
 	mock.ExpectExec("WITH retained_events AS").
 		WithArgs(auditBefore, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 2))
-	mock.ExpectQuery("WITH retained_runs AS").
+	runArgs := []driver.Value{runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, retentionBatchSize}
+	mock.ExpectExec("WITH retained_output AS").
+		WithArgs(runArgs...).WillReturnResult(sqlmock.NewResult(0, 8))
+	mock.ExpectExec("WITH retained_projects AS").
+		WithArgs(runArgs...).WillReturnResult(sqlmock.NewResult(0, 5))
+	mock.ExpectExec("WITH retained_events AS").
+		WithArgs(runArgs...).WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectExec("WITH retained_runs AS").
 		WithArgs(runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, retentionBatchSize).
-		WillReturnRows(sqlmock.NewRows([]string{"runs", "projects", "output"}).AddRow(retentionBatchSize, 3, 5))
-	mock.ExpectQuery("WITH retained_runs AS").
+		WillReturnResult(sqlmock.NewResult(0, retentionBatchSize))
+	mock.ExpectExec("WITH retained_runs AS").
 		WithArgs(runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, retentionBatchSize).
-		WillReturnRows(sqlmock.NewRows([]string{"runs", "projects", "output"}).AddRow(1, 2, 3))
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	result, err := store.ApplyRetention(context.Background(), runs.RetentionPolicy{
 		RunMetadataBefore: &runBefore, OutputBefore: &outputBefore, AuditEventsBefore: &auditBefore,

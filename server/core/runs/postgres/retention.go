@@ -89,40 +89,98 @@ func (s *Store) deleteRunMetadataInBatches(ctx context.Context, cutoff time.Time
 		runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial,
 		runs.StatusCancelled, runs.StatusSkipped,
 	}
-	var total runs.RetentionResult
+	output, err := s.deleteRunChildrenInBatches(ctx, `WITH retained_output AS (
+            SELECT output.id
+            FROM run_output_chunks output
+            JOIN project_runs project ON project.id = output.project_run_id
+            JOIN runs run ON run.id = project.run_id
+            WHERE run.completed_at < $1
+              AND run.status IN ($2, $3, $4, $5, $6)
+            ORDER BY run.completed_at, run.id, project.id, output.id
+            LIMIT $7
+        )
+        DELETE FROM run_output_chunks
+        USING retained_output
+        WHERE run_output_chunks.id = retained_output.id`, cutoff, terminal)
+	if err != nil {
+		return runs.RetentionResult{}, err
+	}
+	projects, err := s.deleteRunChildrenInBatches(ctx, `WITH retained_projects AS (
+            SELECT project.id
+            FROM project_runs project
+            JOIN runs run ON run.id = project.run_id
+            WHERE run.completed_at < $1
+              AND run.status IN ($2, $3, $4, $5, $6)
+              AND NOT EXISTS (
+                  SELECT 1 FROM run_output_chunks output
+                  WHERE output.project_run_id = project.id
+              )
+            ORDER BY run.completed_at, run.id, project.id
+            LIMIT $7
+        )
+        DELETE FROM project_runs
+        USING retained_projects
+        WHERE project_runs.id = retained_projects.id`, cutoff, terminal)
+	if err != nil {
+		return runs.RetentionResult{}, err
+	}
+	if _, err := s.deleteRunChildrenInBatches(ctx, `WITH retained_events AS (
+            SELECT event.id
+            FROM audit_events event
+            JOIN runs run ON run.id = event.run_id
+            WHERE run.completed_at < $1
+              AND run.status IN ($2, $3, $4, $5, $6)
+            ORDER BY run.completed_at, run.id, event.id
+            LIMIT $7
+        )
+        UPDATE audit_events
+        SET run_id = NULL
+        FROM retained_events
+        WHERE audit_events.id = retained_events.id`, cutoff, terminal); err != nil {
+		return runs.RetentionResult{}, err
+	}
+	deletedRuns, err := s.deleteRunChildrenInBatches(ctx, `WITH retained_runs AS (
+            SELECT run.id
+            FROM runs run
+            WHERE run.completed_at < $1
+              AND run.status IN ($2, $3, $4, $5, $6)
+              AND NOT EXISTS (
+                  SELECT 1 FROM project_runs project WHERE project.run_id = run.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM audit_events event WHERE event.run_id = run.id
+              )
+            ORDER BY run.completed_at, run.id
+            LIMIT $7
+        )
+        DELETE FROM runs
+        USING retained_runs
+        WHERE runs.id = retained_runs.id`, cutoff, terminal)
+	if err != nil {
+		return runs.RetentionResult{}, err
+	}
+	return runs.RetentionResult{
+		RunsDeleted: deletedRuns, ProjectRunsDeleted: projects, OutputChunksDeleted: output,
+	}, nil
+}
+
+func (s *Store) deleteRunChildrenInBatches(ctx context.Context, query string, cutoff time.Time, terminal []runs.Status) (int64, error) {
+	var total int64
 	for {
 		opCtx, cancel := s.operationContext(ctx)
-		var batch runs.RetentionResult
-		err := s.db.QueryRowContext(opCtx, `WITH retained_runs AS (
-            SELECT id FROM runs
-            WHERE completed_at < $1
-              AND status IN ($2, $3, $4, $5, $6)
-            ORDER BY completed_at, id
-            LIMIT $7
-        ), retained_counts AS (
-            SELECT count(DISTINCT project_runs.id) AS project_runs,
-                   count(run_output_chunks.id) AS output_chunks
-            FROM retained_runs
-            LEFT JOIN project_runs ON project_runs.run_id = retained_runs.id
-            LEFT JOIN run_output_chunks ON run_output_chunks.project_run_id = project_runs.id
-        ), deleted_runs AS (
-            DELETE FROM runs
-            USING retained_runs
-            WHERE runs.id = retained_runs.id
-            RETURNING runs.id
-        )
-        SELECT (SELECT count(*) FROM deleted_runs), project_runs, output_chunks
-        FROM retained_counts`,
+		result, err := s.db.ExecContext(opCtx, query,
 			cutoff, terminal[0], terminal[1], terminal[2], terminal[3], terminal[4], retentionBatchSize,
-		).Scan(&batch.RunsDeleted, &batch.ProjectRunsDeleted, &batch.OutputChunksDeleted)
+		)
 		cancel()
 		if err != nil {
-			return runs.RetentionResult{}, err
+			return 0, err
 		}
-		total.RunsDeleted += batch.RunsDeleted
-		total.ProjectRunsDeleted += batch.ProjectRunsDeleted
-		total.OutputChunksDeleted += batch.OutputChunksDeleted
-		if batch.RunsDeleted < retentionBatchSize {
+		deleted, err := result.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		total += deleted
+		if deleted < retentionBatchSize {
 			return total, nil
 		}
 	}

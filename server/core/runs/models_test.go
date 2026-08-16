@@ -4,6 +4,7 @@
 package runs_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +20,20 @@ func TestNewIDReturnsUUIDv7(t *testing.T) {
 	parsed, err := uuid.Parse(string(id))
 	Ok(t, err)
 	Equals(t, uuid.Version(7), parsed.Version())
+}
+
+func TestParseIDRequiresUUIDv7AndReturnsCanonicalForm(t *testing.T) {
+	id, err := runs.NewID()
+	Ok(t, err)
+
+	parsed, err := runs.ParseID(strings.ToUpper(string(id)))
+	Ok(t, err)
+	Equals(t, id, parsed)
+
+	_, err = runs.ParseID(uuid.Nil.String())
+	Assert(t, err != nil, "nil UUID must be rejected")
+	_, err = runs.ParseID(uuid.New().String())
+	Assert(t, err != nil, "UUIDv4 must be rejected")
 }
 
 func TestRunValidate(t *testing.T) {

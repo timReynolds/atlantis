@@ -25,10 +25,14 @@ func NewID() (ID, error) {
 
 // ParseID validates and returns a durable history identifier.
 func ParseID(value string) (ID, error) {
-	if _, err := uuid.Parse(value); err != nil {
+	id, err := uuid.Parse(value)
+	if err != nil {
 		return "", fmt.Errorf("parsing history identifier: %w", err)
 	}
-	return ID(value), nil
+	if id.Version() != uuid.Version(7) {
+		return "", fmt.Errorf("history identifier must be UUIDv7")
+	}
+	return ID(id.String()), nil
 }
 
 // Command is the logical Atlantis operation represented by a Run.

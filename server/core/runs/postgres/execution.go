@@ -144,74 +144,86 @@ func (s *Store) CreateAttempt(ctx context.Context, attempt runs.RunAttempt) erro
 	opCtx, cancel := s.operationContext(ctx)
 	defer cancel()
 
-	result, err := s.db.ExecContext(opCtx, `WITH superseded_attempts AS (
+	tx, err := s.db.BeginTx(opCtx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning run attempt admission: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var supersededAttempts, supersededRuns, supersededProjects int
+	err = tx.QueryRowContext(opCtx, `WITH superseded_attempts AS (
         UPDATE run_attempts
         SET status = CASE
-                WHEN side_effect_started_at IS NULL THEN $18
-                ELSE $19
+                WHEN side_effect_started_at IS NULL THEN $7
+                ELSE $8
             END,
-            completed_at = $8,
+            completed_at = $4,
             failure_reason = CASE
                 WHEN side_effect_started_at IS NULL THEN 'ownership transferred before side effect started'
                 ELSE 'ownership transferred after side effect started'
             END
-        WHERE deployment_id = $4
-          AND concurrency_key = $5
-          AND ownership_claim_id <> $6
-          AND status IN ($7, $20)
+        WHERE deployment_id = $1
+          AND concurrency_key = $2
+          AND ownership_claim_id <> $3
+          AND status IN ($5, $6)
         RETURNING run_id, status
     ), superseded_runs AS (
         UPDATE runs
         SET status = CASE
-                WHEN superseded_attempts.status = $19 THEN $22
-                ELSE $21
+                WHEN superseded_attempts.status = $8 THEN $10
+                ELSE $9
             END,
-            completed_at = $8
+            completed_at = $4
         FROM superseded_attempts
         WHERE runs.id = superseded_attempts.run_id
-          AND runs.id <> $2
-          AND runs.status = $23
+          AND runs.id <> $12
+          AND runs.status = $11
         RETURNING runs.id
     ), superseded_project_runs AS (
         UPDATE project_runs
         SET status = CASE
-                WHEN project_runs.status = $25 THEN $24
-                WHEN superseded_attempts.status = $19 THEN $22
-                ELSE $21
+                WHEN project_runs.status = $14 THEN $13
+                WHEN superseded_attempts.status = $8 THEN $10
+                ELSE $9
             END,
-            completed_at = $8,
+            completed_at = $4,
             error_summary = CASE
-                WHEN project_runs.status = $25 THEN 'execution ownership transferred before project started'
-                WHEN superseded_attempts.status = $19 THEN 'execution ownership transferred after infrastructure side effect started'
+                WHEN project_runs.status = $14 THEN 'execution ownership transferred before project started'
+                WHEN superseded_attempts.status = $8 THEN 'execution ownership transferred after infrastructure side effect started'
                 ELSE 'execution ownership transferred before infrastructure side effect started'
             END
         FROM superseded_attempts
         WHERE project_runs.run_id = superseded_attempts.run_id
-          AND project_runs.run_id <> $2
-          AND project_runs.status IN ($25, $23)
+          AND project_runs.run_id <> $12
+          AND project_runs.status IN ($14, $11)
         RETURNING project_runs.id
     )
-    INSERT INTO run_attempts (
+    SELECT
+        (SELECT count(*) FROM superseded_attempts),
+        (SELECT count(*) FROM superseded_runs),
+        (SELECT count(*) FROM superseded_project_runs)`,
+		attempt.DeploymentID, attempt.ConcurrencyKey, attempt.OwnershipClaimID, attempt.ClaimedAt,
+		runs.AttemptClaimed, runs.AttemptRunning, runs.AttemptInterrupted, runs.AttemptUnknown,
+		runs.StatusFailed, runs.StatusUnknown, runs.StatusRunning, attempt.RunID,
+		runs.StatusCancelled, runs.StatusPending,
+	).Scan(&supersededAttempts, &supersededRuns, &supersededProjects)
+	if err != nil {
+		return fmt.Errorf("retiring superseded run attempt: %w", err)
+	}
+
+	result, err := tx.ExecContext(opCtx, `INSERT INTO run_attempts (
         id, run_id, instance_id, deployment_id, concurrency_key, ownership_claim_id, status,
         claimed_at, started_at, heartbeat_at, side_effect_started_at,
         completed_at, failure_reason, reconciled_at, reconciled_by,
         reconciliation_summary, metadata
     )
-    SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
-    FROM (
-        SELECT
-            (SELECT count(*) FROM superseded_runs),
-            (SELECT count(*) FROM superseded_project_runs)
-    ) AS superseded
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
     ON CONFLICT DO NOTHING`,
 		attempt.ID, attempt.RunID, attempt.InstanceID, attempt.DeploymentID, attempt.ConcurrencyKey,
 		attempt.OwnershipClaimID, attempt.Status, attempt.ClaimedAt, attempt.StartedAt,
 		attempt.HeartbeatAt, attempt.SideEffectStartedAt, attempt.CompletedAt,
 		attempt.FailureReason, attempt.ReconciledAt, attempt.ReconciledBy,
 		attempt.ReconciliationSummary, []byte(attempt.Metadata),
-		runs.AttemptInterrupted, runs.AttemptUnknown, runs.AttemptRunning,
-		runs.StatusFailed, runs.StatusUnknown, runs.StatusRunning,
-		runs.StatusCancelled, runs.StatusPending,
 	)
 	if err != nil {
 		return fmt.Errorf("creating run attempt: %w", err)
@@ -221,10 +233,14 @@ func (s *Store) CreateAttempt(ctx context.Context, attempt runs.RunAttempt) erro
 		return fmt.Errorf("checking created run attempt: %w", err)
 	}
 	if inserted == 1 {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("committing run attempt admission: %w", err)
+		}
 		return nil
 	}
 
-	existing, err := s.getAttempt(opCtx, attempt.ID)
+	existing, err := scanRunAttempt(tx.QueryRowContext(opCtx,
+		"SELECT "+runAttemptColumns+" FROM run_attempts WHERE id = $1", attempt.ID))
 	if err != nil {
 		if errors.Is(err, runs.ErrNotFound) {
 			return fmt.Errorf("creating run attempt for concurrency key %q: %w", attempt.ConcurrencyKey, runs.ErrConflict)
@@ -233,6 +249,9 @@ func (s *Store) CreateAttempt(ctx context.Context, attempt runs.RunAttempt) erro
 	}
 	if !attemptAdmissionMatches(existing, attempt) {
 		return fmt.Errorf("creating run attempt %s: %w", attempt.ID, runs.ErrConflict)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing replayed run attempt admission: %w", err)
 	}
 	return nil
 }

@@ -65,19 +65,25 @@ func TestRegisterExecutionInstance(t *testing.T) {
 func TestCreateAttemptMapsActiveConcurrencyConflict(t *testing.T) {
 	store, mock := newMockStore(t)
 	attempt := claimedAttempt()
-	mock.ExpectExec("(?s)WITH superseded_attempts AS .*superseded_runs AS .*superseded_project_runs AS").
+	mock.ExpectBegin()
+	mock.ExpectQuery("(?s)WITH superseded_attempts AS .*superseded_runs AS .*superseded_project_runs AS").
 		WithArgs(
-			attempt.ID, attempt.RunID, attempt.InstanceID, attempt.DeploymentID, attempt.ConcurrencyKey,
-			attempt.OwnershipClaimID, attempt.Status, attempt.ClaimedAt, nil,
-			attempt.HeartbeatAt, nil, nil, attempt.FailureReason, nil,
-			attempt.ReconciledBy, attempt.ReconciliationSummary, []byte(`{}`),
-			runs.AttemptInterrupted, runs.AttemptUnknown, runs.AttemptRunning,
-			runs.StatusFailed, runs.StatusUnknown, runs.StatusRunning,
+			attempt.DeploymentID, attempt.ConcurrencyKey, attempt.OwnershipClaimID, attempt.ClaimedAt,
+			runs.AttemptClaimed, runs.AttemptRunning, runs.AttemptInterrupted, runs.AttemptUnknown,
+			runs.StatusFailed, runs.StatusUnknown, runs.StatusRunning, attempt.RunID,
 			runs.StatusCancelled, runs.StatusPending,
 		).
+		WillReturnRows(sqlmock.NewRows([]string{"attempts", "runs", "projects"}).AddRow(0, 0, 0))
+	mock.ExpectExec("INSERT INTO run_attempts").WithArgs(
+		attempt.ID, attempt.RunID, attempt.InstanceID, attempt.DeploymentID, attempt.ConcurrencyKey,
+		attempt.OwnershipClaimID, attempt.Status, attempt.ClaimedAt, nil,
+		attempt.HeartbeatAt, nil, nil, attempt.FailureReason, nil,
+		attempt.ReconciledBy, attempt.ReconciliationSummary, []byte(`{}`),
+	).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery("SELECT .* FROM run_attempts WHERE id = \\$1").
 		WithArgs(testAttemptID).WillReturnError(sql.ErrNoRows)
+	mock.ExpectRollback()
 
 	err := store.CreateAttempt(context.Background(), attempt)
 	require.ErrorIs(t, err, runs.ErrConflict)

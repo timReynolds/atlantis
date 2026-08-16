@@ -21,6 +21,7 @@ func TestOutcomeForProjectPreservesPartialStates(t *testing.T) {
 		{name: "drifted", project: models.ProjectDrift{Drift: models.DriftSummary{HasDrift: true}}, outcome: drift.DetectionOutcomeDrifted},
 		{name: "failed", project: models.ProjectDrift{Error: "provider unavailable"}, outcome: drift.DetectionOutcomeFailed},
 		{name: "locked", project: models.ProjectDrift{Error: "project is currently locked by a plan"}, outcome: drift.DetectionOutcomeLocked},
+		{name: "lock prefix", project: models.ProjectDrift{Error: "lock acquisition failed"}, outcome: drift.DetectionOutcomeLocked},
 		{name: "locked before skipped", project: models.ProjectDrift{Error: "skipped because the project is locked"}, outcome: drift.DetectionOutcomeLocked},
 		{name: "skipped", project: models.ProjectDrift{Error: "project was skipped"}, outcome: drift.DetectionOutcomeSkipped},
 	}

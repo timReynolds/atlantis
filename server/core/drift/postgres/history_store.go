@@ -307,7 +307,7 @@ WHERE detection_id = $1 ORDER BY ordinal LIMIT $2 OFFSET $3`, id, limit+1, offse
 }
 
 const currentOutcomeSQL = `CASE
-    WHEN ds.error <> '' AND (lower(ds.error) LIKE '%locked%' OR lower(ds.error) LIKE '% lock%') THEN 'locked'
+    WHEN ds.error <> '' AND (lower(ds.error) LIKE '%locked%' OR lower(ds.error) LIKE '% lock%' OR lower(ds.error) LIKE 'lock%') THEN 'locked'
     WHEN ds.error <> '' AND lower(ds.error) LIKE '%skip%' THEN 'skipped'
     WHEN ds.error <> '' THEN 'failed'
     WHEN ds.has_drift THEN 'drifted'

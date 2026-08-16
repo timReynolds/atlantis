@@ -720,6 +720,10 @@ func TestAPIController_PlanSetupErrorRedactsCredentials(t *testing.T) {
 
 func TestAPIController_DetectDriftSetupErrorRedactsCredentials(t *testing.T) {
 	ac, _, _ := setup(t)
+	history := &recordingDetectionHistory{}
+	runWriter := &recordingAPIHistoryWriter{}
+	ac.DriftHistory = history
+	ac.RunHistory = events.NewRunHistory(runWriter, logging.NewNoopLogger(t))
 	workingDir := ac.WorkingDir.(*MockWorkingDir)
 	When(workingDir.Clone(Any[logging.SimpleLogging](), Any[models.Repo](), Any[models.PullRequest](), Any[string]())).
 		ThenReturn("", errors.New("fatal: Authentication failed for 'https://user:super-secret@example.com/Repo.git'"))
@@ -741,6 +745,12 @@ func TestAPIController_DetectDriftSetupErrorRedactsCredentials(t *testing.T) {
 	responseBody := w.Body.String()
 	Assert(t, !strings.Contains(responseBody, "super-secret"), "response leaked token: %s", responseBody)
 	Assert(t, !strings.Contains(responseBody, "user:super-secret"), "response leaked credentials: %s", responseBody)
+	Equals(t, 1, len(runWriter.runsCreated))
+	Equals(t, 1, len(runWriter.runsCompleted))
+	Equals(t, runs.StatusFailed, runWriter.runsCompleted[0].Status)
+	Equals(t, 1, len(history.records))
+	Equals(t, drift.DetectionStatusFailed, history.records[0].Run.Status)
+	Equals(t, string(runWriter.runsCreated[0].ID), history.records[0].Run.ID)
 }
 
 func TestAPIController_LegacyPlanApplyErrorsReturnLegacyShape(t *testing.T) {
@@ -2950,10 +2960,11 @@ func TestAPIController_Remediate(t *testing.T) {
 		},
 	}
 	var capturedRequest models.RemediationRequest
+	var remediationErr error
 	When(remediationService.Remediate(Any[models.RemediationRequest](), Any[drift.RemediationExecutor]())).
 		Then(func(args []Param) ReturnValues {
 			capturedRequest = args[0].(models.RemediationRequest)
-			return ReturnValues{mockResult, nil}
+			return ReturnValues{mockResult, remediationErr}
 		})
 
 	When(vcsClient.GetCloneURL(Any[logging.SimpleLogging](), Any[models.VCSHostType](), Eq("owner/repo"))).ThenReturn("https://github.com/owner/repo.git", nil)
@@ -3003,6 +3014,16 @@ func TestAPIController_Remediate(t *testing.T) {
 	Equals(t, capturedRequest.RunID, string(runWriter.runsCreated[0].ID))
 	Equals(t, runs.CommandDriftRemediation, runWriter.runsCreated[0].Command)
 	Equals(t, 1, len(runWriter.runsCompleted))
+
+	remediationErr = &drift.RemediationResultPersistenceError{Err: errors.New("history unavailable")}
+	retryReq, _ := http.NewRequest("POST", "", bytes.NewBuffer(body))
+	retryReq.Header.Set(atlantisTokenHeader, atlantisToken)
+	retryWriter := httptest.NewRecorder()
+	ac.Remediate(retryWriter, retryReq)
+
+	Equals(t, http.StatusOK, retryWriter.Code)
+	Equals(t, 2, len(runWriter.runsCompleted))
+	Equals(t, runs.StatusSucceeded, runWriter.runsCompleted[1].Status)
 }
 
 func TestAPIController_Remediate_ProjectFailuresReturnNon2xx(t *testing.T) {

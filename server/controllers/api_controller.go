@@ -1233,9 +1233,13 @@ func (a *APIController) Remediate(w http.ResponseWriter, r *http.Request) {
 	// Execute remediation
 	result, err := a.RemediationService.Remediate(request, executor)
 	if err != nil {
-		lifecycle.Fail()
-		responder.InternalError(w, r, err)
-		return
+		var persistenceErr *drift.RemediationResultPersistenceError
+		if result == nil || !errors.As(err, &persistenceErr) {
+			lifecycle.Fail()
+			responder.InternalError(w, r, err)
+			return
+		}
+		a.Logger.Warn("failed to store completed drift remediation history: %v", persistenceErr)
 	}
 	if result.Status == models.RemediationStatusFailed || result.Status == models.RemediationStatusPartial {
 		historyCtx.CommandHasErrors = true
@@ -2271,13 +2275,6 @@ func (a *APIController) DetectDrift(w http.ResponseWriter, r *http.Request) {
 		ExactProjectNameMatching:  true,
 		SortByExecutionOrder:      true,
 	}
-
-	// Setup working directory
-	if err := a.apiSetup(ctx, command.Plan); err != nil {
-		responder.InternalError(w, r, fmt.Errorf("setup failed: %w", err))
-		return
-	}
-	defer a.cleanupNonPRWorkingDir(ctx)
 	lifecycle := a.RunHistory.Begin(ctx, runs.CommandDriftDetection, runs.TriggerAPI)
 	defer lifecycle.FinishRecovering()
 	detectionResult := models.NewDriftDetectionResult(request.Repository)
@@ -2294,6 +2291,18 @@ func (a *APIController) DetectDrift(w http.ResponseWriter, r *http.Request) {
 			ctx.Pull.HeadCommit, string(ctx.RunID), detectionStartedAt, time.Now(), runFailed,
 		))
 	}
+
+	// Setup working directory
+	if err := a.apiSetup(ctx, command.Plan); err != nil {
+		lifecycle.Fail()
+		lifecycle.Finish()
+		if historyErr := recordDetectionHistory(true); historyErr != nil {
+			a.Logger.Warn("failed to store drift detection history: %v", historyErr)
+		}
+		responder.InternalError(w, r, fmt.Errorf("setup failed: %w", err))
+		return
+	}
+	defer a.cleanupNonPRWorkingDir(ctx)
 
 	// Run pre-workflow hooks before project discovery so hooks can
 	// dynamically generate atlantis.yaml or other config files.

@@ -69,7 +69,7 @@ func TestDurableHistoryConformance(t *testing.T) {
 	locked := models.ProjectDrift{
 		ProjectName: "database", Path: "terraform/database", Workspace: "production",
 		Ref: "main", BaseBranch: "main", ResolvedCommit: "deadbeef", DetectionID: string(runID),
-		Error: "project is currently locked by another plan", LastChecked: completedAt,
+		Error: "lock acquisition failed", LastChecked: completedAt,
 	}
 	require.NoError(t, latest.Store("github.com/example/infrastructure", drifted))
 	require.NoError(t, latest.Store("github.com/example/infrastructure", locked))

@@ -29,6 +29,21 @@ type RemediationService interface {
 	ListResults(repository string, limit int) ([]*models.RemediationResult, error)
 }
 
+// RemediationResultPersistenceError reports that remediation execution
+// completed but its final result could not be persisted. Callers can still
+// return the completed result without inviting a retry of successful applies.
+type RemediationResultPersistenceError struct {
+	Err error
+}
+
+func (e *RemediationResultPersistenceError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *RemediationResultPersistenceError) Unwrap() error {
+	return e.Err
+}
+
 // RemediationExecutor executes the actual plan/apply operations.
 // This interface allows the service to be decoupled from the API controller.
 type RemediationExecutor interface {
@@ -157,7 +172,7 @@ func (s *InMemoryRemediationService) Remediate(req models.RemediationRequest, ex
 	// Mark as complete
 	result.Complete()
 	if err := s.storeResult(result); err != nil {
-		return nil, err
+		return result, &RemediationResultPersistenceError{Err: err}
 	}
 
 	return result, nil

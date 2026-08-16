@@ -242,6 +242,88 @@ func TestStoreConformance(t *testing.T) {
 	require.Len(t, auditPage.Events, 1)
 	require.NoError(t, store.StopInstance(ctx, instanceID, completedAt))
 
+	// A process that exits after durable claim admission but before command
+	// start leaves a claimed attempt. It is interrupted and the exact plan may
+	// reuse the logical Run.
+	claimedRunID := mustID(t)
+	claimedPull := 19
+	claimedRun := runs.Run{
+		ID: claimedRunID, Repository: "example/infrastructure", PullNumber: &claimedPull,
+		Command: runs.CommandPlan, Trigger: runs.TriggerComment, Actor: "operator",
+		BaseRef: "main", HeadRef: "claimed-plan", HeadSHA: "a11ce",
+		Status: runs.StatusRunning, CreatedAt: completedAt, StartedAt: &completedAt,
+	}
+	require.NoError(t, store.CreateRun(ctx, claimedRun))
+	claimedInstanceID := mustID(t)
+	require.NoError(t, store.RegisterInstance(ctx, runs.ExecutionInstance{
+		ID: claimedInstanceID, ReplicaID: "atlantis-claimed", DeploymentID: "conformance",
+		StartedAt: completedAt, HeartbeatAt: completedAt,
+	}))
+	claimedAttemptID := mustID(t)
+	require.NoError(t, store.CreateAttempt(ctx, runs.RunAttempt{
+		ID: claimedAttemptID, RunID: claimedRunID, InstanceID: claimedInstanceID,
+		ConcurrencyKey: "sha256:claimed-plan", OwnershipClaimID: "claimed-old",
+		Status: runs.AttemptClaimed, ClaimedAt: completedAt, HeartbeatAt: completedAt,
+	}))
+	duplicateAttemptErr := store.CreateAttempt(ctx, runs.RunAttempt{
+		ID: mustID(t), RunID: claimedRunID, InstanceID: claimedInstanceID,
+		ConcurrencyKey: "sha256:claimed-plan", OwnershipClaimID: "duplicate-delivery",
+		Status: runs.AttemptClaimed, ClaimedAt: completedAt, HeartbeatAt: completedAt,
+	})
+	require.ErrorIs(t, duplicateAttemptErr, runs.ErrConflict,
+		"a duplicate delivery cannot create overlapping active work")
+	claimedRecoveredAt := completedAt.Add(2 * time.Minute)
+	claimedTakeover, err := store.PrepareAttemptTakeover(ctx, runs.AttemptTakeoverRequest{
+		ConcurrencyKey: "sha256:claimed-plan", OwnershipClaimID: "claimed-new",
+		HeartbeatBefore: claimedRecoveredAt.Add(-time.Minute), RecoveredAt: claimedRecoveredAt,
+		Repository: claimedRun.Repository, PullNumber: &claimedPull, Command: claimedRun.Command,
+		Trigger: claimedRun.Trigger, Actor: claimedRun.Actor, BaseRef: claimedRun.BaseRef,
+		HeadRef: claimedRun.HeadRef, HeadSHA: claimedRun.HeadSHA,
+	})
+	require.NoError(t, err)
+	require.Equal(t, runs.AttemptInterrupted, claimedTakeover.RecoveredAttempt.Status)
+	require.Equal(t, claimedRunID, claimedTakeover.RetryRun.ID)
+
+	// An apply interrupted before the durable mutation marker is not unknown,
+	// but it is also never converted into an automatic retry of the same Run.
+	preApplyRunID := mustID(t)
+	preApplyPull := 21
+	preApplyCreatedAt := claimedRecoveredAt.Add(time.Second)
+	preApplyRun := runs.Run{
+		ID: preApplyRunID, Repository: "example/infrastructure", PullNumber: &preApplyPull,
+		Command: runs.CommandApply, Trigger: runs.TriggerComment, Actor: "operator",
+		BaseRef: "main", HeadRef: "pre-apply", HeadSHA: "b4apply",
+		Status: runs.StatusRunning, CreatedAt: preApplyCreatedAt, StartedAt: &preApplyCreatedAt,
+	}
+	require.NoError(t, store.CreateRun(ctx, preApplyRun))
+	preApplyInstanceID := mustID(t)
+	require.NoError(t, store.RegisterInstance(ctx, runs.ExecutionInstance{
+		ID: preApplyInstanceID, ReplicaID: "atlantis-pre-apply", DeploymentID: "conformance",
+		StartedAt: preApplyCreatedAt, HeartbeatAt: preApplyCreatedAt,
+	}))
+	preApplyAttemptID := mustID(t)
+	require.NoError(t, store.CreateAttempt(ctx, runs.RunAttempt{
+		ID: preApplyAttemptID, RunID: preApplyRunID, InstanceID: preApplyInstanceID,
+		ConcurrencyKey: "sha256:pre-apply", OwnershipClaimID: "pre-apply-old",
+		Status: runs.AttemptClaimed, ClaimedAt: preApplyCreatedAt, HeartbeatAt: preApplyCreatedAt,
+	}))
+	require.NoError(t, store.StartAttempt(ctx, preApplyAttemptID, preApplyCreatedAt))
+	preApplyRecoveredAt := preApplyCreatedAt.Add(2 * time.Minute)
+	preApplyTakeover, err := store.PrepareAttemptTakeover(ctx, runs.AttemptTakeoverRequest{
+		ConcurrencyKey: "sha256:pre-apply", OwnershipClaimID: "pre-apply-new",
+		HeartbeatBefore: preApplyRecoveredAt.Add(-time.Minute), RecoveredAt: preApplyRecoveredAt,
+		Repository: preApplyRun.Repository, PullNumber: &preApplyPull, Command: preApplyRun.Command,
+		Trigger: preApplyRun.Trigger, Actor: preApplyRun.Actor, BaseRef: preApplyRun.BaseRef,
+		HeadRef: preApplyRun.HeadRef, HeadSHA: preApplyRun.HeadSHA,
+	})
+	require.NoError(t, err)
+	require.Equal(t, runs.AttemptInterrupted, preApplyTakeover.RecoveredAttempt.Status)
+	require.Nil(t, preApplyTakeover.RetryRun)
+	require.Nil(t, preApplyTakeover.UnreconciledUnknown)
+	storedPreApplyRun, err := store.GetRun(ctx, preApplyRunID)
+	require.NoError(t, err)
+	require.Equal(t, runs.StatusFailed, storedPreApplyRun.Status)
+
 	// A stale plan attempt under an older Redis claim is interrupted and a
 	// duplicate delivery reuses the same logical Run while preserving both
 	// attempts and both sets of project results.
@@ -275,6 +357,17 @@ func TestStoreConformance(t *testing.T) {
 		ProjectName: "network", Directory: "terraform/network", Workspace: "production",
 		Status: runs.StatusRunning, StartedAt: &retryStartedAt,
 	}))
+	liveTakeover, err := store.PrepareAttemptTakeover(ctx, runs.AttemptTakeoverRequest{
+		ConcurrencyKey: "sha256:retry-plan", OwnershipClaimID: "premature-plan-claim",
+		HeartbeatBefore: retryStartedAt.Add(-time.Second), RecoveredAt: retryStartedAt.Add(time.Second),
+		Repository: retryRun.Repository, PullNumber: &retryPull, Command: retryRun.Command,
+		Trigger: retryRun.Trigger, Actor: retryRun.Actor, BaseRef: retryRun.BaseRef,
+		HeadRef: retryRun.HeadRef, HeadSHA: retryRun.HeadSHA,
+	})
+	require.NoError(t, err)
+	require.Equal(t, staleAttemptID, liveTakeover.ActiveAttempt.ID,
+		"Redis lease movement alone must not overlap a process with a fresh PostgreSQL heartbeat")
+	require.Nil(t, liveTakeover.RecoveredAttempt)
 	recoveredAt := retryStartedAt.Add(2 * time.Minute)
 	takeover, err := store.PrepareAttemptTakeover(ctx, runs.AttemptTakeoverRequest{
 		ConcurrencyKey: "sha256:retry-plan", OwnershipClaimID: "new-plan-claim",

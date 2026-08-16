@@ -35,13 +35,15 @@ const (
 	haPlanReadyFileEnv     = "ATLANTIS_HA_PLAN_READY_FILE"
 	haPlanPullNumberEnv    = "ATLANTIS_HA_PLAN_PULL_NUMBER"
 	haPlanHeadSHAEnv       = "ATLANTIS_HA_PLAN_HEAD_SHA"
-	haPlanRepository       = "failure-tests/infrastructure"
+	haPlanRepository       = "github.example.test/failure-tests/infrastructure"
 	haPlanProject          = "network"
 	haPlanDirectory        = "terraform/network"
 	haPlanWorkspace        = "production"
 	haPlanFilename         = "network-production.tfplan"
 	haPlanContent          = "opaque plan persisted before SIGKILL"
 	haPlanWorkflowIdentity = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	haPlanConcurrencyKey   = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	haPlanOwnershipClaim   = "plan-owner-before-process-loss"
 )
 
 // TestHAPlanArtifactSurvivesProcessTermination is an opt-in release-gating
@@ -113,6 +115,19 @@ func TestHAPlanArtifactSurvivesProcessTermination(t *testing.T) {
 	store, err := runpostgres.New(ctx, runpostgres.Config{URL: testURL, OperationTimeout: 5 * time.Second})
 	require.NoError(t, err)
 	defer store.Close()
+	recoveredAt := time.Now().UTC().Add(2 * time.Minute)
+	takeover, err := store.PrepareAttemptTakeover(ctx, runs.AttemptTakeoverRequest{
+		ConcurrencyKey: haPlanConcurrencyKey, OwnershipClaimID: "replacement-plan-owner",
+		HeartbeatBefore: recoveredAt.Add(-time.Minute), RecoveredAt: recoveredAt,
+		Repository: haPlanRepository, PullNumber: &pullNumber, Command: runs.CommandPlan,
+		Trigger: runs.TriggerComment, Actor: "failure-test", BaseRef: "main",
+		HeadRef: "failure-test", HeadSHA: headSHA,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, takeover.RecoveredAttempt)
+	require.NotNil(t, takeover.RetryRun)
+	require.Equal(t, runs.AttemptInterrupted, takeover.RecoveredAttempt.Status)
+	require.Equal(t, takeover.RecoveredAttempt.RunID, takeover.RetryRun.ID)
 	s3Store, err := planstore.NewS3PlanStore(planstore.S3PlanStoreConfig{
 		Bucket: bucket, Region: region, Endpoint: endpoint, ForcePathStyle: true,
 	}, logging.NewNoopLogger(t))
@@ -138,6 +153,13 @@ func runHAPlanRecoveryHelper(t *testing.T) {
 		URL: os.Getenv(haPlanPostgresEnv), OperationTimeout: 5 * time.Second,
 	})
 	require.NoError(t, err)
+	instanceID, err := runs.NewID()
+	require.NoError(t, err)
+	startedAt := time.Now().UTC()
+	require.NoError(t, store.RegisterInstance(ctx, runs.ExecutionInstance{
+		ID: instanceID, ReplicaID: "plan-helper", DeploymentID: "failure-gates",
+		StartedAt: startedAt, HeartbeatAt: startedAt,
+	}))
 	s3Store, err := planstore.NewS3PlanStore(planstore.S3PlanStoreConfig{
 		Bucket: os.Getenv(haPlanS3BucketEnv), Region: os.Getenv(haPlanS3RegionEnv),
 		Endpoint: os.Getenv(haPlanS3EndpointEnv), ForcePathStyle: true,
@@ -147,10 +169,13 @@ func runHAPlanRecoveryHelper(t *testing.T) {
 	projectCtx := haPlanProjectContext(pullNumber, headSHA)
 	runCtx := &command.Context{
 		Log: projectCtx.Log, User: projectCtx.User,
-		Pull: projectCtx.Pull,
+		Pull:                projectCtx.Pull,
+		ExecutionInstanceID: instanceID, ConcurrencyKey: haPlanConcurrencyKey,
+		OwnershipClaimID: haPlanOwnershipClaim,
 	}
 	history.Begin(runCtx, runs.CommandPlan, runs.TriggerComment)
 	projectCtx.RunID = runCtx.RunID
+	projectCtx.AttemptID = runCtx.AttemptID
 	projectCtx = history.beginProject(projectCtx)
 	planPath := filepath.Join(t.TempDir(), haPlanFilename)
 	require.NoError(t, os.WriteFile(planPath, []byte(haPlanContent), 0o600))
@@ -161,7 +186,10 @@ func runHAPlanRecoveryHelper(t *testing.T) {
 }
 
 func haPlanProjectContext(pullNumber int, headSHA string) command.ProjectContext {
-	repository := models.Repo{Owner: "failure-tests", Name: "infrastructure", FullName: haPlanRepository}
+	repository := models.Repo{
+		Owner: "failure-tests", Name: "infrastructure", FullName: "failure-tests/infrastructure",
+		VCSHost: models.VCSHost{Type: models.Github, Hostname: "github.example.test"},
+	}
 	pull := models.PullRequest{
 		Num: pullNumber, BaseRepo: repository, BaseBranch: "main",
 		HeadBranch: "failure-test", HeadCommit: headSHA,

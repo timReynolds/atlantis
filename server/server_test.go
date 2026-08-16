@@ -349,6 +349,14 @@ func TestParseAtlantisURL(t *testing.T) {
 			}
 		})
 	}
+
+	req, err := http.NewRequest(http.MethodGet, "/repos/group/pulls/42", nil)
+	Ok(t, err)
+	var match mux.RouteMatch
+	Assert(t, s.Router.Match(req, &match), "repository route should match")
+	Equals(t, "group/pulls/42", match.Vars["repository"])
+	_, hasPullNumber := match.Vars["pull-number"]
+	Assert(t, !hasPullNumber, "repository suffix must not be interpreted as a pull number")
 }
 
 func TestSetupRoutes_APIRoutesRegistered(t *testing.T) {
@@ -388,9 +396,10 @@ func TestSetupRoutes_APIRoutesRegistered(t *testing.T) {
 		{"GET", "/runs/019c0000-0000-7000-8000-000000000000"},
 		{"GET", "/runs/019c0000-0000-7000-8000-000000000000/projects/019c0000-0000-7000-8000-000000000001"},
 		{"GET", "/repos/example/infrastructure"},
-		{"GET", "/repos/example/infrastructure/pulls/42"},
+		{"GET", "/repos/example/infrastructure?pull=42"},
 		{"GET", "/repos/group/subgroup/infrastructure"},
-		{"GET", "/repos/group/subgroup/infrastructure/pulls/42"},
+		{"GET", "/repos/group/subgroup/infrastructure?pull=42"},
+		{"GET", "/repos/group/pulls/42"},
 		{"GET", "/audit"},
 	}
 

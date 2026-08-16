@@ -479,7 +479,7 @@ func presentRun(run runs.Run) web_templates.RunHistoryRun {
 	if repositoryPath := repositoryHistoryPath(run.Repository); repositoryPath != "" {
 		item.RepositoryPath = repositoryPath
 		if item.PullNumber > 0 {
-			item.PullHistoryPath = item.RepositoryPath + "/pulls/" + strconv.Itoa(item.PullNumber)
+			item.PullHistoryPath = item.RepositoryPath + "?pull=" + strconv.Itoa(item.PullNumber)
 		}
 	}
 	return item

@@ -81,15 +81,27 @@ func TestRunHistoryControllerPreservesNestedRepositoryNamespaces(t *testing.T) {
 	run := runs.Run{Repository: "group/subgroup/repo", PullNumber: &pull}
 	presented := presentRun(run)
 	require.Equal(t, "/repos/group/subgroup/repo", presented.RepositoryPath)
-	require.Equal(t, "/repos/group/subgroup/repo/pulls/42", presented.PullHistoryPath)
+	require.Equal(t, "/repos/group/subgroup/repo?pull=42", presented.PullHistoryPath)
 
 	request := mux.SetURLVars(httptest.NewRequest(http.MethodGet, presented.PullHistoryPath, nil), map[string]string{
-		"repository": "group/subgroup/repo", "pull-number": "42",
+		"repository": "group/subgroup/repo",
 	})
 	filter, _, _, err := parseRunHistoryFilter(request)
 	require.NoError(t, err)
 	require.Equal(t, run.Repository, filter.Repository)
 	require.Equal(t, pull, *filter.PullNumber)
+}
+
+func TestRunHistoryControllerDoesNotTreatRepositorySuffixAsPullRoute(t *testing.T) {
+	request := mux.SetURLVars(httptest.NewRequest(http.MethodGet, "/repos/group/pulls/42", nil), map[string]string{
+		"repository": "group/pulls/42",
+	})
+
+	filter, _, _, err := parseRunHistoryFilter(request)
+
+	require.NoError(t, err)
+	require.Equal(t, "group/pulls/42", filter.Repository)
+	require.Nil(t, filter.PullNumber)
 }
 
 func TestRunHistoryControllerDoesNotExposeProjectOutputWithoutAuthentication(t *testing.T) {

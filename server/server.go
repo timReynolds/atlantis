@@ -1538,7 +1538,7 @@ func (s *Server) shutdown(server httpShutdowner, timeout time.Duration) error {
 	// jobs/SSE stream) must not skip draining in-progress operations, flushing
 	// stats, releasing ownership claims, and closing the database below.
 	if err := server.Shutdown(ctx); err != nil {
-		s.Logger.Err("while shutting down HTTP server: %v", err)
+		s.Logger.Err("while shutting down HTTP server %v", err)
 	}
 
 	commandsDrained := waitForAcceptedCommands(ctx, s.commandExecutorWaiter)
@@ -1563,7 +1563,7 @@ func (s *Server) shutdown(server httpShutdowner, timeout time.Duration) error {
 			err = abandoner.Abandon()
 		}
 		if err != nil {
-			s.Logger.Err("while stopping pull request ownership: %v", err)
+			s.Logger.Err("while stopping pull request ownership %v", err)
 		}
 	}
 	if s.executionInstance != nil {
@@ -1574,7 +1574,7 @@ func (s *Server) shutdown(server httpShutdowner, timeout time.Duration) error {
 		cancel()
 	}
 	if err := s.closeDatabase(1 * time.Second); err != nil {
-		s.Logger.Err("while closing database: %v", err)
+		s.Logger.Err("while closing database %v", err)
 	}
 	if err := s.closeRunStore(1 * time.Second); err != nil {
 		s.Logger.Err("while closing run store %v", err)

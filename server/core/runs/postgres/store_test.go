@@ -339,6 +339,46 @@ func TestStoreConformance(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, retryProjects.ProjectRuns, 2)
 
+	// A preserved interrupted plan can only retain its logical Run when the
+	// replacement request is the exact same operation. A newer ref must
+	// terminalize the old Run before creating a different logical operation.
+	mismatchCreatedAt := retryCompletedAt.Add(500 * time.Millisecond)
+	mismatchRunID := mustID(t)
+	mismatchPull := 24
+	mismatchRun := runs.Run{
+		ID: mismatchRunID, Repository: "example/infrastructure", PullNumber: &mismatchPull,
+		Command: runs.CommandPlan, Trigger: runs.TriggerComment, Actor: "operator",
+		BaseRef: "main", HeadRef: "interrupted-plan", HeadSHA: "old-commit",
+		Status: runs.StatusRunning, CreatedAt: mismatchCreatedAt, StartedAt: &mismatchCreatedAt,
+	}
+	require.NoError(t, store.CreateRun(ctx, mismatchRun))
+	mismatchAttemptID := mustID(t)
+	require.NoError(t, store.CreateAttempt(ctx, runs.RunAttempt{
+		ID: mismatchAttemptID, RunID: mismatchRunID, InstanceID: staleInstanceID,
+		DeploymentID: "conformance", ConcurrencyKey: "sha256:mismatched-plan",
+		OwnershipClaimID: "old-mismatch-claim", Status: runs.AttemptClaimed,
+		ClaimedAt: mismatchCreatedAt, HeartbeatAt: mismatchCreatedAt,
+	}))
+	require.NoError(t, store.StartAttempt(ctx, mismatchAttemptID, mismatchCreatedAt))
+	mismatchInterruptedAt := mismatchCreatedAt.Add(time.Second)
+	require.NoError(t, store.CompleteAttempt(ctx, runs.AttemptCompletion{
+		ID: mismatchAttemptID, Status: runs.AttemptInterrupted, CompletedAt: mismatchInterruptedAt,
+		FailureReason: "graceful shutdown deadline expired before a side effect",
+	}))
+	mismatchRecovery, err := store.PrepareAttemptTakeover(ctx, runs.AttemptTakeoverRequest{
+		ConcurrencyKey: "sha256:mismatched-plan", OwnershipClaimID: "new-mismatch-claim",
+		HeartbeatBefore: mismatchInterruptedAt, RecoveredAt: mismatchInterruptedAt.Add(time.Second),
+		Repository: mismatchRun.Repository, PullNumber: &mismatchPull, Command: mismatchRun.Command,
+		Trigger: mismatchRun.Trigger, Actor: mismatchRun.Actor, BaseRef: mismatchRun.BaseRef,
+		HeadRef: mismatchRun.HeadRef, HeadSHA: "new-commit",
+	})
+	require.NoError(t, err)
+	require.Nil(t, mismatchRecovery.RetryRun)
+	require.Equal(t, mismatchAttemptID, mismatchRecovery.RecoveredAttempt.ID)
+	storedMismatchRun, err := store.GetRun(ctx, mismatchRunID)
+	require.NoError(t, err)
+	require.Equal(t, runs.StatusFailed, storedMismatchRun.Status)
+
 	// Older releases completed the Run before terminalizing its attempt. A
 	// takeover repairs that ordering idempotently instead of blocking forever.
 	terminalCreatedAt := retryCompletedAt.Add(time.Second)

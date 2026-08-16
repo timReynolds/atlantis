@@ -14,7 +14,10 @@ import (
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/db/mocks"
 	"github.com/runatlantis/atlantis/server/core/ownership"
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events"
+	"github.com/runatlantis/atlantis/server/events/command"
+	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/logging"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
@@ -77,6 +80,31 @@ func TestServer_ShutdownAbandonsClaimsWhenAcceptedCommandMissesDeadline(t *testi
 	<-waiter.started
 	close(waiter.release)
 	assert.Equal(t, []string{"begin-drain", "http-shutdown", "owner-abandon", "instance-stop"}, calls)
+}
+
+func TestServer_ShutdownAbandonsClaimsForActiveAPILifecycle(t *testing.T) {
+	var calls []string
+	logger := logging.NewNoopLogger(t)
+	history := events.NewRunHistory(runs.NoopStore{}, logger)
+	ctx := &command.Context{
+		Log: logger, User: models.User{Username: "operator"},
+		Pull: models.PullRequest{
+			Num: 42, BaseBranch: "main", HeadBranch: "feature", HeadCommit: "abc123",
+			BaseRepo: models.Repo{FullName: "org/repo", Owner: "org", Name: "repo"},
+		},
+	}
+	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerAPI)
+	assert.True(t, history.HasActiveExecutions())
+
+	owners := &shutdownOwnerStore{calls: &calls}
+	s := &Server{
+		OwnerStore: owners, Drainer: &events.Drainer{}, Logger: logger, runHistory: history,
+	}
+	assert.NoError(t, s.shutdown(&recordingHTTPShutdowner{calls: &calls, err: context.DeadlineExceeded}, time.Second))
+	lifecycle.Finish()
+
+	assert.False(t, history.HasActiveExecutions())
+	assert.Equal(t, []string{"begin-drain", "http-shutdown", "owner-abandon"}, calls)
 }
 
 type recordingHTTPShutdowner struct {

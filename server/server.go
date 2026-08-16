@@ -1543,7 +1543,8 @@ func (s *Server) shutdown(server httpShutdowner, timeout time.Duration) error {
 
 	commandsDrained := waitForAcceptedCommands(ctx, s.commandExecutorWaiter)
 	operationsDrained := s.waitForDrain(ctx)
-	executionDrained := commandsDrained && operationsDrained
+	historyDrained := s.runHistory == nil || !s.runHistory.HasActiveExecutions()
+	executionDrained := commandsDrained && operationsDrained && historyDrained
 	if !executionDrained && s.runHistory != nil {
 		interrupted := s.runHistory.InterruptActive("graceful shutdown deadline expired")
 		if interrupted > 0 {

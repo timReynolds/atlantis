@@ -117,6 +117,21 @@ func (h *RunHistory) InterruptActive(reason string) int {
 	return interrupted
 }
 
+// HasActiveExecutions reports whether an executable lifecycle is still using
+// durable Run state. Unlike the HTTP drainer, this includes API-triggered plan,
+// apply, drift detection, and drift remediation handlers.
+func (h *RunHistory) HasActiveExecutions() bool {
+	if h == nil {
+		return false
+	}
+	active := false
+	h.sessions.Range(func(_, _ any) bool {
+		active = true
+		return false
+	})
+	return active
+}
+
 // IsRunHistoryComplete reports whether all persistence attempted so far for a
 // Run succeeded. Callers use it to retain full VCS output when history is incomplete.
 func (h *RunHistory) IsRunHistoryComplete(runID runs.ID) bool {
@@ -399,11 +414,12 @@ func (l *RunLifecycle) interrupt(reason string, retryablePlan bool) {
 
 func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 	lifecycle.stopAttemptHeartbeat()
-	value, ok := h.sessions.LoadAndDelete(lifecycle.runID)
+	value, ok := h.sessions.Load(lifecycle.runID)
 	if !ok {
 		return
 	}
 	session := value.(*runSession)
+	defer h.sessions.Delete(lifecycle.runID)
 	defer func() { session.finalizeComments(!session.persistenceIncomplete.Load()) }()
 	if h.outputFinalizer != nil && !h.outputFinalizer.FinishRun(lifecycle.runID) {
 		session.persistenceIncomplete.Store(true)
@@ -621,6 +637,8 @@ type attemptSideEffectMarker struct {
 
 func (m *attemptSideEffectMarker) MarkSideEffectStarted(context.Context) error {
 	m.once.Do(func() {
+		m.history.admissionMu.RLock()
+		defer m.history.admissionMu.RUnlock()
 		m.lifecycle.mu.Lock()
 		defer m.lifecycle.mu.Unlock()
 		if m.history.draining.Load() || m.lifecycle.attemptTerminalStatus != "" {

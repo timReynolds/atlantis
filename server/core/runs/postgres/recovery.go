@@ -117,8 +117,10 @@ func prepareAttemptTakeover(ctx context.Context, tx *sql.Tx, request runs.Attemp
 		if err != nil {
 			return result, err
 		}
-		if retryRun != nil {
+		if interrupted != nil {
 			result.RecoveredAttempt = interrupted
+		}
+		if retryRun != nil {
 			result.RetryRun = retryRun
 		}
 	}
@@ -203,7 +205,10 @@ func retryableInterruptedPlan(
 		return nil, nil, err
 	}
 	if !runMatchesPlanRetry(run, request) {
-		return nil, nil, nil
+		if err := completeRecoveredRun(ctx, tx, run, runs.StatusFailed, request.RecoveredAt); err != nil {
+			return nil, nil, err
+		}
+		return &attempt, nil, nil
 	}
 	return &attempt, &run, nil
 }

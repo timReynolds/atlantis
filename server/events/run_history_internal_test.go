@@ -393,6 +393,34 @@ func TestRunHistoryDrainRejectsNewExecutionAndSideEffectAdmission(t *testing.T) 
 	lifecycle.Finish()
 }
 
+func TestRunHistoryDrainWaitsForSideEffectAdmissionBoundary(t *testing.T) {
+	markerStarted := make(chan struct{})
+	releaseMarker := make(chan struct{})
+	writer := &recordingRunWriter{
+		sideEffectMarkerStarted: markerStarted,
+		sideEffectMarkerRelease: releaseMarker,
+	}
+	history := newTestRunHistory(t, writer)
+	ctx := routedRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerComment)
+	require.True(t, lifecycle.CanExecute())
+
+	markerDone := make(chan error, 1)
+	go func() {
+		markerDone <- ctx.SideEffectMarker.MarkSideEffectStarted(context.Background())
+	}()
+	<-markerStarted
+	if history.admissionMu.TryLock() {
+		history.admissionMu.Unlock()
+		t.Fatal("side-effect admission did not hold the drain read lock")
+	}
+
+	close(releaseMarker)
+	require.NoError(t, <-markerDone)
+	history.BeginDrain()
+	lifecycle.Finish()
+}
+
 func TestRunHistoryInterruptsPlanForAnotherAttemptUnderSameRun(t *testing.T) {
 	writer := &recordingRunWriter{}
 	history := newTestRunHistory(t, writer)
@@ -631,31 +659,33 @@ func routedRunContext(t *testing.T) *command.Context {
 }
 
 type recordingRunWriter struct {
-	mu                   sync.Mutex
-	runsCreated          []runs.Run
-	runsCompleted        []runs.RunCompletion
-	projectsCreated      []runs.ProjectRun
-	projectsCompleted    []runs.ProjectRunCompletion
-	output               []runs.OutputChunk
-	audit                []runs.AuditEvent
-	completeRunErr       error
-	createProjectErr     error
-	completeProjectErr   error
-	completeProjectCalls int
-	appendOutputErr      error
-	createAttemptErr     error
-	attemptsCreated      []runs.RunAttempt
-	attemptsStarted      []runs.ID
-	attemptHeartbeats    []runs.ID
-	sideEffectsStarted   []runs.ID
-	attemptsCompleted    []runs.AttemptCompletion
-	takeoverRequests     []runs.AttemptTakeoverRequest
-	takeoverResult       runs.AttemptTakeoverResult
-	takeoverErr          error
-	artifactUpdates      []runs.ProjectPlanArtifactUpdate
-	artifactResult       runs.PlanArtifactExpectation
-	artifactLookup       runs.PlanArtifactLookup
-	artifactErr          error
+	mu                      sync.Mutex
+	runsCreated             []runs.Run
+	runsCompleted           []runs.RunCompletion
+	projectsCreated         []runs.ProjectRun
+	projectsCompleted       []runs.ProjectRunCompletion
+	output                  []runs.OutputChunk
+	audit                   []runs.AuditEvent
+	completeRunErr          error
+	createProjectErr        error
+	completeProjectErr      error
+	completeProjectCalls    int
+	appendOutputErr         error
+	createAttemptErr        error
+	attemptsCreated         []runs.RunAttempt
+	attemptsStarted         []runs.ID
+	attemptHeartbeats       []runs.ID
+	sideEffectsStarted      []runs.ID
+	sideEffectMarkerStarted chan struct{}
+	sideEffectMarkerRelease chan struct{}
+	attemptsCompleted       []runs.AttemptCompletion
+	takeoverRequests        []runs.AttemptTakeoverRequest
+	takeoverResult          runs.AttemptTakeoverResult
+	takeoverErr             error
+	artifactUpdates         []runs.ProjectPlanArtifactUpdate
+	artifactResult          runs.PlanArtifactExpectation
+	artifactLookup          runs.PlanArtifactLookup
+	artifactErr             error
 }
 
 func (w *recordingRunWriter) CreateRun(_ context.Context, run runs.Run) error {
@@ -773,6 +803,12 @@ func (w *recordingRunWriter) HeartbeatAttempt(_ context.Context, id runs.ID, _ t
 }
 
 func (w *recordingRunWriter) MarkAttemptSideEffectStarted(_ context.Context, id runs.ID, _ time.Time) error {
+	if w.sideEffectMarkerStarted != nil {
+		close(w.sideEffectMarkerStarted)
+	}
+	if w.sideEffectMarkerRelease != nil {
+		<-w.sideEffectMarkerRelease
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.sideEffectsStarted = append(w.sideEffectsStarted, id)

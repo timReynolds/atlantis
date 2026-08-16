@@ -255,7 +255,7 @@ func (c *RunHistoryController) authorize(w http.ResponseWriter, r *http.Request)
 func (c *RunHistoryController) execute(w http.ResponseWriter, r *http.Request, template web_templates.TemplateWriter, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := template.Execute(w, data); err != nil {
-		c.Logger.Err("rendering run history page: %v", err)
+		c.Logger.Err("rendering run history page %v", err)
 		if !headersWritten(w) {
 			http.Error(w, "Unable to render run history", http.StatusInternalServerError)
 		}
@@ -274,7 +274,7 @@ func (c *RunHistoryController) respondStoreError(w http.ResponseWriter, r *http.
 
 func (c *RunHistoryController) respondError(w http.ResponseWriter, r *http.Request, status int, err error) {
 	if status >= http.StatusInternalServerError {
-		c.Logger.Err("serving run history request %q: %v", r.URL.RequestURI(), err)
+		c.Logger.Err("serving run history request %q %v", r.URL.RequestURI(), err)
 	}
 	http.Error(w, http.StatusText(status), status)
 }

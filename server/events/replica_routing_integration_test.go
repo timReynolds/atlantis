@@ -132,6 +132,9 @@ func BenchmarkReplicaRoutingConcurrentPRs(b *testing.B) {
 				basePull := int(haBenchmarkPullNumber.Add(int64(pullCount))) - pullCount + 1
 				dispatchConcurrentPullCommands(b, h, basePull, pullCount, command.Plan, false)
 				dispatchConcurrentPullCommands(b, h, basePull, pullCount, command.Apply, true)
+				b.StopTimer()
+				releaseBenchmarkPullClaims(b, h, basePull, pullCount)
+				b.StartTimer()
 			}
 			b.ReportMetric(float64(pullCount*2), "commands/op")
 			b.StopTimer()
@@ -141,6 +144,24 @@ func BenchmarkReplicaRoutingConcurrentPRs(b *testing.B) {
 }
 
 var haBenchmarkPullNumber atomic.Int64
+
+func releaseBenchmarkPullClaims(b *testing.B, h *haHarness, basePull, pullCount int) {
+	b.Helper()
+	for offset := 0; offset < pullCount; offset++ {
+		key := haOwnershipKey(basePull + offset)
+		owner, found, err := h.storeA.Current(context.Background(), key)
+		require.NoError(b, err)
+		require.True(b, found)
+		switch owner.ReplicaID {
+		case "replica-a":
+			require.NoError(b, h.storeA.Release(context.Background(), key, owner.ClaimID))
+		case "replica-b":
+			require.NoError(b, h.storeB.Release(context.Background(), key, owner.ClaimID))
+		default:
+			b.Fatalf("unexpected benchmark owner %q", owner.ReplicaID)
+		}
+	}
+}
 
 func dispatchConcurrentPullCommands(
 	b *testing.B,

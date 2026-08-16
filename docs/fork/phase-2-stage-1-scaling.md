@@ -12,7 +12,7 @@ Run:
 make benchmark-ha-stage1
 ```
 
-The target provisions digest-pinned disposable PostgreSQL 16 and Redis 7 containers. Override `ATLANTIS_HA_BENCHTIME` and `ATLANTIS_HA_BENCH_COUNT` for longer samples. Store calls have their normal per-operation timeout rather than a benchmark-wide deadline, so samples longer than ten minutes remain valid. The default is a quick developer signal; the PostgreSQL results below used five operations and five repetitions, while the Redis routing results used three operations and three repetitions.
+The target provisions digest-pinned disposable PostgreSQL 16 and Redis 7 containers. Override `ATLANTIS_HA_BENCHTIME` and `ATLANTIS_HA_BENCH_COUNT` for longer samples. Store calls have their normal per-operation timeout rather than a benchmark-wide deadline, so samples longer than ten minutes remain valid. The default is a quick developer signal. The PostgreSQL results below used five operations and five repetitions. Redis used one operation and five independent repetitions so every reported burst began without leases from an earlier operation; the benchmark also releases claims outside the timed section when `b.N` is greater than one.
 
 Environment: Apple M4, macOS arm64, Go 1.26.5, Docker Desktop, PostgreSQL 16, Redis 7. PostgreSQL used Atlantis's production default of 10 open and 5 idle connections.
 
@@ -38,13 +38,13 @@ This benchmark sends a plan for every unrelated pull request to alternating repl
 
 | Concurrent PRs | Commands | Median wall time | Approximate commands/s | Allocated per operation |
 | ---: | ---: | ---: | ---: | ---: |
-| 10 | 20 | 2.43 ms | 8,240 | 0.43 MiB |
-| 50 | 100 | 74.4 ms | 1,340 | 2.21 MiB |
-| 100 | 200 | 493.8 ms | 405 | 4.44 MiB |
-| 300 | 600 | 575.2 ms | 1,040 | 8.92 MiB |
-| 600 | 1,200 | 608.7 ms for successful repetitions | 1,970 | 15.7 MiB |
+| 10 | 20 | 4.08 ms | 4,900 | 0.84 MiB |
+| 50 | 100 | 13.1 ms | 7,620 | 4.42 MiB |
+| 100 | 200 | 212.5 ms | 941 | 8.82 MiB |
+| 300 | 600 | 1.243 s | 483 | 13.08 MiB |
+| 600 | 1,200 | 1.289 s | 931 | 19.59 MiB |
 
-The 100- and 300-PR samples had multi-second outliers. One of three 600-PR repetitions returned the expected fail-closed Redis I/O timeout instead of executing locally. This is a burst-admission and Redis client-pool limit, not evidence that Terraform workers are required. Production should apply webhook backpressure, monitor pool waits and Redis latency, and establish an accepted concurrent-webhook target before changing the pool size.
+Independent samples still had multi-second outliers from 50 projects upward. A separate three-operation verification, with prior claims released between operations, returned the expected fail-closed Redis I/O timeout at 100 and 600 PRs instead of executing locally. This confirms a burst-admission and Redis client limit rather than an artifact of retained benchmark leases; it is not evidence that Terraform workers are required. Production should apply webhook backpressure, monitor pool waits and Redis latency, and establish an accepted concurrent-webhook target before changing the pool size.
 
 The in-process Redis-compatible test server is intentionally not used for the reported allocation figures: an allocation profile showed its Lua interpreter accounted for more than 80% of allocation space. The reproducible script uses Redis 7 for routing measurements.
 

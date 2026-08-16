@@ -22,6 +22,7 @@ func TestPullUpdaterUsesLargeRunSummaryOnlyWhenDurableUIIsAvailable(t *testing.T
 	require.NoError(t, err)
 	updater := &PullUpdater{
 		RunHistoryURLGenerator:   staticRunHistoryURLGenerator{},
+		RunHistoryCompleteness:   staticRunHistoryCompleteness{complete: true},
 		LargeRunSummaryThreshold: 50,
 	}
 	ctx := &command.Context{RunID: runID}
@@ -38,6 +39,9 @@ func TestPullUpdaterUsesLargeRunSummaryOnlyWhenDurableUIIsAvailable(t *testing.T
 	result.Error = errors.New("command failed")
 	require.False(t, updater.shouldUseLargeRunSummary(ctx, result, cmd))
 	result.Error = nil
+	updater.RunHistoryCompleteness = staticRunHistoryCompleteness{complete: false}
+	require.False(t, updater.shouldUseLargeRunSummary(ctx, result, cmd))
+	updater.RunHistoryCompleteness = staticRunHistoryCompleteness{complete: true}
 	ctx.RunID = ""
 	require.False(t, updater.shouldUseLargeRunSummary(ctx, result, cmd))
 }
@@ -49,7 +53,8 @@ func TestPullUpdaterPostsOneBoundedLargeRunComment(t *testing.T) {
 	renderer := NewMarkdownRenderer(false, false, false, false, false, false, "", "atlantis", false, false)
 	updater := &PullUpdater{
 		VCSClient: client, MarkdownRenderer: renderer,
-		RunHistoryURLGenerator: staticRunHistoryURLGenerator{}, LargeRunSummaryThreshold: 50,
+		RunHistoryURLGenerator: staticRunHistoryURLGenerator{},
+		RunHistoryCompleteness: staticRunHistoryCompleteness{complete: true}, LargeRunSummaryThreshold: 50,
 	}
 	runID, err := runs.NewID()
 	require.NoError(t, err)
@@ -90,3 +95,9 @@ func (staticRunHistoryURLGenerator) GenerateRunHistoryURL(runs.ID) (string, erro
 }
 
 var _ RunHistoryURLGenerator = staticRunHistoryURLGenerator{}
+
+type staticRunHistoryCompleteness struct{ complete bool }
+
+func (s staticRunHistoryCompleteness) IsRunHistoryComplete(runs.ID) bool { return s.complete }
+
+var _ RunHistoryCompletenessChecker = staticRunHistoryCompleteness{}

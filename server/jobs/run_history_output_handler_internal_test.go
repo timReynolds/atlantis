@@ -76,11 +76,13 @@ func TestPersistentProjectCommandOutputHandlerStopsWritingAfterStoreFailure(t *t
 
 	handler.SendStream(first, "buffered", runs.OutputStdout, false)
 	handler.SendStream(first, "stream transition", runs.OutputStderr, false)
+	require.False(t, handler.RunOutputComplete(first.RunID))
 	handler.SendStream(first, strings.Repeat("x", persistentOutputChunkBytes), runs.OutputStderr, false)
 	handler.SendStream(second, strings.Repeat("y", persistentOutputChunkBytes), runs.OutputStdout, false)
 	require.False(t, handler.FinishRun(first.RunID))
 
 	require.Equal(t, 1, writer.calls)
+	require.True(t, handler.RunOutputComplete(first.RunID))
 }
 
 func outputProjectContext(t *testing.T) command.ProjectContext {

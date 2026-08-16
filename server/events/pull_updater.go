@@ -16,11 +16,18 @@ type RunHistoryURLGenerator interface {
 	GenerateRunHistoryURL(runID runs.ID) (string, error)
 }
 
+// RunHistoryCompletenessChecker reports whether the durable page can replace
+// the full VCS output without losing results.
+type RunHistoryCompletenessChecker interface {
+	IsRunHistoryComplete(runID runs.ID) bool
+}
+
 type PullUpdater struct {
 	HidePrevPlanComments     bool
 	VCSClient                vcs.Client
 	MarkdownRenderer         *MarkdownRenderer
 	RunHistoryURLGenerator   RunHistoryURLGenerator
+	RunHistoryCompleteness   RunHistoryCompletenessChecker
 	LargeRunSummaryThreshold int
 }
 
@@ -81,7 +88,9 @@ func (c *PullUpdater) updatePull(ctx *command.Context, cmd PullCommand, res comm
 func (c *PullUpdater) shouldUseLargeRunSummary(ctx *command.Context, result command.Result, cmd PullCommand) bool {
 	return c.LargeRunSummaryThreshold > 0 &&
 		c.RunHistoryURLGenerator != nil &&
+		c.RunHistoryCompleteness != nil &&
 		ctx.RunID != "" &&
+		c.RunHistoryCompleteness.IsRunHistoryComplete(ctx.RunID) &&
 		result.Error == nil && result.Failure == "" &&
 		len(result.ProjectResults) >= c.LargeRunSummaryThreshold &&
 		!cmd.IsVerbose()

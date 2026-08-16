@@ -42,6 +42,14 @@ func TestProjectResult_IsSuccessful(t *testing.T) {
 			},
 			true,
 		},
+		"state rm success": {
+			command.ProjectResult{
+				ProjectCommandOutput: command.ProjectCommandOutput{
+					StateRmSuccess: &models.StateRmSuccess{},
+				},
+			},
+			true,
+		},
 		"failure": {
 			command.ProjectResult{
 				ProjectCommandOutput: command.ProjectCommandOutput{

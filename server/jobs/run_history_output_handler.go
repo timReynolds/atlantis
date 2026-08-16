@@ -86,6 +86,11 @@ func (p *PersistentProjectCommandOutputHandler) FinishRun(runID runs.ID) bool {
 	return complete
 }
 
+// RunOutputComplete reports whether every attempted output write for a Run succeeded.
+func (p *PersistentProjectCommandOutputHandler) RunOutputComplete(runID runs.ID) bool {
+	return !p.runFailed(runID)
+}
+
 func (p *PersistentProjectCommandOutputHandler) record(
 	ctx command.ProjectContext,
 	msg string,

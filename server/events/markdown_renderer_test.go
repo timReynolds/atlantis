@@ -148,6 +148,15 @@ func TestRenderRunSummary(t *testing.T) {
 		Assert(t, strings.Contains(apply, expected), "expected %q in:\n%s", expected, apply)
 	}
 	Assert(t, !strings.Contains(apply, "atlantis apply"), "apply summary must not render plan instructions")
+
+	stateResults := make([]command.ProjectResult, 50)
+	for i := range stateResults {
+		stateResults[i].StateRmSuccess = &models.StateRmSuccess{Output: "removed"}
+	}
+	state := newRenderer("en").RenderRunSummary(ctx, command.Result{ProjectResults: stateResults}, &events.CommentCommand{Name: command.State, SubName: "rm"}, historyURL)
+	for _, expected := range []string{"Ran State for 50 projects.", "| Succeeded | 50 |", "| Failed | 0 |"} {
+		Assert(t, strings.Contains(state, expected), "expected %q in:\n%s", expected, state)
+	}
 }
 
 func TestRenderWorkingDirLockMetadata(t *testing.T) {

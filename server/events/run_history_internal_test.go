@@ -78,6 +78,21 @@ func TestRunHistoryAggregatesPlanAndPolicyIntoOneProjectRun(t *testing.T) {
 	require.Equal(t, []string{"plan.requested", "plan.completed"}, writer.auditTypes())
 }
 
+func TestRunHistoryReportsIncompleteProjectPersistence(t *testing.T) {
+	writer := &recordingRunWriter{createProjectErr: errors.New("store unavailable")}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+	require.True(t, history.IsRunHistoryComplete(ctx.RunID))
+
+	history.beginProject(command.ProjectContext{
+		RunID: ctx.RunID, ProjectName: "network", RepoRelDir: "terraform/network",
+		Workspace: "production", Log: ctx.Log,
+	})
+	require.False(t, history.IsRunHistoryComplete(ctx.RunID))
+	lifecycle.Finish()
+}
+
 func TestRunHistoryRepresentsHundredsOfProjectsInOneRun(t *testing.T) {
 	writer := &recordingRunWriter{}
 	history := newTestRunHistory(t, writer)
@@ -259,6 +274,7 @@ type recordingRunWriter struct {
 	output               []runs.OutputChunk
 	audit                []runs.AuditEvent
 	completeRunErr       error
+	createProjectErr     error
 	completeProjectErr   error
 	completeProjectCalls int
 }
@@ -285,6 +301,9 @@ func (w *recordingRunWriter) CompleteRun(_ context.Context, completion runs.RunC
 func (w *recordingRunWriter) CreateProjectRun(_ context.Context, project runs.ProjectRun) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.createProjectErr != nil {
+		return w.createProjectErr
+	}
 	w.projectsCreated = append(w.projectsCreated, project)
 	return nil
 }
@@ -306,7 +325,8 @@ func (w *recordingRunWriter) CompleteProjectRun(_ context.Context, completion ru
 
 type incompleteOutputFinalizer struct{}
 
-func (incompleteOutputFinalizer) FinishRun(runs.ID) bool { return false }
+func (incompleteOutputFinalizer) FinishRun(runs.ID) bool         { return false }
+func (incompleteOutputFinalizer) RunOutputComplete(runs.ID) bool { return false }
 
 var _ RunOutputFinalizer = incompleteOutputFinalizer{}
 

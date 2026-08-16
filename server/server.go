@@ -82,6 +82,8 @@ const (
 	LockViewRouteIDQueryParam = "id"
 	// ProjectJobsViewRouteName is the named route in mux.Router for the log stream view.
 	ProjectJobsViewRouteName = "project-jobs-detail"
+	// RunHistoryViewRouteName is the named route for durable run details.
+	RunHistoryViewRouteName = "run-history-detail"
 	// binDirName is the name of the directory inside our data dir where
 	// we download binaries.
 	BinDirName = "bin"
@@ -111,6 +113,7 @@ type Server struct {
 	StatusController               *controllers.StatusController
 	JobsController                 *controllers.JobsController
 	APIController                  *controllers.APIController
+	RunHistoryController           *controllers.RunHistoryController
 	IndexTemplate                  web_templates.TemplateWriter
 	LockDetailTemplate             web_templates.TemplateWriter
 	ProjectJobsTemplate            web_templates.TemplateWriter
@@ -448,6 +451,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		LockViewRouteIDQueryParam: LockViewRouteIDQueryParam,
 		LockViewRouteName:         LockViewRouteName,
 		ProjectJobsViewRouteName:  ProjectJobsViewRouteName,
+		RunHistoryViewRouteName:   RunHistoryViewRouteName,
 		Underlying:                underlyingRouter,
 	}
 	runStore, runStoreHealth, runStoreCloser, err := initializeRunStore(userConfig, logger)
@@ -1098,6 +1102,19 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		KeyGenerator:             controllers.JobIDKeyGenerator{},
 		StatsScope:               statsScope.SubScope("api"),
 	}
+	var runHistoryController *controllers.RunHistoryController
+	if userConfig.RunStoreType == RunStorePostgres {
+		runHistoryController = &controllers.RunHistoryController{
+			AtlantisVersion: config.AtlantisVersion, AtlantisURL: parsedURL,
+			Logger: logger, Store: runStore,
+			RunListTemplate:       web_templates.RunHistoryListTemplate,
+			RunDetailTemplate:     web_templates.RunHistoryDetailTemplate,
+			ProjectDetailTemplate: web_templates.RunProjectDetailTemplate,
+			AuditListTemplate:     web_templates.RunAuditListTemplate,
+			WebAuthentication:     userConfig.WebBasicAuth,
+			WebUsername:           userConfig.WebUsername, WebPassword: userConfig.WebPassword,
+		}
+	}
 
 	apiController := &controllers.APIController{
 		APISecret:                       []byte(userConfig.APISecret),
@@ -1190,6 +1207,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		JobsController:                 jobsController,
 		StatusController:               statusController,
 		APIController:                  apiController,
+		RunHistoryController:           runHistoryController,
 		IndexTemplate:                  web_templates.IndexTemplate,
 		LockDetailTemplate:             web_templates.LockTemplate,
 		ProjectJobsTemplate:            web_templates.ProjectJobsTemplate,
@@ -1248,6 +1266,14 @@ func (s *Server) SetupRoutes() {
 		Queries(LockViewRouteIDQueryParam, fmt.Sprintf("{%s}", LockViewRouteIDQueryParam)).Name(LockViewRouteName)
 	s.Router.HandleFunc("/jobs/{job-id}", s.JobsController.GetProjectJobs).Methods("GET").Name(ProjectJobsViewRouteName)
 	s.Router.HandleFunc("/jobs/{job-id}/ws", s.JobsController.GetProjectJobsWS).Methods("GET")
+	if s.RunHistoryController != nil {
+		s.Router.HandleFunc("/runs", s.RunHistoryController.ListRuns).Methods("GET")
+		s.Router.HandleFunc("/repos/{owner}/{repo}", s.RunHistoryController.ListRuns).Methods("GET")
+		s.Router.HandleFunc("/repos/{owner}/{repo}/pulls/{pull-number}", s.RunHistoryController.ListRuns).Methods("GET")
+		s.Router.HandleFunc("/runs/{run-id}", s.RunHistoryController.GetRun).Methods("GET").Name(RunHistoryViewRouteName)
+		s.Router.HandleFunc("/runs/{run-id}/projects/{project-id}", s.RunHistoryController.GetProject).Methods("GET")
+		s.Router.HandleFunc("/audit", s.RunHistoryController.ListAudit).Methods("GET")
+	}
 
 	r, ok := s.StatsReporter.(prometheus.Reporter)
 	if ok {
@@ -1455,11 +1481,12 @@ func (s *Server) Index(w http.ResponseWriter, _ *http.Request) {
 	sort.SliceStable(lockResults, func(i, j int) bool { return lockResults[i].Time.After(lockResults[j].Time) })
 
 	err = s.IndexTemplate.Execute(w, web_templates.IndexData{
-		Locks:            lockResults,
-		PullToJobMapping: preparePullToJobMappings(s),
-		ApplyLock:        applyLockData,
-		AtlantisVersion:  s.AtlantisVersion,
-		CleanedBasePath:  s.AtlantisURL.Path,
+		Locks:             lockResults,
+		PullToJobMapping:  preparePullToJobMappings(s),
+		ApplyLock:         applyLockData,
+		AtlantisVersion:   s.AtlantisVersion,
+		RunHistoryEnabled: s.RunHistoryController != nil && s.WebAuthentication,
+		CleanedBasePath:   s.AtlantisURL.Path,
 	})
 	if err != nil {
 		s.Logger.Err("%s", err.Error())

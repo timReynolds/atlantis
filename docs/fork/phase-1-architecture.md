@@ -56,9 +56,17 @@ When history is not configured, a no-op Store preserves existing Atlantis behavi
 
 ## Output and authorization
 
-Raw Terraform output can contain secrets. Metadata and aggregate summaries may use the same visibility as Atlantis's existing read-only web pages, but historical raw output routes require Atlantis web authentication. The initial implementation does not add apply or remediation controls to the UI.
+Raw Terraform output can contain secrets. All history and audit routes require Atlantis web Basic Auth; when `--web-basic-auth` is disabled the routes return not found. The controller verifies credentials in addition to the existing global middleware. The initial implementation does not add apply or remediation controls to the UI.
 
-Output writers preserve order per Project Run, distinguish stdout, stderr, and system output where the existing execution path supplies that information, and flush by size or a short time interval. They do not insert one database row per terminal line.
+Output writers preserve order per Project Run, distinguish stdout, stderr, and system output where the existing execution path supplies that information, and flush by size or operation completion. They do not insert one database row per terminal line.
+
+The read-only, server-rendered history surface follows existing Atlantis UI conventions:
+
+- `/runs` provides global repository, pull request, commit, actor, command, and status filters.
+- `/repos/{owner}/{repo}` and `/repos/{owner}/{repo}/pulls/{number}` provide scoped run history.
+- `/runs/{run-id}` provides aggregate status counts, project filters, pagination, and related pull-request runs.
+- `/runs/{run-id}/projects/{project-id}` provides summary counts, artifact metadata, and paginated typed output.
+- `/audit` provides repository, pull request, actor, event, and date-range filters.
 
 ## Initial relational model
 
@@ -80,7 +88,7 @@ Retention is independently configurable and defaults to:
 - Run and Project Run metadata: indefinite;
 - Audit Events: indefinite;
 - raw command output: 90 days;
-- S3-compatible plan artifacts: managed independently, initially 30 days;
+- S3-compatible plan artifacts: managed independently through object-store lifecycle policy;
 - drift history: at least 12 months.
 
 Deleting output or an expired plan artifact must not delete its Run or Project Run. Partitioning is deferred until measured volume justifies it.

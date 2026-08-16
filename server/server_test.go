@@ -355,14 +355,15 @@ func TestSetupRoutes_APIRoutesRegistered(t *testing.T) {
 	t.Log("All API routes should be registered after SetupRoutes()")
 
 	s := server.Server{
-		Router:              mux.NewRouter(),
-		APIController:       &controllers.APIController{},
-		StatusController:    &controllers.StatusController{},
-		LocksController:     &controllers.LocksController{},
-		GithubAppController: &controllers.GithubAppController{},
-		JobsController:      &controllers.JobsController{},
-		VCSEventsController: &events_controllers.VCSEventsController{},
-		Logger:              logging.NewNoopLogger(t),
+		Router:               mux.NewRouter(),
+		APIController:        &controllers.APIController{},
+		StatusController:     &controllers.StatusController{},
+		LocksController:      &controllers.LocksController{},
+		GithubAppController:  &controllers.GithubAppController{},
+		JobsController:       &controllers.JobsController{},
+		RunHistoryController: &controllers.RunHistoryController{},
+		VCSEventsController:  &events_controllers.VCSEventsController{},
+		Logger:               logging.NewNoopLogger(t),
 	}
 
 	s.SetupRoutes()
@@ -382,6 +383,13 @@ func TestSetupRoutes_APIRoutesRegistered(t *testing.T) {
 		{"GET", "/api/drift/remediate/some-id"},
 		{"GET", "/api/drift/remediate"},
 		{"POST", "/api/drift/remediate"},
+		// Authenticated durable history endpoints
+		{"GET", "/runs"},
+		{"GET", "/runs/019c0000-0000-7000-8000-000000000000"},
+		{"GET", "/runs/019c0000-0000-7000-8000-000000000000/projects/019c0000-0000-7000-8000-000000000001"},
+		{"GET", "/repos/example/infrastructure"},
+		{"GET", "/repos/example/infrastructure/pulls/42"},
+		{"GET", "/audit"},
 	}
 
 	for _, c := range cases {

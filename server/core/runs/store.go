@@ -133,6 +133,20 @@ type ProjectRunPage struct {
 	NextCursor  string
 }
 
+// ProjectRunSummary contains status counts for one logical Run. It supports
+// large-run summaries without loading every ProjectRun into a controller.
+type ProjectRunSummary struct {
+	Total     int
+	Pending   int
+	Running   int
+	Succeeded int
+	Unchanged int
+	Failed    int
+	Partial   int
+	Cancelled int
+	Skipped   int
+}
+
 // OutputPage is an ordered page of output chunks.
 type OutputPage struct {
 	Chunks       []OutputChunk
@@ -162,6 +176,7 @@ type Reader interface {
 	ListRuns(ctx context.Context, filter RunFilter, page PageRequest) (RunPage, error)
 	GetProjectRun(ctx context.Context, id ID) (ProjectRun, error)
 	ListProjectRuns(ctx context.Context, runID ID, filter ProjectRunFilter, page PageRequest) (ProjectRunPage, error)
+	SummarizeProjectRuns(ctx context.Context, runID ID) (ProjectRunSummary, error)
 	GetOutput(ctx context.Context, projectRunID ID, afterSequence int64, limit int) (OutputPage, error)
 	ListAuditEvents(ctx context.Context, filter AuditFilter, page PageRequest) (AuditPage, error)
 }

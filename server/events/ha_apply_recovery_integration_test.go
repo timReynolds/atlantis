@@ -138,8 +138,8 @@ func runHAApplyRecoveryHelper(t *testing.T) {
 	projectCtx := haPlanProjectContext(pullNumber, headSHA)
 	runCtx := &command.Context{
 		Log: projectCtx.Log, User: projectCtx.User, Pull: projectCtx.Pull,
-		ExecutionInstanceID: instanceID, ConcurrencyKey: haApplyConcurrencyKey,
-		OwnershipClaimID: haApplyOwnershipClaim,
+		ExecutionInstanceID: instanceID, ExecutionDeploymentID: "failure-gates",
+		ConcurrencyKey: haApplyConcurrencyKey, OwnershipClaimID: haApplyOwnershipClaim,
 	}
 	lifecycle := history.Begin(runCtx, runs.CommandApply, runs.TriggerComment)
 	require.True(t, lifecycle.CanExecute())

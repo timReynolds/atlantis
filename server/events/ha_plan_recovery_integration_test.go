@@ -170,10 +170,11 @@ func runHAPlanRecoveryHelper(t *testing.T) {
 	runCtx := &command.Context{
 		Log: projectCtx.Log, User: projectCtx.User,
 		Pull:                projectCtx.Pull,
-		ExecutionInstanceID: instanceID, ConcurrencyKey: haPlanConcurrencyKey,
-		OwnershipClaimID: haPlanOwnershipClaim,
+		ExecutionInstanceID: instanceID, ExecutionDeploymentID: "failure-gates",
+		ConcurrencyKey: haPlanConcurrencyKey, OwnershipClaimID: haPlanOwnershipClaim,
 	}
-	history.Begin(runCtx, runs.CommandPlan, runs.TriggerComment)
+	lifecycle := history.Begin(runCtx, runs.CommandPlan, runs.TriggerComment)
+	require.True(t, lifecycle.CanExecute())
 	projectCtx.RunID = runCtx.RunID
 	projectCtx.AttemptID = runCtx.AttemptID
 	projectCtx = history.beginProject(projectCtx)

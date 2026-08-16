@@ -262,12 +262,14 @@ func TestStoreConformance(t *testing.T) {
 	claimedAttemptID := mustID(t)
 	require.NoError(t, store.CreateAttempt(ctx, runs.RunAttempt{
 		ID: claimedAttemptID, RunID: claimedRunID, InstanceID: claimedInstanceID,
+		DeploymentID:   "conformance",
 		ConcurrencyKey: "sha256:claimed-plan", OwnershipClaimID: "claimed-old",
 		Status: runs.AttemptClaimed, ClaimedAt: completedAt, HeartbeatAt: completedAt,
 	}))
 	duplicateAttemptErr := store.CreateAttempt(ctx, runs.RunAttempt{
 		ID: mustID(t), RunID: claimedRunID, InstanceID: claimedInstanceID,
-		ConcurrencyKey: "sha256:claimed-plan", OwnershipClaimID: "duplicate-delivery",
+		DeploymentID:   "conformance",
+		ConcurrencyKey: "sha256:claimed-plan", OwnershipClaimID: "claimed-old",
 		Status: runs.AttemptClaimed, ClaimedAt: completedAt, HeartbeatAt: completedAt,
 	})
 	require.ErrorIs(t, duplicateAttemptErr, runs.ErrConflict,
@@ -304,6 +306,7 @@ func TestStoreConformance(t *testing.T) {
 	preApplyAttemptID := mustID(t)
 	require.NoError(t, store.CreateAttempt(ctx, runs.RunAttempt{
 		ID: preApplyAttemptID, RunID: preApplyRunID, InstanceID: preApplyInstanceID,
+		DeploymentID:   "conformance",
 		ConcurrencyKey: "sha256:pre-apply", OwnershipClaimID: "pre-apply-old",
 		Status: runs.AttemptClaimed, ClaimedAt: preApplyCreatedAt, HeartbeatAt: preApplyCreatedAt,
 	}))
@@ -581,7 +584,7 @@ func TestStoreConformance(t *testing.T) {
 		RunMetadataBefore: &retentionCutoff,
 	})
 	require.NoError(t, err)
-	require.Equal(t, int64(4), retention.RunsDeleted)
+	require.Equal(t, int64(5), retention.RunsDeleted)
 	require.Equal(t, int64(2), retention.ProjectRunsDeleted)
 	require.Equal(t, int64(0), retention.OutputChunksDeleted)
 	_, err = store.GetRun(ctx, runID)

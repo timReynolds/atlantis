@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Masterminds/sprig/v3"
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/jobs"
 )
 
@@ -28,6 +29,10 @@ var templateFileNames = map[string]string{
 	"project-jobs":       "project-jobs.html.tmpl",
 	"project-jobs-error": "project-jobs-error.html.tmpl",
 	"github-app":         "github-app.html.tmpl",
+	"run-history-list":   "run-history-list.html.tmpl",
+	"run-history-detail": "run-history-detail.html.tmpl",
+	"run-project-detail": "run-project-detail.html.tmpl",
+	"run-audit-list":     "run-audit-list.html.tmpl",
 }
 
 // TemplateWriter is an interface over html/template that's used to enable
@@ -63,8 +68,9 @@ type IndexData struct {
 	Locks            []LockIndexData
 	PullToJobMapping []jobs.PullInfoWithJobIDs
 
-	ApplyLock       ApplyLockData
-	AtlantisVersion string
+	ApplyLock         ApplyLockData
+	AtlantisVersion   string
+	RunHistoryEnabled bool
 	// CleanedBasePath is the path Atlantis is accessible at externally. If
 	// not using a path-based proxy, this will be an empty string. Never ends
 	// in a '/' (hence "cleaned").
@@ -120,3 +126,143 @@ type GithubSetupData struct {
 }
 
 var GithubAppSetupTemplate = templates.Lookup(templateFileNames["github-app"])
+
+// RunHistoryRun is the presentation model shared by run history pages.
+type RunHistoryRun struct {
+	ID              string
+	Repository      string
+	PullNumber      int
+	PullURL         string
+	Command         string
+	Trigger         string
+	Actor           string
+	BaseRef         string
+	HeadRef         string
+	HeadSHA         string
+	Status          string
+	CreatedAt       string
+	StartedAt       string
+	CompletedAt     string
+	DetailPath      string
+	RepositoryPath  string
+	PullHistoryPath string
+	RawMetadata     string
+}
+
+// RunHistoryProject is the presentation model for one project execution.
+type RunHistoryProject struct {
+	ID                string
+	ProjectName       string
+	Directory         string
+	Workspace         string
+	Status            string
+	Additions         int
+	Changes           int
+	Destructions      int
+	Imports           int
+	Forgets           int
+	StartedAt         string
+	CompletedAt       string
+	ErrorSummary      string
+	ArtifactKey       string
+	ArtifactChecksum  string
+	ArtifactCreatedAt string
+	ArtifactExpiresAt string
+	DetailPath        string
+	RawMetadata       string
+}
+
+// RunHistoryFilter preserves run-list filter inputs in the server-rendered UI.
+type RunHistoryFilter struct {
+	Repository string
+	PullNumber string
+	HeadSHA    string
+	Actor      string
+	Command    string
+	Status     string
+}
+
+// RunHistoryListData renders global, repository, and pull run listings.
+type RunHistoryListData struct {
+	AtlantisVersion string
+	CleanedBasePath string
+	Title           string
+	Runs            []RunHistoryRun
+	Filter          RunHistoryFilter
+	NextPath        string
+}
+
+var RunHistoryListTemplate = templates.Lookup(templateFileNames["run-history-list"])
+
+// RunHistoryProjectFilter preserves project-list filter inputs.
+type RunHistoryProjectFilter struct {
+	ProjectName string
+	Directory   string
+	Workspace   string
+	Status      string
+}
+
+// RunHistoryDetailData renders one run, its summary, projects, and related runs.
+type RunHistoryDetailData struct {
+	AtlantisVersion string
+	CleanedBasePath string
+	Run             RunHistoryRun
+	Summary         runs.ProjectRunSummary
+	Projects        []RunHistoryProject
+	Filter          RunHistoryProjectFilter
+	NextPath        string
+	RelatedRuns     []RunHistoryRun
+}
+
+var RunHistoryDetailTemplate = templates.Lookup(templateFileNames["run-history-detail"])
+
+// RunHistoryOutputChunk retains stream identity for historical output.
+type RunHistoryOutputChunk struct {
+	Stream  string
+	Content string
+}
+
+// RunProjectDetailData renders one project summary and a bounded output page.
+type RunProjectDetailData struct {
+	AtlantisVersion string
+	CleanedBasePath string
+	Run             RunHistoryRun
+	Project         RunHistoryProject
+	Output          []RunHistoryOutputChunk
+	NextPath        string
+}
+
+var RunProjectDetailTemplate = templates.Lookup(templateFileNames["run-project-detail"])
+
+// RunAuditEvent is the presentation model for a durable audit event.
+type RunAuditEvent struct {
+	Repository string
+	PullNumber int
+	RunID      string
+	Actor      string
+	EventType  string
+	CreatedAt  string
+	RunPath    string
+	Metadata   string
+}
+
+// RunAuditFilter preserves audit filter inputs.
+type RunAuditFilter struct {
+	Repository  string
+	PullNumber  string
+	Actor       string
+	EventType   string
+	CreatedFrom string
+	CreatedTo   string
+}
+
+// RunAuditListData renders the global searchable audit timeline.
+type RunAuditListData struct {
+	AtlantisVersion string
+	CleanedBasePath string
+	Events          []RunAuditEvent
+	Filter          RunAuditFilter
+	NextPath        string
+}
+
+var RunAuditListTemplate = templates.Lookup(templateFileNames["run-audit-list"])

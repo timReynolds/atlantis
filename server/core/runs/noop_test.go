@@ -37,6 +37,9 @@ func TestNoopStorePreservesDisabledBehavior(t *testing.T) {
 	projectPage, err := store.ListProjectRuns(ctx, "missing", runs.ProjectRunFilter{}, runs.PageRequest{})
 	Ok(t, err)
 	Equals(t, 0, len(projectPage.ProjectRuns))
+	summary, err := store.SummarizeProjectRuns(ctx, "missing")
+	Ok(t, err)
+	Equals(t, runs.ProjectRunSummary{}, summary)
 
 	outputPage, err := store.GetOutput(ctx, "missing", 0, 100)
 	Ok(t, err)

@@ -38,12 +38,14 @@ func TestApplyCommandRunner_IsLocked(t *testing.T) {
 		ExpComment     string
 		ExpFailStatus  bool
 		ExpHasErrors   bool
+		ExpSkipped     bool
 	}{
 		{
 			Description:    "When global apply lock is present IsDisabled returns true",
 			ApplyLocked:    true,
 			ApplyLockError: nil,
 			ExpComment:     "**Error:** Running `atlantis apply` is disabled.",
+			ExpSkipped:     true,
 		},
 		{
 			Description:    "When no global apply lock is present IsDisabled returns false",
@@ -90,6 +92,8 @@ func TestApplyCommandRunner_IsLocked(t *testing.T) {
 
 			applyCommandRunner.Run(ctx, &events.CommentCommand{Name: command.Apply})
 			Equals(t, c.ExpHasErrors, ctx.CommandHasErrors)
+			Equals(t, c.ExpSkipped, ctx.CommandOutcomeSkipped)
+			Assert(t, !ctx.CommandSkipped, "durable skipped outcome must not suppress post-workflow hooks")
 
 			vcsClient.VerifyWasCalledOnce().CreateComment(
 				Any[logging.SimpleLogging](), Eq(testdata.GithubRepo), Eq(modelPull.Num), Eq(c.ExpComment), Eq("apply"))
@@ -112,6 +116,23 @@ func TestApplyCommandRunner_IsLocked(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestApplyCommandRunner_DisableApplyAllRecordsSkippedOutcome(t *testing.T) {
+	RegisterMockTestingT(t)
+	setup(t)
+	applyCommandRunner.DisableApplyAll = true
+	t.Cleanup(func() { applyCommandRunner.DisableApplyAll = false })
+	ctx := &command.Context{
+		User: testdata.User, Log: logging.NewNoopLogger(t),
+		Scope: metricstest.NewLoggingScope(t, logging.NewNoopLogger(t), "atlantis"),
+		Pull:  models.PullRequest{BaseRepo: testdata.GithubRepo, State: models.OpenPullState, Num: testdata.Pull.Num},
+	}
+
+	applyCommandRunner.Run(ctx, &events.CommentCommand{Name: command.Apply})
+
+	Assert(t, ctx.CommandOutcomeSkipped, "expected disabled apply-all to record a skipped outcome")
+	Assert(t, !ctx.CommandSkipped, "disabled apply-all must not suppress post-workflow hooks")
 }
 
 func TestApplyCommandRunner_IsSilenced(t *testing.T) {

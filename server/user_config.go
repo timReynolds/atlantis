@@ -18,6 +18,10 @@ const (
 	RunStoreNoop = "noop"
 	// RunStorePostgres enables durable run history in PostgreSQL.
 	RunStorePostgres = "postgres"
+	// DefaultWebUsername and DefaultWebPassword are the publicly known default
+	// credentials for the existing web basic-auth surface.
+	DefaultWebUsername = "atlantis"
+	DefaultWebPassword = "atlantis"
 )
 
 // UserConfig holds config values passed in by the user.

@@ -44,6 +44,10 @@ func (NoopStore) ListProjectRuns(context.Context, ID, ProjectRunFilter, PageRequ
 	return ProjectRunPage{ProjectRuns: []ProjectRun{}}, nil
 }
 
+func (NoopStore) SummarizeProjectRuns(context.Context, ID) (ProjectRunSummary, error) {
+	return ProjectRunSummary{}, nil
+}
+
 func (NoopStore) GetOutput(context.Context, ID, int64, int) (OutputPage, error) {
 	return OutputPage{Chunks: []OutputChunk{}}, nil
 }

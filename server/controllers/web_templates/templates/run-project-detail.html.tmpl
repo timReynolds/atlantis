@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ if .Project.ProjectName }}{{ .Project.ProjectName }}{{ else }}Project{{ end }} · run {{ .Run.ID }} · atlantis</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/normalize.css">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/skeleton.css">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/custom.css">
+  <link rel="icon" type="image/png" href="{{ .CleanedBasePath }}/static/images/atlantis-icon.png">
+</head>
+<body>
+<div class="container history-page">
+  <nav class="history-nav"><a href="{{ .CleanedBasePath }}/">Atlantis</a><a href="{{ .CleanedBasePath }}/runs">Runs</a><a href="{{ .CleanedBasePath }}/audit">Audit</a></nav>
+  <p class="history-breadcrumb"><a href="{{ .CleanedBasePath }}{{ .Run.DetailPath }}">← Back to run</a></p>
+  <header class="history-header">
+    <p class="history-eyebrow"><code>{{ .Project.Directory }}</code> · <code>{{ .Project.Workspace }}</code></p>
+    <h2>{{ if .Project.ProjectName }}{{ .Project.ProjectName }}{{ else }}Unnamed project{{ end }}</h2>
+    <span class="history-status history-status-{{ .Project.Status }}">{{ .Project.Status }}</span>
+  </header>
+  <section class="history-summary-grid history-summary-project">
+    <div><strong class="history-change-add">+{{ .Project.Additions }}</strong><span>Add</span></div>
+    <div><strong class="history-change-update">~{{ .Project.Changes }}</strong><span>Change</span></div>
+    <div><strong class="history-change-destroy">-{{ .Project.Destructions }}</strong><span>Destroy</span></div>
+    <div><strong>{{ .Project.Imports }}</strong><span>Import</span></div>
+    <div><strong>{{ .Project.Forgets }}</strong><span>Forget</span></div>
+  </section>
+  {{ if .Project.ErrorSummary }}<div class="history-alert"><strong>Execution error</strong><p>{{ .Project.ErrorSummary }}</p></div>{{ end }}
+  {{ if .Project.ArtifactKey }}<section class="history-artifact"><h5>Plan artifact</h5><dl><dt>Object key</dt><dd><code>{{ .Project.ArtifactKey }}</code></dd>{{ if .Project.ArtifactChecksum }}<dt>Checksum</dt><dd><code>{{ .Project.ArtifactChecksum }}</code></dd>{{ end }}{{ if .Project.ArtifactCreatedAt }}<dt>Created</dt><dd>{{ .Project.ArtifactCreatedAt }}</dd>{{ end }}{{ if .Project.ArtifactExpiresAt }}<dt>Expires</dt><dd>{{ .Project.ArtifactExpiresAt }}</dd>{{ end }}</dl></section>{{ end }}
+  {{ if .Project.RawMetadata }}<details><summary>Project metadata</summary><pre class="history-metadata">{{ .Project.RawMetadata }}</pre></details>{{ end }}
+
+  <section class="history-section">
+    <div class="history-section-title"><h4>Command output</h4><span>stdout, stderr, and Atlantis system messages</span></div>
+    {{ if .Output }}<pre class="history-output">{{ range .Output }}<span class="history-output-{{ .Stream }}">{{ .Content }}</span>{{ end }}</pre>{{ else }}<div class="history-empty">No retained output for this project.</div>{{ end }}
+    {{ if .NextPath }}<a class="button history-next" href="{{ .CleanedBasePath }}{{ .NextPath }}">Load next output page</a>{{ end }}
+  </section>
+</div>
+<footer>{{ .AtlantisVersion }}</footer>
+</body>
+</html>

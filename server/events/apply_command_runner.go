@@ -113,6 +113,7 @@ func (a *ApplyCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
 
 	if locked {
 		ctx.Log.Info("ignoring apply command since apply disabled globally")
+		ctx.CommandOutcomeSkipped = true
 		if err := a.vcsClient.CreateComment(ctx.Log, baseRepo, pull.Num, applyDisabledComment, command.Apply.String()); err != nil {
 			ctx.Log.Err("unable to comment on pull request: %s", err)
 		}
@@ -122,6 +123,7 @@ func (a *ApplyCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
 
 	if a.DisableApplyAll && !cmd.IsForSpecificProject() {
 		ctx.Log.Info("ignoring apply command without flags since apply all is disabled")
+		ctx.CommandOutcomeSkipped = true
 		if err := a.vcsClient.CreateComment(ctx.Log, baseRepo, pull.Num, applyAllDisabledComment, command.Apply.String()); err != nil {
 			ctx.Log.Err("unable to comment on pull request: %s", err)
 		}

@@ -289,15 +289,16 @@ func (a *APIController) Plan(w http.ResponseWriter, r *http.Request) {
 		a.apiReportLegacyError(w, code, err)
 		return
 	}
-
+	var lifecycle *events.RunLifecycle
+	defer a.finishAPIRun(ctx, runs.CommandPlan, &lifecycle)
 	err = a.apiSetup(ctx, command.Plan)
+	lifecycle = a.RunHistory.Begin(ctx, runs.CommandPlan, runs.TriggerAPI)
 	if err != nil {
+		lifecycle.Fail()
 		a.apiReportLegacyError(w, http.StatusInternalServerError, err)
 		return
 	}
 	defer a.cleanupNonPRWorkingDir(ctx)
-	lifecycle := a.RunHistory.Begin(ctx, runs.CommandPlan, runs.TriggerAPI)
-	defer lifecycle.FinishRecovering()
 
 	result, err := a.apiPlan(request, ctx)
 	if err != nil {
@@ -328,15 +329,16 @@ func (a *APIController) Apply(w http.ResponseWriter, r *http.Request) {
 		a.apiReportLegacyError(w, code, err)
 		return
 	}
-
+	var lifecycle *events.RunLifecycle
+	defer a.finishAPIRun(ctx, runs.CommandApply, &lifecycle)
 	err = a.apiSetup(ctx, command.Apply)
+	lifecycle = a.RunHistory.Begin(ctx, runs.CommandApply, runs.TriggerAPI)
 	if err != nil {
+		lifecycle.Fail()
 		a.apiReportLegacyError(w, http.StatusInternalServerError, err)
 		return
 	}
 	defer a.cleanupNonPRWorkingDir(ctx)
-	lifecycle := a.RunHistory.Begin(ctx, runs.CommandApply, runs.TriggerAPI)
-	defer lifecycle.FinishRecovering()
 
 	// We must first make the plan for all projects
 	result, err := a.apiPlan(request, ctx)
@@ -374,6 +376,20 @@ func (a *APIController) Apply(w http.ResponseWriter, r *http.Request) {
 		statusCode = http.StatusInternalServerError
 	}
 	responder.writeJSON(w, statusCode, result)
+}
+
+func (a *APIController) finishAPIRun(ctx *command.Context, runCommand runs.Command, lifecycle **events.RunLifecycle) {
+	if recovered := recover(); recovered != nil {
+		if *lifecycle == nil {
+			*lifecycle = a.RunHistory.Begin(ctx, runCommand, runs.TriggerAPI)
+		}
+		(*lifecycle).Fail()
+		(*lifecycle).Finish()
+		panic(recovered)
+	}
+	if *lifecycle != nil {
+		(*lifecycle).Finish()
+	}
 }
 
 // LockDetail is deprecated - use LockDetailAPI instead.

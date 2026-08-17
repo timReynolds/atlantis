@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ .Title }} · atlantis</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/normalize.css">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/skeleton.css">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/custom.css">
+  <link rel="icon" type="image/png" href="{{ .CleanedBasePath }}/static/images/atlantis-icon.png">
+</head>
+<body>
+<div class="container history-page">
+  <nav class="history-nav">
+    <a href="{{ .CleanedBasePath }}/">Atlantis</a>
+    <a class="active" href="{{ .CleanedBasePath }}/runs">Runs</a>
+    <a href="{{ .CleanedBasePath }}/audit">Audit</a>
+  </nav>
+  <header class="history-header">
+    <p class="history-eyebrow">Durable history</p>
+    <h2>{{ .Title }}</h2>
+    <p>Plans, applies, drift operations, and their project-level outcomes.</p>
+  </header>
+
+  <form class="history-filter" method="get">
+    <label>Repository<input name="repository" placeholder="owner/repository" value="{{ .Filter.Repository }}"></label>
+    <label>Pull request<input name="pull" inputmode="numeric" value="{{ .Filter.PullNumber }}"></label>
+    <label>Commit SHA<input name="commit" value="{{ .Filter.HeadSHA }}"></label>
+    <label>Actor<input name="actor" value="{{ .Filter.Actor }}"></label>
+    <label>Command<input name="command" placeholder="plan,apply" value="{{ .Filter.Command }}"></label>
+    <label>Status<input name="status" placeholder="failed,partial" value="{{ .Filter.Status }}"></label>
+    <div class="history-filter-actions"><button class="button-primary" type="submit">Filter</button><a href="{{ .CleanedBasePath }}/runs">Clear</a></div>
+  </form>
+
+  {{ if .Runs }}
+  <div class="history-table-wrap">
+    <table class="u-full-width history-table">
+      <thead><tr><th>Run</th><th>Repository / PR</th><th>Command</th><th>Actor</th><th>Commit</th><th>Status</th><th>Created</th></tr></thead>
+      <tbody>
+      {{ $basePath := .CleanedBasePath }}
+      {{ range .Runs }}
+      <tr>
+        <td><a class="history-id" href="{{ $basePath }}{{ .DetailPath }}">{{ .ID }}</a></td>
+        <td>
+          {{ if .RepositoryPath }}<a href="{{ $basePath }}{{ .RepositoryPath }}">{{ .Repository }}</a>{{ else }}{{ .Repository }}{{ end }}
+          {{ if .PullNumber }}<br>{{ if .PullHistoryPath }}<a href="{{ $basePath }}{{ .PullHistoryPath }}">PR #{{ .PullNumber }}</a>{{ else }}PR #{{ .PullNumber }}{{ end }}{{ end }}
+        </td>
+        <td><code>{{ .Command }}</code><br><span class="history-muted">{{ .Trigger }}</span></td>
+        <td>{{ if .Actor }}{{ .Actor }}{{ else }}<span class="history-muted">system</span>{{ end }}</td>
+        <td><code class="history-sha">{{ .HeadSHA }}</code></td>
+        <td><span class="history-status history-status-{{ .Status }}">{{ .Status }}</span></td>
+        <td class="history-nowrap">{{ .CreatedAt }}</td>
+      </tr>
+      {{ end }}
+      </tbody>
+    </table>
+  </div>
+  {{ else }}
+  <div class="history-empty">No runs match these filters.</div>
+  {{ end }}
+
+  {{ if .NextPath }}<a class="button history-next" href="{{ .CleanedBasePath }}{{ .NextPath }}">Next 100 runs</a>{{ end }}
+</div>
+<footer>{{ .AtlantisVersion }}</footer>
+</body>
+</html>

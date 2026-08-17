@@ -108,6 +108,8 @@ func (c AutoplanCommand) IsAutoplan() bool {
 
 // CommentCommand is a command that was triggered by a pull request comment.
 type CommentCommand struct {
+	// VCSDeliveryID identifies the webhook delivery that accepted this command.
+	VCSDeliveryID string
 	// RepoRelDir is the path relative to the repo root to run the command in.
 	// Will never end in "/". If empty then the comment specified no directory.
 	RepoRelDir string

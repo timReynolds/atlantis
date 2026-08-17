@@ -1533,6 +1533,10 @@ ATLANTIS_RUN_STORE_TYPE=postgres
 
 Selects the durable run history store. Valid values are `noop` and `postgres`; the default is `noop`, which preserves the existing Atlantis execution and storage behavior. The PostgreSQL store holds run metadata, project results, audit records, and chunked command output. It does not replace Redis coordination or the external plan artifact store.
 
+When `postgres` is selected, Atlantis registers read-only history pages at `/runs`, repository and pull-request scoped routes under `/repos`, project output pages under `/runs/{run-id}`, and `/audit`. Repository routes preserve provider namespaces such as `group/subgroup/repo`. Because Terraform output can contain secrets, these routes are available only when [`--web-basic-auth`](#--web-basic-auth) is enabled. They return `404 Not Found` when web authentication is disabled, and Atlantis rejects the publicly known default web credentials when history and web authentication are both enabled.
+
+With both PostgreSQL history and web Basic Auth enabled, non-verbose commands returning at least 50 project results produce one concise VCS summary with a link to the authenticated Run page. Existing comment-suppression options are honored first. Smaller runs and explicit verbose commands keep the standard Atlantis comment rendering. Successful `import` and `state rm` results also retain the standard renderer at every size so their destructive-command output and operator guidance are not hidden; their comments are therefore not bounded by this threshold.
+
 ### `--silence-allowlist-errors` <Badge text="v0.28.0+" type="info"/>
 
 ```bash

@@ -47,7 +47,7 @@ func (s *RunHistoryPlanStore) Save(ctx command.ProjectContext, planPath string) 
 	}
 	checksum, err := hashFile(filepath.Dir(planPath), planPath)
 	if err != nil {
-		s.logger.Err("hashing plan artifact metadata: %v", err)
+		s.logger.Err("hashing plan artifact metadata %v", err)
 		return nil
 	}
 	key := s.PlanStore.(artifactKeyProvider).ArtifactKey(ctx, planPath)

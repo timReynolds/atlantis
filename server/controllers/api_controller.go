@@ -5,6 +5,7 @@ package controllers
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/runatlantis/atlantis/server/core/drift"
 	"github.com/runatlantis/atlantis/server/core/locking"
+	"github.com/runatlantis/atlantis/server/core/ownership"
 	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/command"
@@ -60,6 +62,8 @@ type APIController struct {
 	ProjectPolicyCheckCommandRunner events.ProjectPolicyCheckCommandRunner
 	ProjectApplyCommandRunner       events.ProjectApplyCommandRunner `validate:"required"`
 	RunHistory                      *events.RunHistory
+	ExecutionInstanceID             runs.ID
+	ExecutionDeploymentID           string
 	FailOnPreWorkflowHookError      bool
 	PreWorkflowHooksCommandRunner   events.PreWorkflowHooksCommandRunner  `validate:"required"`
 	PostWorkflowHooksCommandRunner  events.PostWorkflowHooksCommandRunner `validate:"required"`
@@ -111,6 +115,61 @@ func (a *APIController) getAPIMiddleware() *APIMiddleware {
 
 func nextNonPRPullNum() int {
 	return -int((time.Now().UnixNano() & 0x3fffffff) + nonPRPullCounter.Add(1))
+}
+
+// prepareAPIExecution gives authenticated API work the same durable attempt
+// identity and admission fence as owner-routed VCS work. PR-backed requests
+// share the existing whole-PR concurrency key; non-PR requests use a stable
+// deployment/repository/ref key so a process loss cannot make an ambiguous
+// apply immediately executable on another replica.
+func (a *APIController) prepareAPIExecution(ctx *command.Context) error {
+	if a.ExecutionInstanceID == "" {
+		return nil
+	}
+	deploymentID := strings.TrimSpace(a.ExecutionDeploymentID)
+	if deploymentID == "" {
+		return errors.New("API execution deployment identity is incomplete")
+	}
+	var (
+		concurrencyKey string
+		err            error
+	)
+	if ctx.Pull.Num > 0 {
+		concurrencyKey, err = ownership.NewKey(ctx.Pull.BaseRepo, ctx.Pull.Num).ConcurrencyKey(deploymentID)
+	} else {
+		concurrencyKey, err = apiRefConcurrencyKey(deploymentID, ctx.Pull)
+	}
+	if err != nil {
+		return fmt.Errorf("deriving API execution concurrency key: %w", err)
+	}
+	claimID, err := runs.NewID()
+	if err != nil {
+		return fmt.Errorf("generating API execution admission token: %w", err)
+	}
+	ctx.ExecutionInstanceID = a.ExecutionInstanceID
+	ctx.ExecutionDeploymentID = deploymentID
+	ctx.ConcurrencyKey = concurrencyKey
+	ctx.OwnershipClaimID = "api:" + string(claimID)
+	return nil
+}
+
+func apiRefConcurrencyKey(deploymentID string, pull models.PullRequest) (string, error) {
+	hostname := strings.ToLower(strings.TrimSpace(pull.BaseRepo.VCSHost.Hostname))
+	repository := strings.TrimSpace(pull.BaseRepo.FullName)
+	// Normalize to what the checkout actually resolves to: "main" and
+	// "refs/heads/main" both fetch refs/heads/main, so they must collapse to
+	// the same admission key or two replicas can admit conflicting attempts
+	// against the same underlying ref.
+	headRef := models.NormalizeAPIRef(pull.HeadBranch)
+	if hostname == "" || repository == "" || headRef == "" {
+		return "", fmt.Errorf("invalid API execution key for host %q repo %q ref %q", hostname, repository, headRef)
+	}
+	canonical := strings.Join([]string{
+		"api-ref-v1", deploymentID, hostname, repository,
+		models.NormalizeAPIRef(pull.BaseBranch), headRef,
+	}, "\x00")
+	sum := sha256.Sum256([]byte(canonical))
+	return fmt.Sprintf("sha256:%x", sum), nil
 }
 
 func (a *APIController) lockFullDriftDetection(repository, vcsType, ref, baseBranch string) func() {
@@ -294,6 +353,10 @@ func (a *APIController) Plan(w http.ResponseWriter, r *http.Request) {
 		a.apiReportLegacyError(w, code, err)
 		return
 	}
+	if err := a.prepareAPIExecution(ctx); err != nil {
+		a.apiReportLegacyError(w, http.StatusInternalServerError, err)
+		return
+	}
 	var lifecycle *events.RunLifecycle
 	defer a.finishAPIRun(ctx, runs.CommandPlan, &lifecycle)
 	err = a.apiSetup(ctx, command.Plan)
@@ -301,6 +364,10 @@ func (a *APIController) Plan(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		lifecycle.Fail()
 		a.apiReportLegacyError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !lifecycle.CanExecute() {
+		a.apiReportLegacyError(w, http.StatusServiceUnavailable, lifecycle.AdmissionError())
 		return
 	}
 	defer a.cleanupNonPRWorkingDir(ctx)
@@ -334,6 +401,10 @@ func (a *APIController) Apply(w http.ResponseWriter, r *http.Request) {
 		a.apiReportLegacyError(w, code, err)
 		return
 	}
+	if err := a.prepareAPIExecution(ctx); err != nil {
+		a.apiReportLegacyError(w, http.StatusInternalServerError, err)
+		return
+	}
 	var lifecycle *events.RunLifecycle
 	defer a.finishAPIRun(ctx, runs.CommandApply, &lifecycle)
 	err = a.apiSetup(ctx, command.Apply)
@@ -341,6 +412,10 @@ func (a *APIController) Apply(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		lifecycle.Fail()
 		a.apiReportLegacyError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !lifecycle.CanExecute() {
+		a.apiReportLegacyError(w, http.StatusServiceUnavailable, lifecycle.AdmissionError())
 		return
 	}
 	defer a.cleanupNonPRWorkingDir(ctx)
@@ -1235,17 +1310,27 @@ func (a *APIController) Remediate(w http.ResponseWriter, r *http.Request) {
 		},
 		Log: a.Logger, Scope: a.Scope, API: true,
 	}
+	if err := a.prepareAPIExecution(historyCtx); err != nil {
+		responder.InternalError(w, r, err)
+		return
+	}
 	lifecycle := a.RunHistory.Begin(historyCtx, runs.CommandDriftRemediation, runs.TriggerAPI)
 	defer lifecycle.FinishRecovering()
+	if !lifecycle.CanExecute() {
+		responder.ServiceUnavailable(w, r, lifecycle.AdmissionError().Error())
+		return
+	}
 	request.RunID = string(historyCtx.RunID)
 
 	// Create executor that bridges to existing plan/apply infrastructure
 	executor := &apiRemediationExecutor{
-		controller: a,
-		baseRepo:   baseRepo,
-		baseBranch: request.BaseBranch,
-		logger:     a.Logger,
-		runID:      historyCtx.RunID,
+		controller:       a,
+		baseRepo:         baseRepo,
+		baseBranch:       request.BaseBranch,
+		logger:           a.Logger,
+		runID:            historyCtx.RunID,
+		attemptID:        historyCtx.AttemptID,
+		sideEffectMarker: historyCtx.SideEffectMarker,
 	}
 
 	// Execute remediation
@@ -1287,11 +1372,13 @@ func (a *APIController) Remediate(w http.ResponseWriter, r *http.Request) {
 // apiRemediationExecutor implements drift.RemediationExecutor using the API controller's
 // existing plan/apply infrastructure.
 type apiRemediationExecutor struct {
-	controller *APIController
-	baseRepo   models.Repo
-	baseBranch string
-	logger     logging.SimpleLogging
-	runID      runs.ID
+	controller       *APIController
+	baseRepo         models.Repo
+	baseBranch       string
+	logger           logging.SimpleLogging
+	runID            runs.ID
+	attemptID        runs.ID
+	sideEffectMarker command.SideEffectMarker
 }
 
 // ExecutePlan runs a plan for the given project using the API infrastructure.
@@ -1315,8 +1402,10 @@ func (e *apiRemediationExecutor) ExecutePlan(repository, ref, vcsType, projectNa
 
 	// Build the command context
 	ctx := &command.Context{
-		RunID:    e.runID,
-		HeadRepo: e.baseRepo,
+		RunID:            e.runID,
+		AttemptID:        e.attemptID,
+		SideEffectMarker: e.sideEffectMarker,
+		HeadRepo:         e.baseRepo,
 		Pull: models.PullRequest{
 			Num:                      nextNonPRPullNum(), // Synthetic non-PR workflow ID.
 			BaseBranch:               e.baseBranchForRef(ref),
@@ -1391,8 +1480,10 @@ func (e *apiRemediationExecutor) ExecuteApplyProjects(repository, ref, vcsType s
 	}
 
 	ctx := &command.Context{
-		RunID:    e.runID,
-		HeadRepo: e.baseRepo,
+		RunID:            e.runID,
+		AttemptID:        e.attemptID,
+		SideEffectMarker: e.sideEffectMarker,
+		HeadRepo:         e.baseRepo,
 		Pull: models.PullRequest{
 			Num:                      nextNonPRPullNum(), // Synthetic non-PR workflow ID.
 			BaseBranch:               e.baseBranchForRef(ref),
@@ -1486,8 +1577,10 @@ func (e *apiRemediationExecutor) ExecuteApply(repository, ref, vcsType, projectN
 
 	// Build the command context
 	ctx := &command.Context{
-		RunID:    e.runID,
-		HeadRepo: e.baseRepo,
+		RunID:            e.runID,
+		AttemptID:        e.attemptID,
+		SideEffectMarker: e.sideEffectMarker,
+		HeadRepo:         e.baseRepo,
 		Pull: models.PullRequest{
 			Num:                      nextNonPRPullNum(), // Synthetic non-PR workflow ID.
 			BaseBranch:               e.baseBranchForRef(ref),
@@ -2308,8 +2401,16 @@ func (a *APIController) DetectDrift(w http.ResponseWriter, r *http.Request) {
 		ExactProjectNameMatching:  true,
 		SortByExecutionOrder:      true,
 	}
+	if err := a.prepareAPIExecution(ctx); err != nil {
+		responder.InternalError(w, r, err)
+		return
+	}
 	lifecycle := a.RunHistory.Begin(ctx, runs.CommandDriftDetection, runs.TriggerAPI)
 	defer lifecycle.FinishRecovering()
+	if !lifecycle.CanExecute() {
+		responder.ServiceUnavailable(w, r, lifecycle.AdmissionError().Error())
+		return
+	}
 	detectionResult := models.NewDriftDetectionResult(request.Repository)
 	if ctx.RunID != "" {
 		detectionResult.ID = string(ctx.RunID)

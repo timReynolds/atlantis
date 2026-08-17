@@ -268,10 +268,24 @@ func (s *OwnerStore) Ready(ctx context.Context) error {
 
 // Close stops renewal and releases claims still owned by this process.
 func (s *OwnerStore) Close() error {
+	return s.stop(true)
+}
+
+// Abandon stops renewal without releasing claims. Shutdown uses this when
+// Terraform did not drain before the termination deadline, so another replica
+// cannot begin until the existing leases expire naturally.
+func (s *OwnerStore) Abandon() error {
+	return s.stop(false)
+}
+
+func (s *OwnerStore) stop(release bool) error {
 	s.closeOnce.Do(func() {
 		s.BeginDrain()
 		s.cancel()
 		<-s.done
+		if !release {
+			return
+		}
 
 		s.mu.RLock()
 		owned := make(map[string]ownedRecord, len(s.owned))

@@ -31,6 +31,8 @@ const (
 	defaultAttemptStaleAfter = 30 * time.Second
 )
 
+var errRunHistoryDraining = errors.New("Atlantis is draining and is not accepting executable work")
+
 // RunOutputFinalizer flushes and releases buffered output for a logical Run.
 type RunOutputFinalizer interface {
 	FinishRun(runID runs.ID) bool
@@ -52,6 +54,8 @@ type RunHistory struct {
 	outputFinalizer   RunOutputFinalizer
 	attemptHeartbeat  time.Duration
 	attemptStaleAfter time.Duration
+	draining          atomic.Bool
+	admissionMu       sync.RWMutex
 }
 
 // NewRunHistory returns a lifecycle observer for a configured durable store.
@@ -79,6 +83,56 @@ func (h *RunHistory) SetAttemptRecoveryTimeout(timeout time.Duration) {
 	if h != nil && timeout > 0 {
 		h.attemptStaleAfter = timeout
 	}
+}
+
+// BeginDrain prevents new execution admission and prevents an already
+// admitted command from crossing the durable infrastructure-side-effect
+// boundary. Planning work already in flight may continue to drain.
+func (h *RunHistory) BeginDrain() {
+	if h != nil {
+		h.admissionMu.Lock()
+		defer h.admissionMu.Unlock()
+		h.draining.Store(true)
+	}
+}
+
+// InterruptActive durably classifies commands that did not finish inside the
+// graceful termination window. Interrupted plans leave their logical Run open
+// so a replacement attempt can reuse it. Once a mutation marker exists, the
+// only safe terminal state is unknown.
+// ctx bounds the entire classification pass, shared across every session's
+// heartbeat teardown and durable writes, so a slow or unavailable database
+// cannot turn "graceful shutdown" into an unbounded wait.
+func (h *RunHistory) InterruptActive(ctx context.Context, reason string) int {
+	if h == nil {
+		return 0
+	}
+	h.BeginDrain()
+	interrupted := 0
+	h.sessions.Range(func(_, value any) bool {
+		session := value.(*runSession)
+		if session.lifecycle != nil {
+			interrupted++
+			session.lifecycle.interrupt(ctx, reason, session.run.Command == runs.CommandPlan)
+		}
+		return true
+	})
+	return interrupted
+}
+
+// HasActiveExecutions reports whether an executable lifecycle is still using
+// durable Run state. Unlike the HTTP drainer, this includes API-triggered plan,
+// apply, drift detection, and drift remediation handlers.
+func (h *RunHistory) HasActiveExecutions() bool {
+	if h == nil {
+		return false
+	}
+	active := false
+	h.sessions.Range(func(_, _ any) bool {
+		active = true
+		return false
+	})
+	return active
 }
 
 // IsRunHistoryComplete reports whether all persistence attempted so far for a
@@ -120,10 +174,23 @@ func (h *RunHistory) Begin(ctx *command.Context, runCommand runs.Command, trigge
 	if h == nil || ctx == nil || h.writer == nil {
 		return lifecycle
 	}
+	h.admissionMu.RLock()
+	defer h.admissionMu.RUnlock()
+	if h.draining.Load() {
+		lifecycle.canExecute = false
+		lifecycle.admissionErr = errRunHistoryDraining
+		ctx.CommandHasErrors = true
+		h.logError(ctx.Log, "admitting run while draining", errRunHistoryDraining)
+		return lifecycle
+	}
 	now := h.now().UTC()
 	runID, err := h.newID()
 	if err != nil {
 		h.logError(ctx.Log, "generating run history ID", err)
+		if requiresDurableAttempt {
+			lifecycle.admissionErr = fmt.Errorf("generating run history ID: %w", err)
+			ctx.CommandHasErrors = true
+		}
 		return lifecycle
 	}
 	pullNumber := positivePullNumber(ctx.Pull.Num)
@@ -145,6 +212,7 @@ func (h *RunHistory) Begin(ctx *command.Context, runCommand runs.Command, trigge
 			h.logError(ctx.Log, "creating run history", err)
 			if ctx.ExecutionInstanceID != "" {
 				lifecycle.canExecute = false
+				lifecycle.admissionErr = fmt.Errorf("creating run history: %w", err)
 				ctx.CommandHasErrors = true
 			}
 			return lifecycle
@@ -159,7 +227,7 @@ func (h *RunHistory) Begin(ctx *command.Context, runCommand runs.Command, trigge
 		h.recordProject(projectCtx, phase, output)
 	}
 	session := &runSession{
-		run: run, projects: sync.Map{},
+		run: run, projects: sync.Map{}, lifecycle: lifecycle,
 	}
 	h.sessions.Store(runID, session)
 	lifecycle.runID = runID
@@ -167,6 +235,10 @@ func (h *RunHistory) Begin(ctx *command.Context, runCommand runs.Command, trigge
 	h.appendAudit(ctx.Log, session, string(run.Command)+".requested", auditMetadata, now)
 	if recovery.err != nil || recovery.blockReason != "" {
 		lifecycle.canExecute = false
+		lifecycle.admissionErr = recovery.err
+		if lifecycle.admissionErr == nil {
+			lifecycle.admissionErr = errors.New(recovery.blockReason)
+		}
 		lifecycle.Fail()
 		ctx.CommandHasErrors = true
 		if recovery.err != nil {
@@ -265,18 +337,23 @@ func (d attemptRecoveryDecision) auditMetadata() map[string]any {
 
 // RunLifecycle controls one logical Run's terminal outcome.
 type RunLifecycle struct {
-	history              *RunHistory
-	ctx                  *command.Context
-	runID                runs.ID
-	once                 sync.Once
-	mu                   sync.Mutex
-	status               runs.Status
-	canExecute           bool
-	attemptID            runs.ID
-	attemptCancel        context.CancelFunc
-	attemptDone          chan struct{}
-	sideEffectMarker     *attemptSideEffectMarker
-	attemptUnknownReason string
+	history               *RunHistory
+	ctx                   *command.Context
+	runID                 runs.ID
+	once                  sync.Once
+	mu                    sync.Mutex
+	status                runs.Status
+	canExecute            bool
+	admissionErr          error
+	attemptID             runs.ID
+	attemptCancel         context.CancelFunc
+	attemptDone           chan struct{}
+	budgetCtx             context.Context
+	sideEffectMarker      *attemptSideEffectMarker
+	attemptUnknownReason  string
+	attemptTerminalStatus runs.AttemptStatus
+	attemptTerminalReason string
+	preserveRunForRetry   bool
 }
 
 // CanExecute reports whether HA admission state was durably persisted. Phase 1
@@ -288,6 +365,14 @@ func (l *RunLifecycle) CanExecute() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.canExecute
+}
+
+// AdmissionError explains a fail-closed execution admission decision.
+func (l *RunLifecycle) AdmissionError() error {
+	if l == nil {
+		return nil
+	}
+	return l.admissionErr
 }
 
 // Fail marks the logical operation failed independently of command.Context.
@@ -325,22 +410,62 @@ func (l *RunLifecycle) Finish() {
 func (l *RunLifecycle) FinishRecovering() {
 	if recovered := recover(); recovered != nil {
 		l.Fail()
+		l.mu.Lock()
 		if l.sideEffectMarker != nil && l.sideEffectMarker.Marked() {
 			l.attemptUnknownReason = "panic after infrastructure side effect started"
 		}
+		l.mu.Unlock()
 		l.Finish()
 		panic(recovered)
 	}
 	l.Finish()
 }
 
+// writeHistory runs a durable write, sharing this lifecycle's classification
+// budget (if any) as the write's parent context so a bounded interrupt pass
+// cannot be exceeded one write at a time.
+func (l *RunLifecycle) writeHistory(operation func(context.Context) error) error {
+	parent := context.Context(context.Background())
+	if l != nil {
+		l.mu.Lock()
+		if l.budgetCtx != nil {
+			parent = l.budgetCtx
+		}
+		l.mu.Unlock()
+	}
+	return writeRunHistoryWithParent(parent, operation)
+}
+
+func (l *RunLifecycle) interrupt(ctx context.Context, reason string, retryablePlan bool) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	l.budgetCtx = ctx
+	if l.sideEffectMarker != nil && l.sideEffectMarker.Marked() {
+		l.attemptUnknownReason = reason + "; infrastructure side effect may have completed"
+		l.attemptTerminalStatus = runs.AttemptUnknown
+		l.preserveRunForRetry = false
+	} else if l.attemptID != "" {
+		l.attemptTerminalStatus = runs.AttemptInterrupted
+		l.attemptTerminalReason = reason + "; execution stopped before an infrastructure side effect"
+		l.preserveRunForRetry = retryablePlan
+	}
+	if l.status == "" {
+		l.status = runs.StatusFailed
+	}
+	l.mu.Unlock()
+	l.Finish()
+}
+
 func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 	lifecycle.stopAttemptHeartbeat()
-	value, ok := h.sessions.LoadAndDelete(lifecycle.runID)
+	value, ok := h.sessions.Load(lifecycle.runID)
 	if !ok {
 		return
 	}
 	session := value.(*runSession)
+	defer h.sessions.Delete(lifecycle.runID)
 	defer func() { session.finalizeComments(!session.persistenceIncomplete.Load()) }()
 	if h.outputFinalizer != nil && !h.outputFinalizer.FinishRun(lifecycle.runID) {
 		session.persistenceIncomplete.Store(true)
@@ -348,11 +473,15 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 	}
 	now := h.now().UTC()
 	succeeded, failed := 0, 0
+	unknownPhase := lifecycle.unknownMutationPhase(session.run.Command)
 	session.projects.Range(func(_, value any) bool {
 		project := value.(*projectObservation)
 		project.mu.Lock()
 		status := project.status
-		if status == runs.StatusRunning || status == "" {
+		if unknownPhase != "" && !project.phases[unknownPhase] {
+			status = runs.StatusUnknown
+			project.errorSummary = "infrastructure outcome is unknown because execution stopped after a side effect started"
+		} else if status == runs.StatusRunning || status == "" {
 			status = runs.StatusFailed
 			if project.errorSummary == "" {
 				project.errorSummary = "project execution did not complete"
@@ -366,13 +495,13 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 			PlanArtifact: project.artifact, Metadata: project.metadata(),
 		}
 		project.mu.Unlock()
-		if err := writeRunHistory(func(writeCtx context.Context) error {
+		if err := lifecycle.writeHistory(func(writeCtx context.Context) error {
 			return h.writer.CompleteProjectRun(writeCtx, completion)
 		}); err != nil {
 			h.blockRunCompletion(lifecycle.ctx.Log, session, "completing project run history", err)
 			return false
 		}
-		if status == runs.StatusFailed || status == runs.StatusPartial || status == runs.StatusCancelled {
+		if status == runs.StatusFailed || status == runs.StatusPartial || status == runs.StatusCancelled || status == runs.StatusUnknown {
 			failed++
 		} else {
 			succeeded++
@@ -388,17 +517,46 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 		return
 	}
 
-	if err := writeRunHistory(func(writeCtx context.Context) error {
-		return h.writer.CompleteRun(writeCtx, runs.RunCompletion{
-			ID: lifecycle.runID, Status: status, CompletedAt: now,
-		})
-	}); err != nil {
-		h.markPersistenceFailed(lifecycle.ctx.Log, session, "completing run history", err)
-		return
+	preserveRunForRetry := lifecycle.shouldPreserveRunForRetry()
+	if !preserveRunForRetry {
+		if err := lifecycle.writeHistory(func(writeCtx context.Context) error {
+			return h.writer.CompleteRun(writeCtx, runs.RunCompletion{
+				ID: lifecycle.runID, Status: status, CompletedAt: now,
+			})
+		}); err != nil {
+			h.markPersistenceFailed(lifecycle.ctx.Log, session, "completing run history", err)
+			return
+		}
 	}
-	h.appendAudit(lifecycle.ctx.Log, session, string(session.run.Command)+".completed", map[string]any{
+	eventType := string(session.run.Command) + ".completed"
+	if preserveRunForRetry {
+		eventType = string(session.run.Command) + ".interrupted"
+	}
+	h.appendAudit(lifecycle.ctx.Log, session, eventType, map[string]any{
 		"status": status, "projects_succeeded": succeeded, "projects_failed": failed,
 	}, now)
+}
+
+func (l *RunLifecycle) unknownMutationPhase(runCommand runs.Command) string {
+	if l == nil {
+		return ""
+	}
+	l.mu.Lock()
+	unknown := l.attemptUnknownReason != ""
+	l.mu.Unlock()
+	if !unknown {
+		return ""
+	}
+	switch runCommand {
+	case runs.CommandApply, runs.CommandDriftRemediation:
+		return command.Apply.String()
+	case runs.CommandImport:
+		return command.Import.String()
+	case runs.CommandStateRemove:
+		return command.State.String()
+	default:
+		return ""
+	}
 }
 
 func (h *RunHistory) beginAttempt(lifecycle *RunLifecycle, session *runSession, now time.Time) {
@@ -409,6 +567,7 @@ func (h *RunHistory) beginAttempt(lifecycle *RunLifecycle, session *runSession, 
 	block := func(action string, err error) {
 		lifecycle.mu.Lock()
 		lifecycle.canExecute = false
+		lifecycle.admissionErr = err
 		lifecycle.mu.Unlock()
 		lifecycle.Fail()
 		ctx.CommandHasErrors = true
@@ -436,8 +595,14 @@ func (h *RunHistory) beginAttempt(lifecycle *RunLifecycle, session *runSession, 
 		ConcurrencyKey: ctx.ConcurrencyKey, OwnershipClaimID: ctx.OwnershipClaimID,
 		Status: runs.AttemptClaimed, ClaimedAt: now, HeartbeatAt: now,
 	}
+	// A claim mismatch alone is not proof of a legitimate takeover for every
+	// caller: routed VCS work's claims are arbitrated by a single Redis lease,
+	// but API-triggered work mints an unarbitrated claim per request. Bound
+	// eviction to the same recovery window used for stale-attempt takeover so
+	// a still-healthy attempt can never be evicted by an unrelated request.
+	supersedeStaleBefore := now.Add(-h.attemptStaleAfter)
 	if err := writeRunHistory(func(writeCtx context.Context) error {
-		return h.executionWriter.CreateAttempt(writeCtx, attempt)
+		return h.executionWriter.CreateAttempt(writeCtx, attempt, supersedeStaleBefore)
 	}); err != nil {
 		block("creating execution attempt", err)
 		return
@@ -465,7 +630,7 @@ func (h *RunHistory) beginAttempt(lifecycle *RunLifecycle, session *runSession, 
 		return
 	}
 	marker := &attemptSideEffectMarker{
-		history: h, session: session, logger: ctx.Log, attemptID: attemptID,
+		history: h, session: session, lifecycle: lifecycle, logger: ctx.Log, attemptID: attemptID,
 	}
 	lifecycle.sideEffectMarker = marker
 	ctx.SideEffectMarker = marker
@@ -483,16 +648,20 @@ func (h *RunHistory) completeAttempt(lifecycle *RunLifecycle, session *runSessio
 	if lifecycle.attemptID == "" || h.executionWriter == nil {
 		return true
 	}
-	status := runs.AttemptSucceeded
-	reason := ""
-	if lifecycle.attemptUnknownReason != "" {
-		status = runs.AttemptUnknown
-		reason = lifecycle.attemptUnknownReason
-	} else if runStatus != runs.StatusSucceeded && runStatus != runs.StatusSkipped {
-		status = runs.AttemptFailed
-		reason = "logical run completed with status " + string(runStatus)
+	status, reason, unknownReason := lifecycle.attemptCompletion()
+	if status == "" {
+		status = runs.AttemptSucceeded
 	}
-	if err := writeRunHistory(func(writeCtx context.Context) error {
+	if unknownReason != "" {
+		status = runs.AttemptUnknown
+		reason = unknownReason
+	} else if runStatus != runs.StatusSucceeded && runStatus != runs.StatusSkipped {
+		if status != runs.AttemptInterrupted {
+			status = runs.AttemptFailed
+			reason = "logical run completed with status " + string(runStatus)
+		}
+	}
+	if err := lifecycle.writeHistory(func(writeCtx context.Context) error {
 		return h.executionWriter.CompleteAttempt(writeCtx, runs.AttemptCompletion{
 			ID: lifecycle.attemptID, Status: status, CompletedAt: completedAt,
 			FailureReason: reason,
@@ -520,7 +689,10 @@ func (l *RunLifecycle) startAttemptHeartbeat() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				err := writeRunHistory(func(writeCtx context.Context) error {
+				// Derive from the loop's own cancelable ctx (not Background) so
+				// stopAttemptHeartbeat's cancel promptly aborts an in-flight
+				// write instead of blocking for a full runHistoryWriteTimeout.
+				err := writeRunHistoryWithParent(ctx, func(writeCtx context.Context) error {
 					return l.history.executionWriter.HeartbeatAttempt(writeCtx, l.attemptID, l.history.now().UTC())
 				})
 				if err != nil {
@@ -544,6 +716,7 @@ func (l *RunLifecycle) stopAttemptHeartbeat() {
 type attemptSideEffectMarker struct {
 	history   *RunHistory
 	session   *runSession
+	lifecycle *RunLifecycle
 	logger    logging.SimpleLogging
 	attemptID runs.ID
 	once      sync.Once
@@ -553,6 +726,14 @@ type attemptSideEffectMarker struct {
 
 func (m *attemptSideEffectMarker) MarkSideEffectStarted(context.Context) error {
 	m.once.Do(func() {
+		m.history.admissionMu.RLock()
+		defer m.history.admissionMu.RUnlock()
+		m.lifecycle.mu.Lock()
+		defer m.lifecycle.mu.Unlock()
+		if m.history.draining.Load() || m.lifecycle.attemptTerminalStatus != "" {
+			m.err = errRunHistoryDraining
+			return
+		}
 		startedAt := m.history.now().UTC()
 		m.err = writeRunHistory(func(writeCtx context.Context) error {
 			return m.history.executionWriter.MarkAttemptSideEffectStarted(writeCtx, m.attemptID, startedAt)
@@ -573,8 +754,9 @@ func (m *attemptSideEffectMarker) Marked() bool {
 func (l *RunLifecycle) terminalStatus(succeeded, failed int) runs.Status {
 	l.mu.Lock()
 	forced := l.status
+	unknownReason := l.attemptUnknownReason
 	l.mu.Unlock()
-	if l.attemptUnknownReason != "" {
+	if unknownReason != "" {
 		return runs.StatusUnknown
 	}
 	if forced != "" {
@@ -603,9 +785,22 @@ func (l *RunLifecycle) terminalStatus(succeeded, failed int) runs.Status {
 	return runs.StatusSucceeded
 }
 
+func (l *RunLifecycle) attemptCompletion() (runs.AttemptStatus, string, string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.attemptTerminalStatus, l.attemptTerminalReason, l.attemptUnknownReason
+}
+
+func (l *RunLifecycle) shouldPreserveRunForRetry() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.preserveRunForRetry && l.attemptTerminalStatus == runs.AttemptInterrupted
+}
+
 type runSession struct {
 	run                   runs.Run
 	projects              sync.Map
+	lifecycle             *RunLifecycle
 	persistenceIncomplete atomic.Bool
 	completionBlocked     atomic.Bool
 	commentMu             sync.Mutex
@@ -1154,7 +1349,16 @@ var _ ProjectCommandRunner = (*RunHistoryProjectCommandRunner)(nil)
 var _ DeferredApplyStatusPublisher = (*RunHistoryProjectCommandRunner)(nil)
 
 func writeRunHistory(operation func(context.Context) error) error {
-	ctx, cancel := context.WithTimeout(context.Background(), runHistoryWriteTimeout)
+	return writeRunHistoryWithParent(context.Background(), operation)
+}
+
+// writeRunHistoryWithParent bounds a durable write to whatever time remains on
+// parent, capped at runHistoryWriteTimeout. When parent already carries a
+// deadline (e.g. a shared post-shutdown classification budget), that deadline
+// wins so a sequence of writes cannot each claim a fresh timeout and blow
+// through a caller's overall time budget.
+func writeRunHistoryWithParent(parent context.Context, operation func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(parent, runHistoryWriteTimeout)
 	defer cancel()
 	return operation(ctx)
 }

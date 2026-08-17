@@ -120,6 +120,7 @@ var testFlags = map[string]any{
 	EnableExternalStoresFlag:         false,
 	InternalCommandTokenFlag:         "internal-token",
 	OwnershipTTLSecondsFlag:          30,
+	ShutdownGracePeriodSecondsFlag:   5,
 	PortFlag:                         8181,
 	ParallelPoolSize:                 100,
 	ParallelPlanFlag:                 true,
@@ -303,6 +304,13 @@ func TestExecute_ReplicaRoutingValidation(t *testing.T) {
 			expected: "--replica-deployment-id must not be blank",
 		},
 		{
+			name: "rejects negative shutdown grace period",
+			configure: func(flags map[string]any) {
+				flags[ShutdownGracePeriodSecondsFlag] = -1
+			},
+			expected: "--shutdown-grace-period-seconds cannot be negative",
+		},
+		{
 			name: "durable HA requires PostgreSQL history",
 			configure: func(flags map[string]any) {
 				flags[ReplicaDeploymentIDFlag] = "prod-eu"
@@ -337,11 +345,12 @@ func TestInit_ReplicaRoutingFlagContract(t *testing.T) {
 		t.Fatal("--enable-replica-routing must not be exposed")
 	}
 	for flag, expected := range map[string][]string{
-		InternalCommandTokenFlag: {"activates replica routing"},
-		OwnershipTTLSecondsFlag:  {"does not activate replica routing"},
-		ReplicaAdvertiseURLFlag:  {"activates replica routing"},
-		ReplicaDeploymentIDFlag:  {"durable replica identity", "PostgreSQL run history", "S3 plan storage"},
-		ReplicaIDFlag:            {"Defaults to the process hostname", "activates replica routing"},
+		InternalCommandTokenFlag:       {"activates replica routing"},
+		OwnershipTTLSecondsFlag:        {"does not activate replica routing"},
+		ShutdownGracePeriodSecondsFlag: {"Maximum seconds", "SIGTERM"},
+		ReplicaAdvertiseURLFlag:        {"activates replica routing"},
+		ReplicaDeploymentIDFlag:        {"durable replica identity", "PostgreSQL run history", "S3 plan storage"},
+		ReplicaIDFlag:                  {"Defaults to the process hostname", "activates replica routing"},
 	} {
 		usage := c.Flags().Lookup(flag).Usage
 		for _, text := range expected {

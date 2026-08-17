@@ -28,7 +28,7 @@ func TestNoopStorePreservesDisabledBehavior(t *testing.T) {
 	Ok(t, store.RegisterInstance(ctx, runs.ExecutionInstance{}))
 	Ok(t, store.HeartbeatInstance(ctx, "", time.Time{}))
 	Ok(t, store.StopInstance(ctx, "", time.Time{}))
-	Ok(t, store.CreateAttempt(ctx, runs.RunAttempt{}))
+	Ok(t, store.CreateAttempt(ctx, runs.RunAttempt{}, time.Time{}))
 	Ok(t, store.StartAttempt(ctx, "", time.Time{}))
 	Ok(t, store.HeartbeatAttempt(ctx, "", time.Time{}))
 	Ok(t, store.MarkAttemptSideEffectStarted(ctx, "", time.Time{}))

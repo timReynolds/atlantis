@@ -133,7 +133,16 @@ func (s *Store) StopInstance(ctx context.Context, id runs.ID, stoppedAt time.Tim
 // CreateAttempt records admission under a Redis ownership claim. PostgreSQL's
 // partial unique index provides a durable second fence against overlapping
 // active attempts; it does not replace the Redis lease.
-func (s *Store) CreateAttempt(ctx context.Context, attempt runs.RunAttempt) error {
+//
+// supersedeStaleBefore bounds when a claim mismatch alone may be treated as a
+// legitimate takeover: an existing active attempt is only retired if its
+// heartbeat predates this time. Callers whose claim IDs are arbitrated by a
+// single distributed lease (Redis) may pass a generous threshold, since a
+// claim only changes there after the lease has already transferred. Callers
+// whose claim IDs are not arbitrated (e.g. freely-minted per-request IDs)
+// must pass the caller's real recovery window so a still-healthy attempt
+// cannot be evicted by an unrelated concurrent request.
+func (s *Store) CreateAttempt(ctx context.Context, attempt runs.RunAttempt, supersedeStaleBefore time.Time) error {
 	if err := attempt.Validate(); err != nil {
 		return fmt.Errorf("validating run attempt: %w", err)
 	}
@@ -188,6 +197,7 @@ func (s *Store) CreateAttempt(ctx context.Context, attempt runs.RunAttempt) erro
           AND concurrency_key = $2
           AND ownership_claim_id <> $3
           AND status IN ($5, $6)
+          AND heartbeat_at < $15
         RETURNING run_id, status, completed_at
     ), superseded_runs AS (
         UPDATE runs
@@ -228,7 +238,7 @@ func (s *Store) CreateAttempt(ctx context.Context, attempt runs.RunAttempt) erro
 		attempt.DeploymentID, attempt.ConcurrencyKey, attempt.OwnershipClaimID, attempt.ClaimedAt,
 		runs.AttemptClaimed, runs.AttemptRunning, runs.AttemptInterrupted, runs.AttemptUnknown,
 		runs.StatusFailed, runs.StatusUnknown, runs.StatusRunning, attempt.RunID,
-		runs.StatusCancelled, runs.StatusPending,
+		runs.StatusCancelled, runs.StatusPending, supersedeStaleBefore,
 	).Scan(&supersededAttempts, &supersededRuns, &supersededProjects, &supersededUnknown)
 	if err != nil {
 		return fmt.Errorf("retiring superseded run attempt: %w", err)

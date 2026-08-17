@@ -396,6 +396,140 @@ func TestRunHistoryRecordsRoutedExecutionAttempt(t *testing.T) {
 	require.Equal(t, []string{"apply.requested", "apply.attempt_started", "apply.completed"}, writer.auditTypes())
 }
 
+func TestRunHistoryDrainRejectsNewExecutionAndSideEffectAdmission(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := routedRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerComment)
+	require.True(t, lifecycle.CanExecute())
+
+	history.BeginDrain()
+	require.ErrorIs(t, ctx.SideEffectMarker.MarkSideEffectStarted(context.Background()), errRunHistoryDraining)
+
+	newCtx := routedRunContext(t)
+	newLifecycle := history.Begin(newCtx, runs.CommandPlan, runs.TriggerComment)
+	require.False(t, newLifecycle.CanExecute())
+	require.ErrorIs(t, newLifecycle.AdmissionError(), errRunHistoryDraining)
+	require.True(t, newCtx.CommandHasErrors)
+	require.Empty(t, newCtx.RunID)
+	lifecycle.Finish()
+}
+
+func TestRunHistoryDrainWaitsForSideEffectAdmissionBoundary(t *testing.T) {
+	markerStarted := make(chan struct{})
+	releaseMarker := make(chan struct{})
+	writer := &recordingRunWriter{
+		sideEffectMarkerStarted: markerStarted,
+		sideEffectMarkerRelease: releaseMarker,
+	}
+	history := newTestRunHistory(t, writer)
+	ctx := routedRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerComment)
+	require.True(t, lifecycle.CanExecute())
+
+	markerDone := make(chan error, 1)
+	go func() {
+		markerDone <- ctx.SideEffectMarker.MarkSideEffectStarted(context.Background())
+	}()
+	<-markerStarted
+	if history.admissionMu.TryLock() {
+		history.admissionMu.Unlock()
+		t.Fatal("side-effect admission did not hold the drain read lock")
+	}
+
+	close(releaseMarker)
+	require.NoError(t, <-markerDone)
+	history.BeginDrain()
+	lifecycle.Finish()
+}
+
+func TestRunHistoryInterruptsPlanForAnotherAttemptUnderSameRun(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := routedRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+	projectCtx := history.beginProject(command.ProjectContext{
+		RunID: ctx.RunID, ProjectName: "network", RepoRelDir: "terraform/network",
+		Workspace: "production", Log: ctx.Log,
+	})
+	require.NotEmpty(t, projectCtx.ProjectRunID)
+
+	require.Equal(t, 1, history.InterruptActive(context.Background(), "graceful shutdown deadline expired"))
+	lifecycle.Finish()
+
+	require.Empty(t, writer.runsCompleted, "logical plan Run remains open for a replacement attempt")
+	require.Len(t, writer.attemptsCompleted, 1)
+	require.Equal(t, runs.AttemptInterrupted, writer.attemptsCompleted[0].Status)
+	require.Contains(t, writer.attemptsCompleted[0].FailureReason, "before an infrastructure side effect")
+	require.Equal(t, runs.StatusFailed, writer.projectsCompleted[0].Status)
+	require.Equal(t, []string{"plan.requested", "plan.attempt_started", "plan.interrupted"}, writer.auditTypes())
+}
+
+func TestRunHistoryInterruptsApplyAfterSideEffectAsUnknown(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := routedRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerComment)
+	require.NoError(t, ctx.SideEffectMarker.MarkSideEffectStarted(context.Background()))
+
+	require.Equal(t, 1, history.InterruptActive(context.Background(), "graceful shutdown deadline expired"))
+	lifecycle.Finish()
+
+	require.Equal(t, runs.StatusUnknown, writer.runsCompleted[0].Status)
+	require.Equal(t, runs.AttemptUnknown, writer.attemptsCompleted[0].Status)
+	require.Contains(t, writer.attemptsCompleted[0].FailureReason, "may have completed")
+}
+
+func TestRunHistoryInterruptsAPIApplyAfterSideEffectAsUnknown(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := routedRunContext(t)
+	ctx.API = true
+	ctx.Pull.Num = -1
+	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerAPI)
+	require.True(t, lifecycle.CanExecute())
+	projectCtx := history.beginProject(command.ProjectContext{
+		RunID: ctx.RunID, AttemptID: ctx.AttemptID, ProjectName: "network",
+		RepoRelDir: "terraform/network", Workspace: "production", Log: ctx.Log,
+	})
+	require.NotEmpty(t, projectCtx.ProjectRunID)
+	require.NoError(t, ctx.SideEffectMarker.MarkSideEffectStarted(context.Background()))
+
+	require.Equal(t, 1, history.InterruptActive(context.Background(), "graceful shutdown deadline expired"))
+	lifecycle.Finish()
+
+	require.Equal(t, runs.StatusUnknown, writer.runsCompleted[0].Status)
+	require.Equal(t, runs.AttemptUnknown, writer.attemptsCompleted[0].Status)
+	require.Equal(t, runs.StatusUnknown, writer.projectsCompleted[0].Status)
+	require.NotEmpty(t, writer.attemptsCompleted[0].FailureReason)
+}
+
+func TestRunHistoryInterruptActiveSharesClassificationBudgetAcrossWrites(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := routedRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+	projectCtx := history.beginProject(command.ProjectContext{
+		RunID: ctx.RunID, ProjectName: "network", RepoRelDir: "terraform/network",
+		Workspace: "production", Log: ctx.Log,
+	})
+	require.NotEmpty(t, projectCtx.ProjectRunID)
+
+	// A budget that has already expired stands in for a classification pass
+	// that used up its bounded window on other work (e.g. heartbeat teardown
+	// or an earlier session's writes).
+	expiredCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Minute))
+	defer cancel()
+	require.Equal(t, 1, history.InterruptActive(expiredCtx, "graceful shutdown deadline expired"))
+	lifecycle.Finish()
+
+	require.NotEmpty(t, writer.completeProjectCtxErrs)
+	for _, err := range writer.completeProjectCtxErrs {
+		require.ErrorIs(t, err, context.DeadlineExceeded,
+			"a shared classification budget must bound every write, not grant each write a fresh timeout")
+	}
+}
+
 func TestRunHistoryFailsClosedWhenAttemptAdmissionIsNotDurable(t *testing.T) {
 	writer := &recordingRunWriter{createAttemptErr: errors.New("database unavailable")}
 	history := newTestRunHistory(t, writer)
@@ -443,6 +577,8 @@ func TestRunHistoryRoutedExecutionStartsBlockedUntilRunIsDurable(t *testing.T) {
 
 			require.False(t, lifecycle.CanExecute())
 			require.Empty(t, writer.attemptsCreated)
+			require.Error(t, lifecycle.AdmissionError(),
+				"a fail-closed admission decision must retain a reportable error")
 		})
 	}
 }
@@ -641,35 +777,45 @@ func enableHAContext(ctx *command.Context) {
 	ctx.OwnershipClaimID = "claim-1"
 }
 
+func routedRunContext(t *testing.T) *command.Context {
+	t.Helper()
+	ctx := testRunContext(t)
+	enableHAContext(ctx)
+	return ctx
+}
+
 type recordingRunWriter struct {
-	mu                   sync.Mutex
-	runsCreated          []runs.Run
-	runsCompleted        []runs.RunCompletion
-	projectsCreated      []runs.ProjectRun
-	projectsCompleted    []runs.ProjectRunCompletion
-	output               []runs.OutputChunk
-	audit                []runs.AuditEvent
-	completeRunErr       error
-	createProjectErr     error
-	completeProjectErr   error
-	completeProjectCalls int
-	appendOutputErr      error
-	createRunErr         error
-	createAttemptErr     error
-	startAttemptErr      error
-	completeAttemptErr   error
-	attemptsCreated      []runs.RunAttempt
-	attemptsStarted      []runs.ID
-	attemptHeartbeats    []runs.ID
-	sideEffectsStarted   []runs.ID
-	attemptsCompleted    []runs.AttemptCompletion
-	takeoverRequests     []runs.AttemptTakeoverRequest
-	takeoverResult       runs.AttemptTakeoverResult
-	takeoverErr          error
-	artifactUpdates      []runs.ProjectPlanArtifactUpdate
-	artifactResult       runs.PlanArtifactExpectation
-	artifactLookup       runs.PlanArtifactLookup
-	artifactErr          error
+	mu                      sync.Mutex
+	runsCreated             []runs.Run
+	runsCompleted           []runs.RunCompletion
+	projectsCreated         []runs.ProjectRun
+	projectsCompleted       []runs.ProjectRunCompletion
+	output                  []runs.OutputChunk
+	audit                   []runs.AuditEvent
+	completeRunErr          error
+	createProjectErr        error
+	completeProjectErr      error
+	completeProjectCalls    int
+	appendOutputErr         error
+	createRunErr            error
+	createAttemptErr        error
+	startAttemptErr         error
+	completeAttemptErr      error
+	attemptsCreated         []runs.RunAttempt
+	attemptsStarted         []runs.ID
+	attemptHeartbeats       []runs.ID
+	sideEffectsStarted      []runs.ID
+	sideEffectMarkerStarted chan struct{}
+	sideEffectMarkerRelease chan struct{}
+	attemptsCompleted       []runs.AttemptCompletion
+	takeoverRequests        []runs.AttemptTakeoverRequest
+	takeoverResult          runs.AttemptTakeoverResult
+	takeoverErr             error
+	artifactUpdates         []runs.ProjectPlanArtifactUpdate
+	artifactResult          runs.PlanArtifactExpectation
+	artifactLookup          runs.PlanArtifactLookup
+	artifactErr             error
+	completeProjectCtxErrs  []error
 }
 
 func (w *recordingRunWriter) CreateRun(_ context.Context, run runs.Run) error {
@@ -706,9 +852,10 @@ func (w *recordingRunWriter) CreateProjectRun(_ context.Context, project runs.Pr
 
 func (w *recordingRunWriter) StartProjectRun(context.Context, runs.ID, time.Time) error { return nil }
 
-func (w *recordingRunWriter) CompleteProjectRun(_ context.Context, completion runs.ProjectRunCompletion) error {
+func (w *recordingRunWriter) CompleteProjectRun(ctx context.Context, completion runs.ProjectRunCompletion) error {
 	w.mu.Lock()
 	w.completeProjectCalls++
+	w.completeProjectCtxErrs = append(w.completeProjectCtxErrs, ctx.Err())
 	w.mu.Unlock()
 	if w.completeProjectErr != nil {
 		return w.completeProjectErr
@@ -765,7 +912,7 @@ func (w *recordingRunWriter) StopInstance(context.Context, runs.ID, time.Time) e
 	return nil
 }
 
-func (w *recordingRunWriter) CreateAttempt(_ context.Context, attempt runs.RunAttempt) error {
+func (w *recordingRunWriter) CreateAttempt(_ context.Context, attempt runs.RunAttempt, _ time.Time) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.createAttemptErr != nil {
@@ -793,6 +940,12 @@ func (w *recordingRunWriter) HeartbeatAttempt(_ context.Context, id runs.ID, _ t
 }
 
 func (w *recordingRunWriter) MarkAttemptSideEffectStarted(_ context.Context, id runs.ID, _ time.Time) error {
+	if w.sideEffectMarkerStarted != nil {
+		close(w.sideEffectMarkerStarted)
+	}
+	if w.sideEffectMarkerRelease != nil {
+		<-w.sideEffectMarkerRelease
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.sideEffectsStarted = append(w.sideEffectsStarted, id)

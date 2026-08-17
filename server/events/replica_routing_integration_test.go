@@ -6,13 +6,19 @@ package events_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"net/http/httptest"
+	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/gorilla/mux"
+	"github.com/runatlantis/atlantis/server/controllers"
 	"github.com/runatlantis/atlantis/server/core/locking"
 	"github.com/runatlantis/atlantis/server/core/ownership"
 	redisdb "github.com/runatlantis/atlantis/server/core/redis"
@@ -119,6 +125,83 @@ func TestReplicaRouting_OwnerLossRequiresReplanAndKeepsSamePRLockUsable(t *testi
 	require.Equal(t, 1, h.diskB.deleteCount(pullNum), "one ownership claim must reset local state only once")
 }
 
+func BenchmarkReplicaRoutingConcurrentPRs(b *testing.B) {
+	for _, pullCount := range []int{10, 50, 100, 300, 600} {
+		b.Run(fmt.Sprintf("pulls-%03d", pullCount), func(b *testing.B) {
+			h := newHABenchmarkHarness(b)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				basePull := int(haBenchmarkPullNumber.Add(int64(pullCount))) - pullCount + 1
+				dispatchConcurrentPullCommands(b, h, basePull, pullCount, command.Plan, false)
+				dispatchConcurrentPullCommands(b, h, basePull, pullCount, command.Apply, true)
+				b.StopTimer()
+				releaseBenchmarkPullClaims(b, h, basePull, pullCount)
+				h.resetProcessLocalState()
+				b.StartTimer()
+			}
+			b.ReportMetric(float64(pullCount*2), "commands/op")
+			b.StopTimer()
+			require.Equal(b, int64(b.N*pullCount*2), h.runnerA.totalCalls.Load()+h.runnerB.totalCalls.Load())
+		})
+	}
+}
+
+var haBenchmarkPullNumber atomic.Int64
+
+func releaseBenchmarkPullClaims(b *testing.B, h *haHarness, basePull, pullCount int) {
+	b.Helper()
+	for offset := 0; offset < pullCount; offset++ {
+		key := haOwnershipKey(basePull + offset)
+		owner, found, err := h.storeA.Current(context.Background(), key)
+		require.NoError(b, err)
+		require.True(b, found)
+		switch owner.ReplicaID {
+		case "replica-a":
+			require.NoError(b, h.storeA.Release(context.Background(), key, owner.ClaimID))
+			require.NoError(b, h.claimGuardA.Forget(key, owner.ClaimID))
+		case "replica-b":
+			require.NoError(b, h.storeB.Release(context.Background(), key, owner.ClaimID))
+			require.NoError(b, h.claimGuardB.Forget(key, owner.ClaimID))
+		default:
+			b.Fatalf("unexpected benchmark owner %q", owner.ReplicaID)
+		}
+	}
+}
+
+func dispatchConcurrentPullCommands(
+	b *testing.B,
+	h *haHarness,
+	basePull int,
+	pullCount int,
+	name command.Name,
+	throughOppositeIngress bool,
+) {
+	b.Helper()
+	errors := make(chan error, pullCount)
+	dispatches := make([]events.CommentDispatch, pullCount)
+	for index := range dispatches {
+		dispatches[index] = haCommentDispatch(b, basePull+index, "default", name)
+	}
+	var group sync.WaitGroup
+	for index := 0; index < pullCount; index++ {
+		group.Add(1)
+		go func(offset int) {
+			defer group.Done()
+			dispatcher := h.dispatcherA
+			if (offset%2 == 1) != throughOppositeIngress {
+				dispatcher = h.dispatcherB
+			}
+			errors <- dispatcher.DispatchComment(dispatches[offset])
+		}(index)
+	}
+	group.Wait()
+	close(errors)
+	for err := range errors {
+		require.NoError(b, err)
+	}
+}
+
 type haHarness struct {
 	redis       *miniredis.Miniredis
 	database    *redisdb.RedisDB
@@ -130,9 +213,22 @@ type haHarness struct {
 	diskB       *haPlanDisk
 	runnerA     *haCommandRunner
 	runnerB     *haCommandRunner
+	claimGuardA *events.LocalClaimGuard
+	claimGuardB *events.LocalClaimGuard
 }
 
-func newHAHarness(t *testing.T) *haHarness {
+// resetProcessLocalState clears every in-process structure a real replica
+// would not retain across independent commands: local plan-checkout
+// bookkeeping and recorded runner calls. Redis ownership claims are released
+// separately since they are shared, remote state.
+func (h *haHarness) resetProcessLocalState() {
+	h.diskA.reset()
+	h.diskB.reset()
+	h.runnerA.reset()
+	h.runnerB.reset()
+}
+
+func newHAHarness(t testing.TB) *haHarness {
 	t.Helper()
 	redisServer := miniredis.RunT(t)
 	host, portString, err := net.SplitHostPort(redisServer.Addr())
@@ -141,13 +237,115 @@ func newHAHarness(t *testing.T) *haHarness {
 	require.NoError(t, err)
 	database, err := redisdb.NewWithConfig(redisdb.Config{Hostname: host, Port: port})
 	require.NoError(t, err)
+	return newHAHarnessWithDatabase(t, redisServer, database)
+}
+
+// newHABenchmarkHarness models two independent replica processes as closely
+// as the production topology does: each gets its own Redis client (so
+// neither is throttled by sharing one connection pool) and commands are
+// forwarded between them over the real internal HTTP transport
+// (HTTPCommandForwarder + InternalCommandController) instead of an in-process
+// shortcut, so the reported timings include JSON encoding, authentication,
+// and HTTP client/server overhead.
+func newHABenchmarkHarness(t testing.TB) *haHarness {
+	t.Helper()
 	logger := logging.NewNoopLogger(t)
+	deploymentID := fmt.Sprintf("ha-benchmark-%d", time.Now().UnixNano())
+
+	address := os.Getenv("ATLANTIS_REDIS_BENCHMARK_ADDR")
+	var redisServer *miniredis.Miniredis
+	if address == "" {
+		redisServer = miniredis.RunT(t)
+		address = redisServer.Addr()
+	}
+	host, portString, err := net.SplitHostPort(address)
+	require.NoError(t, err)
+	port, err := strconv.Atoi(portString)
+	require.NoError(t, err)
+	databaseA, err := redisdb.NewWithConfig(redisdb.Config{Hostname: host, Port: port})
+	require.NoError(t, err)
+	databaseB, err := redisdb.NewWithConfig(redisdb.Config{Hostname: host, Port: port})
+	require.NoError(t, err)
+
+	// Bind each replica's internal-command listener before constructing its
+	// OwnerStore, so the store can advertise the httptest server's real
+	// address instead of a placeholder that forwarding could never reach.
+	routerA, routerB := mux.NewRouter(), mux.NewRouter()
+	serverA := httptest.NewUnstartedServer(routerA)
+	serverB := httptest.NewUnstartedServer(routerB)
+	advertiseA := "http://" + serverA.Listener.Addr().String()
+	advertiseB := "http://" + serverB.Listener.Addr().String()
+
+	storeA, err := redisdb.NewOwnerStore(databaseA, redisdb.OwnerStoreConfig{
+		ReplicaID: "replica-a", DeploymentID: deploymentID, TTL: 30 * time.Second,
+		AdvertiseURL: advertiseA,
+	}, logger)
+	require.NoError(t, err)
+	storeB, err := redisdb.NewOwnerStore(databaseB, redisdb.OwnerStoreConfig{
+		ReplicaID: "replica-b", DeploymentID: deploymentID, TTL: 30 * time.Second,
+		AdvertiseURL: advertiseB,
+	}, logger)
+	require.NoError(t, err)
+
+	diskA, diskB := newHAPlanDisk(), newHAPlanDisk()
+	runnerA, runnerB := &haCommandRunner{disk: diskA}, &haCommandRunner{disk: diskB}
+	claimGuardA, claimGuardB := events.NewLocalClaimGuard(), events.NewLocalClaimGuard()
+	executorA := &events.LocalCommandExecutor{
+		Hydrator: &haRepoHydrator{}, Runner: runnerA, PullCleaner: haPullCleaner{}, WorkingDir: diskA,
+		ClaimGuard: claimGuardA, Owners: storeA, Logger: logger, TestingMode: true,
+	}
+	executorB := &events.LocalCommandExecutor{
+		Hydrator: &haRepoHydrator{}, Runner: runnerB, PullCleaner: haPullCleaner{}, WorkingDir: diskB,
+		ClaimGuard: claimGuardB, Owners: storeB, Logger: logger, TestingMode: true,
+	}
+
+	const token = "ha-benchmark-internal-token" // #nosec G101 -- fixed test-only token, not a credential.
+	mountInternalCommandRoutes(routerA, &controllers.InternalCommandController{
+		Token: token, ReplicaID: "replica-a", Owners: storeA, Executor: executorA,
+	})
+	mountInternalCommandRoutes(routerB, &controllers.InternalCommandController{
+		Token: token, ReplicaID: "replica-b", Owners: storeB, Executor: executorB,
+	})
+	serverA.Start()
+	serverB.Start()
+
+	t.Cleanup(func() {
+		serverA.Close()
+		serverB.Close()
+		require.NoError(t, storeA.Close())
+		require.NoError(t, storeB.Close())
+		require.NoError(t, databaseA.Close())
+		require.NoError(t, databaseB.Close())
+	})
+
+	forwarder := events.NewHTTPCommandForwarder(token)
+	return &haHarness{
+		redis: redisServer, database: databaseA, storeA: storeA, storeB: storeB,
+		dispatcherA: events.NewRoutedCommandDispatcher("replica-a", storeA, executorA, forwarder),
+		dispatcherB: events.NewRoutedCommandDispatcher("replica-b", storeB, executorB, forwarder),
+		diskA:       diskA, diskB: diskB, runnerA: runnerA, runnerB: runnerB,
+		claimGuardA: claimGuardA, claimGuardB: claimGuardB,
+	}
+}
+
+func mountInternalCommandRoutes(router *mux.Router, controller *controllers.InternalCommandController) {
+	router.HandleFunc(events.InternalCommentCommandPath, controller.Comment).Methods("POST")
+	router.HandleFunc(events.InternalAutoplanCommandPath, controller.Autoplan).Methods("POST")
+	router.HandleFunc(events.InternalPullClosedCommandPath, controller.PullClosed).Methods("POST")
+}
+
+func newHAHarnessWithDatabase(t testing.TB, redisServer *miniredis.Miniredis, database *redisdb.RedisDB) *haHarness {
+	t.Helper()
+	logger := logging.NewNoopLogger(t)
+	deploymentID := fmt.Sprintf("ha-harness-%d", time.Now().UnixNano())
 	storeA, err := redisdb.NewOwnerStore(database, redisdb.OwnerStoreConfig{
-		ReplicaID: "replica-a", AdvertiseURL: "http://replica-a", TTL: 30 * time.Second,
+		ReplicaID: "replica-a", DeploymentID: deploymentID,
+		AdvertiseURL: "http://replica-a", TTL: 30 * time.Second,
 	}, logger)
 	require.NoError(t, err)
 	storeB, err := redisdb.NewOwnerStore(database, redisdb.OwnerStoreConfig{
-		ReplicaID: "replica-b", AdvertiseURL: "http://replica-b", TTL: 30 * time.Second,
+		ReplicaID: "replica-b", DeploymentID: deploymentID,
+		AdvertiseURL: "http://replica-b", TTL: 30 * time.Second,
 	}, logger)
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -179,7 +377,7 @@ func newHAHarness(t *testing.T) *haHarness {
 	}
 }
 
-func haCommentDispatch(t *testing.T, pullNum int, workspace string, name command.Name) events.CommentDispatch {
+func haCommentDispatch(t testing.TB, pullNum int, workspace string, name command.Name) events.CommentDispatch {
 	t.Helper()
 	repo, err := models.NewRepo(models.Github, "owner/repo", "https://github.com/owner/repo", "receiver", "receiver-token", "")
 	require.NoError(t, err)
@@ -256,6 +454,15 @@ func (d *haPlanDisk) deleteCount(pullNum int) int {
 	return d.deletes[pullNum]
 }
 
+// reset discards per-pull bookkeeping so a benchmark's next operation does not
+// grow this map for the lifetime of the harness.
+func (d *haPlanDisk) reset() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.plans = make(map[int]bool)
+	d.deletes = make(map[int]int)
+}
+
 type haRunnerCall struct {
 	PullNum     int
 	Workspace   string
@@ -264,9 +471,10 @@ type haRunnerCall struct {
 }
 
 type haCommandRunner struct {
-	mu    sync.Mutex
-	disk  *haPlanDisk
-	calls []haRunnerCall
+	mu         sync.Mutex
+	disk       *haPlanDisk
+	calls      []haRunnerCall
+	totalCalls atomic.Int64
 }
 
 func (r *haCommandRunner) RunCommentCommand(_ models.Repo, _ *models.Repo, pull *models.PullRequest, _ models.User, pullNum int, cmd *events.CommentCommand) {
@@ -280,6 +488,7 @@ func (r *haCommandRunner) RunCommentCommand(_ models.Repo, _ *models.Repo, pull 
 	r.mu.Lock()
 	r.calls = append(r.calls, call)
 	r.mu.Unlock()
+	r.totalCalls.Add(1)
 }
 
 func (r *haCommandRunner) RunAutoplanCommand(models.Repo, models.Repo, models.PullRequest, models.User) {
@@ -297,6 +506,14 @@ func (r *haCommandRunner) snapshot() []haRunnerCall {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]haRunnerCall(nil), r.calls...)
+}
+
+// reset discards recorded calls so a benchmark's next operation does not run
+// against an ever-growing history for the lifetime of the harness.
+func (r *haCommandRunner) reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = nil
 }
 
 func (r *haCommandRunner) lastApplyHadPlan() bool {

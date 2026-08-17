@@ -40,6 +40,7 @@ import (
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/drift"
 	"github.com/runatlantis/atlantis/server/core/redis"
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/core/terraform/tfclient"
 	"github.com/runatlantis/atlantis/server/jobs"
 	"github.com/runatlantis/atlantis/server/metrics"
@@ -127,7 +128,15 @@ type Server struct {
 	ScheduledExecutorService       *scheduled.ExecutorService
 	DisableGlobalApplyLock         bool
 	EnableProfilingAPI             bool
+	RunStore                       runs.Store
 	database                       db.Database
+	runStoreHealth                 runStorePinger
+	runStoreCloser                 io.Closer
+	runStoreRetention              *runStoreRetentionService
+}
+
+type runStorePinger interface {
+	Ping(context.Context) error
 }
 
 // Config holds config for server that isn't passed in by the user.
@@ -172,6 +181,9 @@ var staticAssets embed.FS
 func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	if userConfig.EnableDriftRemediation && !userConfig.EnableDriftDetection {
 		return nil, errors.New("--enable-drift-remediation requires --enable-drift-detection")
+	}
+	if err := validateRunStoreConfig(userConfig); err != nil {
+		return nil, err
 	}
 
 	logging.SuppressDefaultLogging()
@@ -438,6 +450,21 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		ProjectJobsViewRouteName:  ProjectJobsViewRouteName,
 		Underlying:                underlyingRouter,
 	}
+	runStore, runStoreHealth, runStoreCloser, err := initializeRunStore(userConfig, logger)
+	if err != nil {
+		return nil, err
+	}
+	closeRunStoreOnError := runStoreCloser != nil
+	defer func() {
+		if closeRunStoreOnError {
+			runStoreCloser.Close() // nolint: errcheck
+		}
+	}()
+	runStoreRetention := newRunStoreRetentionService(runStore, userConfig, logger)
+	var runHistory *events.RunHistory
+	if userConfig.RunStoreType == RunStorePostgres {
+		runHistory = events.NewRunHistory(runStore, logger)
+	}
 
 	var projectCmdOutputHandler jobs.ProjectCommandOutputHandler
 
@@ -450,6 +477,11 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 			projectCmdOutput,
 			logger,
 		)
+	}
+	if runHistory != nil {
+		persistentOutputHandler := jobs.NewPersistentProjectCommandOutputHandler(projectCmdOutputHandler, runStore, logger)
+		projectCmdOutputHandler = persistentOutputHandler
+		runHistory.SetOutputFinalizer(persistentOutputHandler)
 	}
 
 	distribution := terraform.NewDistribution(userConfig.DefaultTFDistribution)
@@ -712,6 +744,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	} else {
 		planStore = &runtime.LocalPlanStore{}
 	}
+	planStore = events.NewRunHistoryPlanStore(planStore, runHistory, logger)
 
 	deleteLockCommand.PlanStore = planStore
 
@@ -855,9 +888,10 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		ProjectCommandRunner: projectCommandRunner,
 		JobURLSetter:         jobs.NewJobURLSetter(router, commitStatusUpdater),
 	}
+	historyProjectCommandRunner := events.NewRunHistoryProjectCommandRunner(runHistory, projectOutputWrapper)
 	instrumentedProjectCmdRunner := events.NewInstrumentedProjectCommandRunner(
 		statsScope,
-		projectOutputWrapper,
+		historyProjectCommandRunner,
 	)
 
 	policyCheckCommandRunner := events.NewPolicyCheckCommandRunner(
@@ -967,13 +1001,13 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	)
 
 	commentCommandRunnerByCmd := map[command.Name]events.CommentCommandRunner{
-		command.Plan:            planCommandRunner,
-		command.Apply:           applyCommandRunner,
+		command.Plan:            events.NewRunHistoryCommandRunner(runHistory, planCommandRunner, runs.CommandPlan),
+		command.Apply:           events.NewRunHistoryCommandRunner(runHistory, applyCommandRunner, runs.CommandApply),
 		command.ApprovePolicies: approvePoliciesCommandRunner,
-		command.Unlock:          unlockCommandRunner,
+		command.Unlock:          events.NewRunHistoryCommandRunner(runHistory, unlockCommandRunner, runs.CommandUnlock),
 		command.Version:         versionCommandRunner,
-		command.Import:          importCommandRunner,
-		command.State:           stateCommandRunner,
+		command.Import:          events.NewRunHistoryCommandRunner(runHistory, importCommandRunner, runs.CommandImport),
+		command.State:           events.NewRunHistoryCommandRunner(runHistory, stateCommandRunner, runs.CommandStateRemove),
 		command.Cancel:          cancelCommandRunner,
 	}
 
@@ -1089,6 +1123,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		PullStatusFetcher:               database,
 		LivePullHeadFetcher:             livePullHeadFetcher,
 		SilenceVCSStatusNoProjects:      userConfig.SilenceVCSStatusNoProjects,
+		RunHistory:                      runHistory,
 	}
 
 	if userConfig.EnableDriftDetection {
@@ -1135,7 +1170,6 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		GithubHostname:      userConfig.GithubHostname,
 		GithubOrg:           userConfig.GithubOrg,
 	}
-
 	server := &Server{
 		AtlantisVersion:                config.AtlantisVersion,
 		AtlantisURL:                    parsedURL,
@@ -1170,7 +1204,11 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		WebPassword:                    userConfig.WebPassword,
 		ScheduledExecutorService:       scheduledExecutorService,
 		EnableProfilingAPI:             userConfig.EnableProfilingAPI,
+		RunStore:                       runStore,
 		database:                       database,
+		runStoreHealth:                 runStoreHealth,
+		runStoreCloser:                 runStoreCloser,
+		runStoreRetention:              runStoreRetention,
 	}
 
 	validate := validator.New(validator.WithRequiredStructEnabled())
@@ -1179,6 +1217,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	} else {
+		closeRunStoreOnError = false
 		return server, nil
 	}
 }
@@ -1246,6 +1285,18 @@ func (s *Server) Start() error {
 
 	defer s.Logger.Flush()
 
+	var retentionCancel context.CancelFunc
+	var retentionDone chan struct{}
+	if s.runStoreRetention != nil {
+		retentionCtx, cancel := context.WithCancel(context.Background())
+		retentionCancel = cancel
+		retentionDone = make(chan struct{})
+		go func() {
+			defer close(retentionDone)
+			s.runStoreRetention.Run(retentionCtx)
+		}()
+	}
+
 	// Ensure server gracefully drains connections when stopped.
 	stop := make(chan os.Signal, 1)
 	// Stop on SIGINTs and SIGTERMs.
@@ -1275,6 +1326,14 @@ func (s *Server) Start() error {
 		}
 	}()
 	<-stop
+	if retentionCancel != nil {
+		retentionCancel()
+		select {
+		case <-retentionDone:
+		case <-time.After(time.Second):
+			s.Logger.Warn("waiting for run history retention to stop timed out")
+		}
+	}
 
 	s.Logger.Warn("Received interrupt. Waiting for in-progress operations to complete")
 	s.waitForDrain()
@@ -1287,6 +1346,9 @@ func (s *Server) Start() error {
 	// Attempt to close the database
 	if err := s.closeDatabase(1 * time.Second); err != nil {
 		s.Logger.Err("while closing database: %v", err)
+	}
+	if err := s.closeRunStore(1 * time.Second); err != nil {
+		s.Logger.Err("while closing run store: %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1330,6 +1392,22 @@ func (s *Server) closeDatabase(timeout time.Duration) error {
 		return err
 	case <-time.After(timeout):
 		return fmt.Errorf("database close timed out after %s", timeout)
+	}
+}
+
+func (s *Server) closeRunStore(timeout time.Duration) error {
+	if s.runStoreCloser == nil {
+		return nil
+	}
+	s.Logger.Info("shutting down run store")
+
+	done := make(chan error, 1)
+	go func() { done <- s.runStoreCloser.Close() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("run store close timed out after %s", timeout)
 	}
 }
 
@@ -1442,10 +1520,21 @@ func (s *Server) Healthz(w http.ResponseWriter, _ *http.Request) {
 // Readyz checks whether the server is ready to handle requests by verifying
 // connectivity to external dependencies (e.g. Redis). Returns 503 if any
 // dependency is unreachable. Suitable for K8s readiness probes.
-func (s *Server) Readyz(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) Readyz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if s.database != nil {
 		if err := s.database.Ping(); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write(fmt.Appendf(nil, `{"status":"error","error":%q}`, err.Error())) // nolint: errcheck
+			return
+		}
+	}
+	if s.runStoreHealth != nil {
+		ctx := context.Background()
+		if r != nil {
+			ctx = r.Context()
+		}
+		if err := s.runStoreHealth.Ping(ctx); err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			w.Write(fmt.Appendf(nil, `{"status":"error","error":%q}`, err.Error())) // nolint: errcheck
 			return

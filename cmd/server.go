@@ -135,6 +135,13 @@ const (
 	RepoConfigFlag                   = "repo-config"
 	RepoConfigJSONFlag               = "repo-config-json"
 	RepoAllowlistFlag                = "repo-allowlist"
+	RunStoreAuditRetentionDaysFlag   = "run-store-audit-retention-days"
+	RunStoreMaxIdleConnsFlag         = "run-store-max-idle-conns"
+	RunStoreMaxOpenConnsFlag         = "run-store-max-open-conns"
+	RunStoreOutputRetentionDaysFlag  = "run-store-output-retention-days"
+	RunStorePostgresURLFlag          = "run-store-postgres-url" // nolint: gosec
+	RunStoreRetentionDaysFlag        = "run-store-retention-days"
+	RunStoreTypeFlag                 = "run-store-type"
 	SilenceNoProjectsFlag            = "silence-no-projects"
 	SilenceForkPRErrorsFlag          = "silence-fork-pr-errors"
 	SilenceVCSStatusNoPlans          = "silence-vcs-status-no-plans"
@@ -197,6 +204,10 @@ const (
 	DefaultRedisPort                    = 6379
 	DefaultRedisTLSEnabled              = false
 	DefaultRedisInsecureSkipVerify      = false
+	DefaultRunStoreMaxIdleConns         = 5
+	DefaultRunStoreMaxOpenConns         = 10
+	DefaultRunStoreOutputRetentionDays  = 90
+	DefaultRunStoreType                 = server.RunStoreNoop
 	DefaultTFDistribution               = TFDistributionTerraform
 	DefaultTFDownloadURL                = "https://releases.hashicorp.com"
 	DefaultTFDownload                   = true
@@ -457,6 +468,13 @@ var stringFlags = map[string]stringFlag{
 			"The format is {hostname}/{owner}/{repo}, ex. github.com/runatlantis/atlantis. '*' matches any characters until the next comma. Examples: " +
 			"all repos: '*' (not secure), an entire hostname: 'internalgithub.com/*' or an organization: 'github.com/runatlantis/*'." +
 			" For Bitbucket Server, {owner} is the name of the project (not the key).",
+	},
+	RunStorePostgresURLFlag: {
+		description: "PostgreSQL connection URL for durable run history. Prefer the ATLANTIS_RUN_STORE_POSTGRES_URL environment variable instead of a command-line argument.",
+	},
+	RunStoreTypeFlag: {
+		description:  "Run history store type. Either noop or postgres.",
+		defaultValue: DefaultRunStoreType,
 	},
 	SlackTokenFlag: {
 		description: "API token for Slack notifications.",
@@ -731,6 +749,24 @@ var intFlags = map[string]intFlag{
 	RedisPort: {
 		description:  "The Redis Port for when using a Locking DB type of 'redis'.",
 		defaultValue: DefaultRedisPort,
+	},
+	RunStoreAuditRetentionDaysFlag: {
+		description: "Delete audit events older than this many days. Zero retains audit events indefinitely.",
+	},
+	RunStoreMaxIdleConnsFlag: {
+		description:  "Maximum idle PostgreSQL connections for the durable run history store.",
+		defaultValue: DefaultRunStoreMaxIdleConns,
+	},
+	RunStoreMaxOpenConnsFlag: {
+		description:  "Maximum open PostgreSQL connections for the durable run history store.",
+		defaultValue: DefaultRunStoreMaxOpenConns,
+	},
+	RunStoreOutputRetentionDaysFlag: {
+		description:  "Delete raw command output older than this many days without deleting run metadata. Zero retains output indefinitely.",
+		defaultValue: DefaultRunStoreOutputRetentionDays,
+	},
+	RunStoreRetentionDaysFlag: {
+		description: "Delete terminal run metadata and project summaries older than this many days. Zero retains them indefinitely.",
 	},
 }
 
@@ -1037,6 +1073,18 @@ func (s *ServerCmd) setDefaults(c *server.UserConfig, v *viper.Viper) {
 	if c.RedisPort == 0 {
 		c.RedisPort = DefaultRedisPort
 	}
+	if c.RunStoreType == "" {
+		c.RunStoreType = DefaultRunStoreType
+	}
+	if !v.IsSet(RunStoreMaxIdleConnsFlag) {
+		c.RunStoreMaxIdleConns = DefaultRunStoreMaxIdleConns
+	}
+	if !v.IsSet(RunStoreMaxOpenConnsFlag) {
+		c.RunStoreMaxOpenConns = DefaultRunStoreMaxOpenConns
+	}
+	if !v.IsSet(RunStoreOutputRetentionDaysFlag) {
+		c.RunStoreOutputRetentionDays = DefaultRunStoreOutputRetentionDays
+	}
 	if c.TFDistribution != "" && c.DefaultTFDistribution == "" {
 		c.DefaultTFDistribution = c.TFDistribution
 	}
@@ -1191,6 +1239,25 @@ func (s *ServerCmd) validate(userConfig server.UserConfig) error {
 		if userConfig.RedisDB != DefaultRedisDB {
 			return fmt.Errorf("--%s is not supported in cluster mode (Redis Cluster ignores the DB parameter)", RedisDB)
 		}
+	}
+
+	if userConfig.RunStoreType != server.RunStoreNoop && userConfig.RunStoreType != server.RunStorePostgres {
+		return fmt.Errorf("invalid --%s: must be one of %s or %s", RunStoreTypeFlag, server.RunStoreNoop, server.RunStorePostgres)
+	}
+	if userConfig.RunStoreType == server.RunStorePostgres && strings.TrimSpace(userConfig.RunStorePostgresURL) == "" {
+		return fmt.Errorf("--%s is required when --%s=%s", RunStorePostgresURLFlag, RunStoreTypeFlag, server.RunStorePostgres)
+	}
+	if userConfig.RunStoreType == server.RunStoreNoop && userConfig.RunStorePostgresURL != "" {
+		return fmt.Errorf("--%s requires --%s=%s", RunStorePostgresURLFlag, RunStoreTypeFlag, server.RunStorePostgres)
+	}
+	if userConfig.RunStoreMaxOpenConns < 1 {
+		return fmt.Errorf("--%s must be greater than zero", RunStoreMaxOpenConnsFlag)
+	}
+	if userConfig.RunStoreMaxIdleConns < 0 || userConfig.RunStoreMaxIdleConns > userConfig.RunStoreMaxOpenConns {
+		return fmt.Errorf("--%s must be between zero and --%s", RunStoreMaxIdleConnsFlag, RunStoreMaxOpenConnsFlag)
+	}
+	if userConfig.RunStoreRetentionDays < 0 || userConfig.RunStoreOutputRetentionDays < 0 || userConfig.RunStoreAuditRetentionDays < 0 {
+		return fmt.Errorf("run store retention days cannot be negative")
 	}
 
 	_, patternErr := patternmatcher.New(strings.Split(userConfig.AutoplanFileList, ","))

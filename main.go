@@ -45,6 +45,7 @@ func main() {
 		ServerCreator:   &cmd.DefaultServerCreator{},
 		Viper:           v,
 		AtlantisVersion: atlantisVersion,
+		AtlantisCommit:  commit,
 		Logger:          logger,
 	}
 	version := &cmd.VersionCmd{AtlantisVersion: atlantisVersion}

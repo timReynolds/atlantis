@@ -57,6 +57,9 @@ func (v *VersionCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
 	} else {
 		result = runProjectCmds(projectCmds, v.prjCmdRunner.Version)
 	}
+	if commandSuperseded(ctx, result) {
+		return
+	}
 
 	v.pullUpdater.updatePull(ctx, cmd, result)
 }

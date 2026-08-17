@@ -94,6 +94,9 @@ func runProjectCmds(
 		res := RunOneProjectCmd(runnerFunc, pCmd)
 
 		results = append(results, res)
+		if res.OwnershipLost {
+			break
+		}
 	}
 	return command.Result{ProjectResults: results}
 }
@@ -129,6 +132,9 @@ func runProjectCmdsParallelGroups(
 	for _, group := range groups {
 		res := runProjectCmdsParallel(group, runnerFunc, poolSize, cancellationTracker, ctx.Pull)
 		results = append(results, res.ProjectResults...)
+		if res.LostOwnership() {
+			break
+		}
 		if res.HasErrors() && group[0].AbortOnExecutionOrderFail {
 			ctx.Log.Info("abort on execution order when failed")
 			break
@@ -170,6 +176,9 @@ func runProjectCmdsWithCancellationTracker(
 			groupResult = runProjectCmds(group, runnerFunc)
 		}
 		results = append(results, groupResult.ProjectResults...)
+		if groupResult.LostOwnership() {
+			break
+		}
 
 		if groupResult.HasErrors() && group[0].AbortOnExecutionOrderFail && isParallel {
 			ctx.Log.Info("abort on execution order when failed")
@@ -191,6 +200,15 @@ func runProjectCmdsWithCancellationTracker(
 	}
 
 	return command.Result{ProjectResults: results}
+}
+
+func commandSuperseded(ctx *command.Context, result command.Result) bool {
+	if !result.LostOwnership() {
+		return false
+	}
+	ctx.CommandSuperseded = true
+	ctx.Log.Info("stopping command publication because pull request ownership changed")
+	return true
 }
 
 func prepareExecutionGroups(

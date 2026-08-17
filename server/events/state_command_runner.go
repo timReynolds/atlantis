@@ -43,6 +43,9 @@ func (v *StateCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
 	if ctx.CommandSkipped {
 		return
 	}
+	if commandSuperseded(ctx, result) {
+		return
+	}
 	if err := v.dbUpdater.updateDBForDiscardedPlans(ctx, ctx.Pull, result.ProjectResults); err != nil {
 		result.Error = fmt.Errorf("writing discarded plan status: %w", err)
 		ctx.CommandHasErrors = true

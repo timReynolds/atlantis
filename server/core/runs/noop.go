@@ -28,6 +28,24 @@ func (NoopStore) AppendOutput(context.Context, []OutputChunk) error { return nil
 
 func (NoopStore) AppendAuditEvent(context.Context, AuditEvent) error { return nil }
 
+func (NoopStore) RegisterInstance(context.Context, ExecutionInstance) error { return nil }
+
+func (NoopStore) HeartbeatInstance(context.Context, ID, time.Time) error { return nil }
+
+func (NoopStore) StopInstance(context.Context, ID, time.Time) error { return nil }
+
+func (NoopStore) CreateAttempt(context.Context, RunAttempt) error { return nil }
+
+func (NoopStore) StartAttempt(context.Context, ID, time.Time) error { return nil }
+
+func (NoopStore) HeartbeatAttempt(context.Context, ID, time.Time) error { return nil }
+
+func (NoopStore) MarkAttemptSideEffectStarted(context.Context, ID, time.Time) error { return nil }
+
+func (NoopStore) CompleteAttempt(context.Context, AttemptCompletion) error { return nil }
+
+func (NoopStore) ReconcileAttempt(context.Context, AttemptReconciliation) error { return nil }
+
 func (NoopStore) GetRun(context.Context, ID) (Run, error) {
 	return Run{}, ErrNotFound
 }
@@ -54,6 +72,18 @@ func (NoopStore) GetOutput(context.Context, ID, int64, int) (OutputPage, error) 
 
 func (NoopStore) ListAuditEvents(context.Context, AuditFilter, PageRequest) (AuditPage, error) {
 	return AuditPage{Events: []AuditEvent{}}, nil
+}
+
+func (NoopStore) GetInstance(context.Context, ID) (ExecutionInstance, error) {
+	return ExecutionInstance{}, ErrNotFound
+}
+
+func (NoopStore) GetAttempt(context.Context, ID) (RunAttempt, error) {
+	return RunAttempt{}, ErrNotFound
+}
+
+func (NoopStore) ListRunAttempts(context.Context, ID, PageRequest) (AttemptPage, error) {
+	return AttemptPage{Attempts: []RunAttempt{}}, nil
 }
 
 func (NoopStore) ApplyRetention(context.Context, RetentionPolicy) (RetentionResult, error) {

@@ -5,6 +5,7 @@
 package events
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -38,6 +39,13 @@ type CommandRunner interface {
 	// and then calling the appropriate services to finish executing the command.
 	RunCommentCommand(baseRepo models.Repo, maybeHeadRepo *models.Repo, maybePull *models.PullRequest, user models.User, pullNum int, cmd *CommentCommand)
 	RunAutoplanCommand(baseRepo models.Repo, headRepo models.Repo, pull models.PullRequest, user models.User)
+}
+
+// RoutedCommandRunner accepts owner-local routing state without changing the
+// direct command runner interface used by API and non-HA callers.
+type RoutedCommandRunner interface {
+	RunRoutedCommentCommand(baseRepo models.Repo, maybeHeadRepo *models.Repo, maybePull *models.PullRequest, user models.User, pullNum int, cmd *CommentCommand, routing command.RoutingContext)
+	RunRoutedAutoplanCommand(baseRepo models.Repo, headRepo models.Repo, pull models.PullRequest, user models.User, routing command.RoutingContext)
 }
 
 //go:generate go tool pegomock generate github.com/runatlantis/atlantis/server/events --package mocks -o mocks/mock_github_pull_getter.go GithubPullGetter
@@ -143,6 +151,15 @@ type DefaultCommandRunner struct {
 
 // RunAutoplanCommand runs plan and policy_checks when a pull request is opened or updated.
 func (c *DefaultCommandRunner) RunAutoplanCommand(baseRepo models.Repo, headRepo models.Repo, pull models.PullRequest, user models.User) {
+	c.runAutoplanCommand(baseRepo, headRepo, pull, user, command.RoutingContext{})
+}
+
+// RunRoutedAutoplanCommand runs autoplan with owner-local routing state.
+func (c *DefaultCommandRunner) RunRoutedAutoplanCommand(baseRepo models.Repo, headRepo models.Repo, pull models.PullRequest, user models.User, routing command.RoutingContext) {
+	c.runAutoplanCommand(baseRepo, headRepo, pull, user, routing)
+}
+
+func (c *DefaultCommandRunner) runAutoplanCommand(baseRepo models.Repo, headRepo models.Repo, pull models.PullRequest, user models.User, routing command.RoutingContext) {
 	if opStarted := c.Drainer.StartOp(); !opStarted {
 		if commentErr := c.VCSClient.CreateComment(c.Logger, baseRepo, pull.Num, ShutdownComment, command.Plan.String()); commentErr != nil {
 			c.Logger.Log(logging.Error, "unable to comment that Atlantis is shutting down: %s", commentErr)
@@ -153,6 +170,9 @@ func (c *DefaultCommandRunner) RunAutoplanCommand(baseRepo models.Repo, headRepo
 
 	log := c.buildLogger(baseRepo.FullName, pull.Num)
 	defer c.logPanics(baseRepo, pull.Num, log)
+	if !admitRoutedCommand(log, routing.Lease, "loading pull request state") {
+		return
+	}
 	status, err := c.PullStatusFetcher.GetPullStatus(pull)
 
 	if err != nil {
@@ -184,13 +204,15 @@ func (c *DefaultCommandRunner) RunAutoplanCommand(baseRepo models.Repo, headRepo
 	}
 
 	ctx := &command.Context{
-		User:       user,
-		Log:        log,
-		Scope:      scope,
-		Pull:       pull,
-		HeadRepo:   headRepo,
-		PullStatus: status,
-		Trigger:    command.AutoTrigger,
+		User:                 user,
+		Log:                  log,
+		Scope:                scope,
+		Pull:                 pull,
+		HeadRepo:             headRepo,
+		PullStatus:           status,
+		Trigger:              command.AutoTrigger,
+		ExecutionLease:       routing.Lease,
+		RecoverExternalPlans: routing.RecoverExternalPlans,
 	}
 	if !c.validateCtxAndComment(ctx, command.Autoplan, true) {
 		return
@@ -214,10 +236,16 @@ func (c *DefaultCommandRunner) RunAutoplanCommand(baseRepo models.Repo, headRepo
 	}
 
 	cmdRunner := buildCommentCommandRunner(c, command.Plan)
+	if !admitRoutedCommand(ctx.Log, routing.Lease, "selecting projects") {
+		return
+	}
 	if shouldSkipPreWorkflowHooks(ctx, cmdRunner, cmd) {
 		return
 	}
 
+	if !admitRoutedCommand(ctx.Log, routing.Lease, "running pre-workflow hooks") {
+		return
+	}
 	preWorkflowHooksErr := c.PreWorkflowHooksCommandRunner.RunPreHooks(ctx, cmd)
 
 	if preWorkflowHooksErr != nil {
@@ -242,8 +270,14 @@ func (c *DefaultCommandRunner) RunAutoplanCommand(baseRepo models.Repo, headRepo
 
 	autoPlanRunner := buildCommentCommandRunner(c, command.Plan)
 
+	if !admitRoutedCommand(ctx.Log, routing.Lease, "building and executing projects") {
+		return
+	}
 	autoPlanRunner.Run(ctx, nil)
 
+	if !admitRoutedCommand(ctx.Log, routing.Lease, "running post-workflow hooks") {
+		return
+	}
 	c.PostWorkflowHooksCommandRunner.RunPostHooks(ctx, cmd) // nolint: errcheck
 }
 
@@ -462,6 +496,15 @@ func (c *DefaultCommandRunner) validateCommentCommand(ctx *command.Context, base
 // the event is further validated before making an additional (potentially
 // wasteful) call to get the necessary data.
 func (c *DefaultCommandRunner) RunCommentCommand(baseRepo models.Repo, maybeHeadRepo *models.Repo, maybePull *models.PullRequest, user models.User, pullNum int, cmd *CommentCommand) {
+	c.runCommentCommand(baseRepo, maybeHeadRepo, maybePull, user, pullNum, cmd, command.RoutingContext{})
+}
+
+// RunRoutedCommentCommand runs a comment command with owner-local routing state.
+func (c *DefaultCommandRunner) RunRoutedCommentCommand(baseRepo models.Repo, maybeHeadRepo *models.Repo, maybePull *models.PullRequest, user models.User, pullNum int, cmd *CommentCommand, routing command.RoutingContext) {
+	c.runCommentCommand(baseRepo, maybeHeadRepo, maybePull, user, pullNum, cmd, routing)
+}
+
+func (c *DefaultCommandRunner) runCommentCommand(baseRepo models.Repo, maybeHeadRepo *models.Repo, maybePull *models.PullRequest, user models.User, pullNum int, cmd *CommentCommand, routing command.RoutingContext) {
 	if opStarted := c.Drainer.StartOp(); !opStarted {
 		if commentErr := c.VCSClient.CreateComment(c.Logger, baseRepo, pullNum, ShutdownComment, ""); commentErr != nil {
 			c.Logger.Log(logging.Error, "unable to comment that Atlantis is shutting down: %s", commentErr)
@@ -472,6 +515,9 @@ func (c *DefaultCommandRunner) RunCommentCommand(baseRepo models.Repo, maybeHead
 
 	log := c.buildLogger(baseRepo.FullName, pullNum)
 	defer c.logPanics(baseRepo, pullNum, log)
+	if !admitRoutedCommand(log, routing.Lease, "loading pull request metadata") {
+		return
+	}
 
 	scope := c.StatsScope.SubScope("comment")
 
@@ -504,6 +550,8 @@ func (c *DefaultCommandRunner) RunCommentCommand(baseRepo models.Repo, maybeHead
 		PolicySet:            cmd.PolicySet,
 		ClearPolicyApproval:  cmd.ClearPolicyApproval,
 		TeamAllowlistChecker: c.TeamAllowlistChecker,
+		ExecutionLease:       routing.Lease,
+		RecoverExternalPlans: routing.RecoverExternalPlans,
 	}
 
 	if !c.validateCtxAndComment(ctx, cmd.Name, true) {
@@ -511,6 +559,9 @@ func (c *DefaultCommandRunner) RunCommentCommand(baseRepo models.Repo, maybeHead
 	}
 
 	cmdRunner := buildCommentCommandRunner(c, cmd.CommandName())
+	if !admitRoutedCommand(ctx.Log, routing.Lease, "selecting projects") {
+		return
+	}
 	targetInitiallyIgnored := shouldSkipPreWorkflowHooks(ctx, cmdRunner, cmd)
 	if targetInitiallyIgnored {
 		ctx.CommandSkipped = false
@@ -520,6 +571,9 @@ func (c *DefaultCommandRunner) RunCommentCommand(baseRepo models.Repo, maybeHead
 		return
 	}
 
+	if !admitRoutedCommand(ctx.Log, routing.Lease, "running pre-workflow hooks") {
+		return
+	}
 	preWorkflowHooksMayUpdateRepo := preWorkflowHooksConfigured(c.PreWorkflowHooksCommandRunner, ctx)
 	preWorkflowHooksErr := c.PreWorkflowHooksCommandRunner.RunPreHooks(ctx, cmd)
 	if targetInitiallyIgnored {
@@ -528,6 +582,9 @@ func (c *DefaultCommandRunner) RunCommentCommand(baseRepo models.Repo, maybeHead
 			return
 		}
 		ctx.PreferLocalRepoCfgForTargetedIgnore = true
+		if !admitRoutedCommand(ctx.Log, routing.Lease, "reselecting projects") {
+			return
+		}
 		if shouldSkipPreWorkflowHooks(ctx, cmdRunner, cmd) {
 			return
 		}
@@ -560,12 +617,29 @@ func (c *DefaultCommandRunner) RunCommentCommand(baseRepo models.Repo, maybeHead
 		ctx.Log.Err("'fail-on-pre-workflow-hook-error' not set so running %s command.", cmd.Name.String())
 	}
 
+	if !admitRoutedCommand(ctx.Log, routing.Lease, "building and executing projects") {
+		return
+	}
 	cmdRunner.Run(ctx, cmd)
-	if ctx.CommandSkipped {
+	if ctx.CommandSkipped || ctx.CommandSuperseded {
 		return
 	}
 
+	if !admitRoutedCommand(ctx.Log, routing.Lease, "running post-workflow hooks") {
+		return
+	}
 	c.PostWorkflowHooksCommandRunner.RunPostHooks(ctx, cmd) // nolint: errcheck
+}
+
+func admitRoutedCommand(log logging.SimpleLogging, lease command.ExecutionLease, stage string) bool {
+	if lease == nil {
+		return true
+	}
+	if err := lease.Admit(context.Background()); err != nil {
+		log.Err("admitting routed command before %s %v", stage, err)
+		return false
+	}
+	return true
 }
 
 func (c *DefaultCommandRunner) getGithubData(logger logging.SimpleLogging, baseRepo models.Repo, pullNum int) (models.PullRequest, models.Repo, error) {

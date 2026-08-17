@@ -129,6 +129,9 @@ func (p *PlanCommandRunner) runAutoplan(ctx *command.Context) {
 	}
 
 	projectCmds, err := p.prjCmdBuilder.BuildAutoplanCommands(ctx)
+	if !admitRoutedCommand(ctx.Log, ctx.ExecutionLease, "mutating plan state") {
+		return
+	}
 	if err != nil {
 		if statusErr := p.commitStatusUpdater.UpdateCombined(ctx.Log, baseRepo, pull, models.FailedCommitStatus, command.Plan); statusErr != nil {
 			ctx.Log.Warn("unable to update commit status: %s", statusErr)
@@ -178,6 +181,9 @@ func (p *PlanCommandRunner) runAutoplan(ctx *command.Context) {
 	}
 
 	result := runProjectCmdsWithCancellationTracker(ctx, projectCmds, p.cancellationTracker, p.parallelPoolSize, p.isParallelEnabled(projectCmds), p.prjCmdRunner.Plan)
+	if commandSuperseded(ctx, result) {
+		return
+	}
 
 	if p.autoMerger.automergeEnabled(projectCmds) && result.HasErrors() {
 		ctx.Log.Info("deleting plans because there were errors and automerge requires all plans succeed")
@@ -234,6 +240,9 @@ func (p *PlanCommandRunner) run(ctx *command.Context, cmd *CommentCommand) {
 
 	projectCmds, err := p.prjCmdBuilder.BuildPlanCommands(ctx, cmd)
 	if MarkCommandSkippedIfIgnoredTargetedDir(ctx, command.Plan, err) {
+		return
+	}
+	if !admitRoutedCommand(ctx.Log, ctx.ExecutionLease, "mutating plan state") {
 		return
 	}
 
@@ -324,6 +333,9 @@ func (p *PlanCommandRunner) run(ctx *command.Context, cmd *CommentCommand) {
 	}
 
 	result := runProjectCmdsWithCancellationTracker(ctx, projectCmds, p.cancellationTracker, p.parallelPoolSize, p.isParallelEnabled(projectCmds), p.prjCmdRunner.Plan)
+	if commandSuperseded(ctx, result) {
+		return
+	}
 	ctx.CommandHasErrors = result.HasErrors()
 
 	if p.autoMerger.automergeEnabled(projectCmds) && result.HasErrors() {

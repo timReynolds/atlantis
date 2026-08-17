@@ -447,3 +447,18 @@ func TestRunProjectCmdsWithCancellationTracker_UpdatesPullStatusBetweenGroups(t 
 	// Verify both projects ran
 	Assert(t, len(result.ProjectResults) == 2, "expected 2 project results, got %d", len(result.ProjectResults))
 }
+
+func TestRunProjectCmdsStopsAfterOwnershipLoss(t *testing.T) {
+	ctx := &command.Context{Log: logging.NewNoopLogger(t)}
+	commands := []command.ProjectContext{makeProjectContext("stale"), makeProjectContext("must-not-run")}
+	calls := 0
+	result := runProjectCmdsWithCancellationTracker(ctx, commands, nil, 1, false, func(command.ProjectContext) command.ProjectCommandOutput {
+		calls++
+		return command.ProjectCommandOutput{OwnershipLost: true}
+	})
+
+	Equals(t, 1, calls)
+	Assert(t, result.LostOwnership(), "expected ownership loss result")
+	Assert(t, commandSuperseded(ctx, result), "expected command publication to stop")
+	Assert(t, ctx.CommandSuperseded, "expected command lifecycle cancellation marker")
+}

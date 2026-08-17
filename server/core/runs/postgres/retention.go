@@ -114,6 +114,14 @@ func (s *Store) deleteRunMetadataInBatches(ctx context.Context, cutoff time.Time
             JOIN runs run ON run.id = project.run_id
             WHERE run.completed_at < $1
               AND run.status IN ($2, $3, $4, $5, $6)
+              AND NOT EXISTS (
+                  SELECT 1 FROM run_attempts attempt
+                  WHERE attempt.run_id = run.id
+                    AND (
+                      attempt.status IN ('claimed', 'running')
+                      OR (attempt.status = 'unknown' AND attempt.reconciled_at IS NULL)
+                    )
+              )
             ORDER BY run.completed_at, run.id, project.id, output.id
             LIMIT $7
         )
@@ -129,6 +137,14 @@ func (s *Store) deleteRunMetadataInBatches(ctx context.Context, cutoff time.Time
             JOIN runs run ON run.id = project.run_id
             WHERE run.completed_at < $1
               AND run.status IN ($2, $3, $4, $5, $6)
+              AND NOT EXISTS (
+                  SELECT 1 FROM run_attempts attempt
+                  WHERE attempt.run_id = run.id
+                    AND (
+                      attempt.status IN ('claimed', 'running')
+                      OR (attempt.status = 'unknown' AND attempt.reconciled_at IS NULL)
+                    )
+              )
               AND NOT EXISTS (
                   SELECT 1 FROM run_output_chunks output
                   WHERE output.project_run_id = project.id
@@ -148,6 +164,14 @@ func (s *Store) deleteRunMetadataInBatches(ctx context.Context, cutoff time.Time
             JOIN runs run ON run.id = event.run_id
             WHERE run.completed_at < $1
               AND run.status IN ($2, $3, $4, $5, $6)
+              AND NOT EXISTS (
+                  SELECT 1 FROM run_attempts attempt
+                  WHERE attempt.run_id = run.id
+                    AND (
+                      attempt.status IN ('claimed', 'running')
+                      OR (attempt.status = 'unknown' AND attempt.reconciled_at IS NULL)
+                    )
+              )
             ORDER BY run.completed_at, run.id, event.id
             LIMIT $7
         )
@@ -162,6 +186,14 @@ func (s *Store) deleteRunMetadataInBatches(ctx context.Context, cutoff time.Time
             FROM runs run
             WHERE run.completed_at < $1
               AND run.status IN ($2, $3, $4, $5, $6)
+              AND NOT EXISTS (
+                  SELECT 1 FROM run_attempts attempt
+                  WHERE attempt.run_id = run.id
+                    AND (
+                      attempt.status IN ('claimed', 'running')
+                      OR (attempt.status = 'unknown' AND attempt.reconciled_at IS NULL)
+                    )
+              )
               AND NOT EXISTS (
                   SELECT 1 FROM project_runs project WHERE project.run_id = run.id
               )

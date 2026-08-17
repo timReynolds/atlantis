@@ -46,6 +46,8 @@ By default, Atlantis uses the hostname returned by the operating system as the r
 
 For the fork's durable HA mode, also set the same `--replica-deployment-id` on every replica. This mode requires PostgreSQL run history and S3 plan storage. Atlantis creates a distinct process-lifetime instance ID on every restart, stores it in PostgreSQL, and uses that same ID in Redis ownership records. The deployment ID namespaces durable attempt admission, while Redis retains the upstream v1 ownership key so old and new replicas cannot acquire separate owners during a rolling upgrade. Deployments that should not coordinate must use separate Redis databases. The replica ID remains the stable addressable pod identity.
 
+Durable HA adds a `RunAttempt` for each process that tries to execute a logical Run. Attempts record the process instance, Redis ownership claim, concurrency key, heartbeats, terminal classification, and the point at which an infrastructure mutation may have begun. A retried plan keeps its original Run ID and appends a new attempt and attempt-scoped project results; replica identity never becomes part of the external Run ID.
+
 The ownership TTL defaults to 30 seconds and must be at least 10 seconds. Use a TTL long enough to tolerate routine scheduling and Redis latency, but short enough for the desired failover time.
 
 ## Plan Storage
@@ -58,7 +60,9 @@ Without `--enable-external-stores`, plan files stay beneath the owner's local `-
 
 ### External Plans
 
-With `--enable-external-stores` and a valid server-side `external_stores.plan_store` configuration, Atlantis saves plans through the external PlanStore. After takeover, the new owner clears its local state, ensures the default checkout and every plan-bearing project workspace exist, and restores plans before discovery. Targeted applies also ensure the selected project's resolved workspace exists before loading its plan. Recovery runs for a new local ownership generation even when a pre-workflow hook already recreated the pull directory. Missing, stale, or unavailable external plans fail the command and require a new plan.
+With `--enable-external-stores` and a valid server-side `external_stores.plan_store` configuration, Atlantis saves plans through the external PlanStore. Before upload, durable HA records the expected object key, SHA-256 checksum, repository, pull request, commit, project, directory, workspace, repo-config version, and a digest of the resolved Atlantis workflow in PostgreSQL. S3 object metadata carries the same identity and a body checksum. This ordering means a process killed immediately after upload leaves a recoverable expectation; a process killed before upload leaves a harmless missing-object reference that fails closed.
+
+After takeover, the new owner clears its local state, ensures the default checkout and every plan-bearing project workspace exist, and restores plans before discovery. Targeted applies also ensure the selected project's resolved workspace exists before loading its plan. Recovery runs for a new local ownership generation even when a pre-workflow hook already recreated the pull directory. Before apply, Atlantis verifies S3 metadata and body checksum and then compares the restored key, checksum, commit, project identity, repo-config version, and resolved workflow digest with PostgreSQL. Missing, stale, changed, or unavailable external plans fail the command and require a new plan.
 
 ## Failure Behavior
 
@@ -76,6 +80,36 @@ Atlantis fails closed when it cannot resolve or reach the owner:
 Graceful shutdown marks the owner store as draining, stops HTTP traffic, waits for active commands, releases exact claims, and then closes Redis. If HTTP shutdown times out, Atlantis logs the error and still drains active commands, releases claims, and closes Redis; in-progress work is tracked independently of open HTTP connections, so a lingering jobs or SSE stream does not abort the rest of the shutdown sequence.
 
 Internal forwarding is at-least-once. A timeout can leave the ingress replica unsure whether the owner accepted a command, so a provider or manual redelivery can execute it again. Atlantis does not claim exactly-once execution. Ownership or forwarding failures return HTTP 503; monitor failed VCS deliveries and redeliver them when the provider does not retry automatically.
+
+### Reconcile an unknown mutation
+
+If an owner disappears after an apply, import, state removal, or drift remediation crosses its durable side-effect marker, Atlantis records the attempt and Run as `unknown`. Later mutating commands for that pull remain blocked until an operator inspects the recorded output and Terraform state, generates a fresh plan where appropriate, and records an explicit reconciliation.
+
+The authenticated history API provides that operational path. Send the web Basic Auth credentials, a non-empty summary of the checks performed, and the explicit confirmation header:
+
+```bash
+curl --fail-with-body \
+  --user "$ATLANTIS_WEB_USERNAME:$ATLANTIS_WEB_PASSWORD" \
+  --header 'Content-Type: application/json' \
+  --header 'X-Atlantis-Reconcile-Unknown: true' \
+  --data '{"summary":"inspected state and generated a fresh plan"}' \
+  'https://atlantis.example.test/runs/<run-id>/attempts/<attempt-id>/reconcile'
+```
+
+Reconciliation does not change the historical `unknown` status and does not retry the mutation. It adds the operator, summary, timestamp, and a durable audit event in the same PostgreSQL transaction. Run history must be protected by `--web-basic-auth`; when web authentication is disabled, the endpoint is not available.
+
+## Process loss and takeover
+
+PostgreSQL does not replace the Redis lease. After Redis issues ownership to a different process claim, the new owner checks the active attempt and process heartbeats in PostgreSQL before admitting work. If either heartbeat is still fresh, admission fails closed. This prevents Redis lease expiry by itself from authorizing overlapping work while the old process can still reach PostgreSQL.
+
+When the old claim is different and both heartbeats have expired:
+
+- Work with no recorded infrastructure-mutation boundary is marked `interrupted`. An exact duplicate of a plan for the same repository, pull request, commit, refs, actor, and trigger may create another attempt under the existing logical Run.
+- Work whose mutation boundary was recorded is marked `unknown`. Atlantis does not automatically retry it. Apply, import, state removal, and drift-remediation admission remain blocked for that pull request until an operator reconciles the unknown attempt. A fresh plan is still allowed so the operator can inspect current state.
+
+The authenticated Run detail page shows every attempt, its replica and process identity, ownership claim, last heartbeat, mutation boundary, failure reason, and attempt-scoped project output. For an unreconciled `unknown` attempt, inspect the retained output and Terraform state, generate a fresh plan, and use **Mark reconciled** with an operator summary. Reconciliation preserves the historical `unknown` status and atomically appends an `execution_attempt.reconciled` audit event; it is not permission to apply without reviewing the new plan.
+
+These rules do not provide exactly-once Terraform execution. If a process can reach an infrastructure API while unable to reach both Redis and PostgreSQL, Atlantis cannot externally fence a subprocess that already started. The durable mutation marker ensures a replacement process treats that outcome as unknown instead of redelivering the apply.
 
 ## Redis Requirements
 

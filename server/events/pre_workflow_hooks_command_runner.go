@@ -85,7 +85,7 @@ func (w *DefaultPreWorkflowHooksCommandRunner) RunPreHooks(ctx *command.Context,
 			ProjectName:        cmd.ProjectName,
 			SuppressJobOutput:  ctx.SuppressJobOutput,
 		},
-		preWorkflowHooks, repoDir, ctx.SuppressVCSStatus)
+		preWorkflowHooks, repoDir, ctx.SuppressVCSStatus, ctx.SideEffectMarker)
 
 	if err != nil {
 		ctx.Log.Err("Error running pre-workflow hooks %s.", err)
@@ -116,6 +116,7 @@ func (w *DefaultPreWorkflowHooksCommandRunner) runHooks(
 	preWorkflowHooks []*valid.WorkflowHook,
 	repoDir string,
 	suppressVCSStatus bool,
+	sideEffectMarker command.SideEffectMarker,
 ) error {
 	for i, hook := range preWorkflowHooks {
 		ctx.HookDescription = hook.StepDescription
@@ -132,7 +133,6 @@ func (w *DefaultPreWorkflowHooksCommandRunner) runHooks(
 				ctx.HookDescription, ctx.CommandName, hook.Commands)
 			continue
 		}
-
 		ctx.Log.Debug("Running pre workflow hook: '%s'", ctx.HookDescription)
 		ctx.HookID = uuid.NewString()
 		shell := hook.Shell
@@ -161,6 +161,9 @@ func (w *DefaultPreWorkflowHooksCommandRunner) runHooks(
 			}
 		}
 
+		if err := markCommandSideEffect(sideEffectMarker); err != nil {
+			return err
+		}
 		_, runtimeDesc, err := w.PreWorkflowHookRunner.Run(ctx, hook.RunCommand, shell, shellArgs, repoDir)
 
 		if err != nil {

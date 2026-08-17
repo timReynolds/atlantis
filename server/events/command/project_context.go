@@ -27,11 +27,14 @@ type ProjectContext struct {
 	// are empty when durable history is disabled.
 	RunID        runs.ID
 	ProjectRunID runs.ID
+	AttemptID    runs.ID
 	// ObserveProjectResult records synthetic outcomes such as queued work that
 	// was cancelled before ProjectCommandRunner was invoked.
 	ObserveProjectResult func(ProjectContext, Name, ProjectCommandOutput)
-	CommandName          Name
-	SubCommand           string
+	// SideEffectMarker is shared by every project in one execution attempt.
+	SideEffectMarker SideEffectMarker
+	CommandName      Name
+	SubCommand       string
 	// ApplyCmd is the command that users should run to apply this plan. If
 	// this is an apply then this will be empty.
 	ApplyCmd string
@@ -105,6 +108,9 @@ type ProjectContext struct {
 	// RepoConfigVersion is the version of the repo's atlantis.yaml file. If
 	// there was no file, this will be 0.
 	RepoConfigVersion int
+	// WorkflowIdentity is a SHA-256 digest of the resolved project execution
+	// configuration used to create or apply an external plan.
+	WorkflowIdentity string
 	// RePlanCmd is the command that users should run to re-plan this project.
 	// If this is an apply then this will be empty.
 	RePlanCmd string

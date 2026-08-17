@@ -1229,6 +1229,11 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 	for _, step := range steps {
 		var out string
 		var err error
+		if step.StepName == "run" && stepMayMutateInfrastructure(ctx.CommandName, step.StepName) {
+			if err := markInfrastructureSideEffect(ctx); err != nil {
+				return outputs, err
+			}
+		}
 		switch step.StepName {
 		case "init":
 			out, err = p.InitStepRunner.Run(ctx, step.ExtraArgs, absPath, envs)
@@ -1247,12 +1252,21 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 					return outputs, err
 				}
 			}
+			if err := markInfrastructureSideEffect(ctx); err != nil {
+				return outputs, err
+			}
 			out, err = p.ApplyStepRunner.Run(ctx, step.ExtraArgs, absPath, envs)
 		case "version":
 			out, err = p.VersionStepRunner.Run(ctx, step.ExtraArgs, absPath, envs)
 		case "import":
+			if err := markInfrastructureSideEffect(ctx); err != nil {
+				return outputs, err
+			}
 			out, err = p.ImportStepRunner.Run(ctx, step.ExtraArgs, absPath, envs)
 		case "state_rm":
+			if err := markInfrastructureSideEffect(ctx); err != nil {
+				return outputs, err
+			}
 			out, err = p.StateRmStepRunner.Run(ctx, step.ExtraArgs, absPath, envs)
 		case "run":
 			out, err = p.RunStepRunner.Run(ctx, step.RunShell, step.RunCommand, absPath, envs, !ctx.SuppressJobOutput, step.Output, step.FilterRegexes)
@@ -1276,6 +1290,39 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 		}
 	}
 	return outputs, nil
+}
+
+func markInfrastructureSideEffect(ctx command.ProjectContext) error {
+	return markCommandSideEffect(ctx.SideEffectMarker)
+}
+
+func markCommandSideEffect(marker command.SideEffectMarker) error {
+	if marker == nil {
+		return nil
+	}
+	if err := marker.MarkSideEffectStarted(context.Background()); err != nil {
+		return fmt.Errorf("recording infrastructure side effect start: %w", err)
+	}
+	return nil
+}
+
+func stepMayMutateInfrastructure(commandName command.Name, stepName string) bool {
+	// Arbitrary workflow commands can mutate infrastructure even in a plan or
+	// policy stage. Conservatively cross the durable side-effect boundary before
+	// every run step.
+	if stepName == "run" {
+		return true
+	}
+	switch commandName {
+	case command.Apply:
+		return stepName == "apply"
+	case command.Import:
+		return stepName == "import"
+	case command.State:
+		return stepName == "state_rm"
+	default:
+		return false
+	}
 }
 
 // getMissingPolicySetNames returns the names of policy sets that don't have corresponding outputs

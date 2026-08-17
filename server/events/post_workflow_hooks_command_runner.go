@@ -87,7 +87,7 @@ func (w *DefaultPostWorkflowHooksCommandRunner) RunPostHooks(ctx *command.Contex
 			ProjectName:        cmd.ProjectName,
 			SuppressJobOutput:  ctx.SuppressJobOutput,
 		},
-		postWorkflowHooks, repoDir, ctx.SuppressVCSStatus)
+		postWorkflowHooks, repoDir, ctx.SuppressVCSStatus, ctx.SideEffectMarker)
 
 	if err != nil {
 		ctx.Log.Err("Error running post-workflow hooks %s.", err)
@@ -102,6 +102,7 @@ func (w *DefaultPostWorkflowHooksCommandRunner) runHooks(
 	postWorkflowHooks []*valid.WorkflowHook,
 	repoDir string,
 	suppressVCSStatus bool,
+	sideEffectMarker command.SideEffectMarker,
 ) error {
 
 	for i, hook := range postWorkflowHooks {
@@ -119,7 +120,6 @@ func (w *DefaultPostWorkflowHooksCommandRunner) runHooks(
 				ctx.HookDescription, ctx.CommandName, hook.Commands)
 			continue
 		}
-
 		ctx.Log.Debug("Running post workflow hook: '%s'", ctx.HookDescription)
 		ctx.HookID = uuid.NewString()
 		shell := hook.Shell
@@ -143,6 +143,9 @@ func (w *DefaultPostWorkflowHooksCommandRunner) runHooks(
 			}
 		}
 
+		if err := markCommandSideEffect(sideEffectMarker); err != nil {
+			return err
+		}
 		_, runtimeDesc, err := w.PostWorkflowHookRunner.Run(ctx, hook.RunCommand, shell, shellArgs, repoDir)
 
 		if err != nil {

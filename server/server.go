@@ -517,6 +517,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	var runHistory *events.RunHistory
 	if userConfig.RunStoreType == RunStorePostgres {
 		runHistory = events.NewRunHistory(runStore, logger)
+		runHistory.SetAttemptRecoveryTimeout(time.Duration(userConfig.OwnershipTTLSeconds) * time.Second)
 	}
 
 	var projectCmdOutputHandler jobs.ProjectCommandOutputHandler
@@ -1060,14 +1061,15 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		userConfig.SilenceNoProjects,
 	)
 
+	admissionFailureReporter := events.NewVCSRunAdmissionFailureReporter(vcsClient, commitStatusUpdater)
 	commentCommandRunnerByCmd := map[command.Name]events.CommentCommandRunner{
-		command.Plan:            events.NewRunHistoryCommandRunner(runHistory, planCommandRunner, runs.CommandPlan),
-		command.Apply:           events.NewRunHistoryCommandRunner(runHistory, applyCommandRunner, runs.CommandApply),
+		command.Plan:            events.NewRunHistoryCommandRunner(runHistory, planCommandRunner, runs.CommandPlan, admissionFailureReporter),
+		command.Apply:           events.NewRunHistoryCommandRunner(runHistory, applyCommandRunner, runs.CommandApply, admissionFailureReporter),
 		command.ApprovePolicies: approvePoliciesCommandRunner,
-		command.Unlock:          events.NewRunHistoryCommandRunner(runHistory, unlockCommandRunner, runs.CommandUnlock),
+		command.Unlock:          events.NewRunHistoryCommandRunner(runHistory, unlockCommandRunner, runs.CommandUnlock, admissionFailureReporter),
 		command.Version:         versionCommandRunner,
-		command.Import:          events.NewRunHistoryCommandRunner(runHistory, importCommandRunner, runs.CommandImport),
-		command.State:           events.NewRunHistoryCommandRunner(runHistory, stateCommandRunner, runs.CommandStateRemove),
+		command.Import:          events.NewRunHistoryCommandRunner(runHistory, importCommandRunner, runs.CommandImport, admissionFailureReporter),
+		command.State:           events.NewRunHistoryCommandRunner(runHistory, stateCommandRunner, runs.CommandStateRemove, admissionFailureReporter),
 		command.Cancel:          cancelCommandRunner,
 	}
 
@@ -1121,6 +1123,8 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		TeamAllowlistChecker:           teamAllowlistChecker,
 		VarFileAllowlistChecker:        varFileAllowlistChecker,
 		CommitStatusUpdater:            commitStatusUpdater,
+		RunHistory:                     runHistory,
+		RunAdmissionFailureReporter:    admissionFailureReporter,
 	}
 
 	repoAllowlist, err := events.NewRepoAllowlistChecker(userConfig.RepoAllowlist)
@@ -1237,12 +1241,14 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	var commandExecutorWaiter acceptedCommandWaiter
 	if replicaRoutingEnabled {
 		localCommandExecutor := &events.LocalCommandExecutor{
-			Hydrator:    eventParser,
-			Runner:      commandRunner,
-			PullCleaner: pullClosedExecutor,
-			WorkingDir:  workingDir,
-			ClaimGuard:  events.NewLocalClaimGuard(),
-			Logger:      logger,
+			Hydrator:     eventParser,
+			Runner:       commandRunner,
+			PullCleaner:  pullClosedExecutor,
+			WorkingDir:   workingDir,
+			ClaimGuard:   events.NewLocalClaimGuard(),
+			Logger:       logger,
+			InstanceID:   executionInstanceID,
+			DeploymentID: strings.TrimSpace(userConfig.ReplicaDeploymentID),
 		}
 		ownerStore, err = redis.NewOwnerStore(redisDatabase, redis.OwnerStoreConfig{
 			ReplicaID: replicaID, InstanceID: string(executionInstanceID),
@@ -1400,6 +1406,7 @@ func (s *Server) SetupRoutes() {
 		s.Router.HandleFunc("/repos/{repository:.+}", s.RunHistoryController.ListRuns).Methods("GET")
 		s.Router.HandleFunc("/runs/{run-id}", s.RunHistoryController.GetRun).Methods("GET").Name(RunHistoryViewRouteName)
 		s.Router.HandleFunc("/runs/{run-id}/projects/{project-id}", s.RunHistoryController.GetProject).Methods("GET")
+		s.Router.HandleFunc("/runs/{run-id}/attempts/{attempt-id}/reconcile", s.RunHistoryController.ReconcileAttempt).Methods("POST")
 		s.Router.HandleFunc("/audit", s.RunHistoryController.ListAudit).Methods("GET")
 	}
 	if s.DriftHistoryController != nil {

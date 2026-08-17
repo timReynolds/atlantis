@@ -18,6 +18,7 @@
     <h2>{{ if .Project.ProjectName }}{{ .Project.ProjectName }}{{ else }}Unnamed project{{ end }}</h2>
     <span class="history-status history-status-{{ .Project.Status }}">{{ .Project.Status }}</span>
   </header>
+  {{ if .Project.AttemptID }}<p class="history-muted">Execution attempt <code>{{ .Project.AttemptID }}</code></p>{{ end }}
   <section class="history-summary-grid history-summary-project">
     <div><strong class="history-change-add">+{{ .Project.Additions }}</strong><span>Add</span></div>
     <div><strong class="history-change-update">~{{ .Project.Changes }}</strong><span>Change</span></div>

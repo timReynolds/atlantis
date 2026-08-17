@@ -105,7 +105,7 @@ func (s *Store) deleteBeforeInBatches(ctx context.Context, query string, cutoff 
 func (s *Store) deleteRunMetadataInBatches(ctx context.Context, cutoff time.Time) (runs.RetentionResult, error) {
 	terminal := []runs.Status{
 		runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial,
-		runs.StatusCancelled, runs.StatusSkipped,
+		runs.StatusCancelled, runs.StatusSkipped, runs.StatusUnknown,
 	}
 	output, err := s.deleteRunChildrenInBatches(ctx, `WITH retained_output AS (
             SELECT output.id
@@ -113,7 +113,7 @@ func (s *Store) deleteRunMetadataInBatches(ctx context.Context, cutoff time.Time
             JOIN project_runs project ON project.id = output.project_run_id
             JOIN runs run ON run.id = project.run_id
             WHERE run.completed_at < $1
-              AND run.status IN ($2, $3, $4, $5, $6)
+              AND run.status IN ($2, $3, $4, $5, $6, $7)
               AND NOT EXISTS (
                   SELECT 1 FROM run_attempts attempt
                   WHERE attempt.run_id = run.id
@@ -123,7 +123,7 @@ func (s *Store) deleteRunMetadataInBatches(ctx context.Context, cutoff time.Time
                     )
               )
             ORDER BY run.completed_at, run.id, project.id, output.id
-            LIMIT $7
+            LIMIT $8
         )
         DELETE FROM run_output_chunks
         USING retained_output
@@ -136,7 +136,7 @@ func (s *Store) deleteRunMetadataInBatches(ctx context.Context, cutoff time.Time
             FROM project_runs project
             JOIN runs run ON run.id = project.run_id
             WHERE run.completed_at < $1
-              AND run.status IN ($2, $3, $4, $5, $6)
+              AND run.status IN ($2, $3, $4, $5, $6, $7)
               AND NOT EXISTS (
                   SELECT 1 FROM run_attempts attempt
                   WHERE attempt.run_id = run.id
@@ -150,7 +150,7 @@ func (s *Store) deleteRunMetadataInBatches(ctx context.Context, cutoff time.Time
                   WHERE output.project_run_id = project.id
               )
             ORDER BY run.completed_at, run.id, project.id
-            LIMIT $7
+            LIMIT $8
         )
         DELETE FROM project_runs
         USING retained_projects
@@ -163,7 +163,7 @@ func (s *Store) deleteRunMetadataInBatches(ctx context.Context, cutoff time.Time
             FROM audit_events event
             JOIN runs run ON run.id = event.run_id
             WHERE run.completed_at < $1
-              AND run.status IN ($2, $3, $4, $5, $6)
+              AND run.status IN ($2, $3, $4, $5, $6, $7)
               AND NOT EXISTS (
                   SELECT 1 FROM run_attempts attempt
                   WHERE attempt.run_id = run.id
@@ -173,7 +173,7 @@ func (s *Store) deleteRunMetadataInBatches(ctx context.Context, cutoff time.Time
                     )
               )
             ORDER BY run.completed_at, run.id, event.id
-            LIMIT $7
+            LIMIT $8
         )
         UPDATE audit_events
         SET run_id = NULL
@@ -185,7 +185,7 @@ func (s *Store) deleteRunMetadataInBatches(ctx context.Context, cutoff time.Time
             SELECT run.id
             FROM runs run
             WHERE run.completed_at < $1
-              AND run.status IN ($2, $3, $4, $5, $6)
+              AND run.status IN ($2, $3, $4, $5, $6, $7)
               AND NOT EXISTS (
                   SELECT 1 FROM run_attempts attempt
                   WHERE attempt.run_id = run.id
@@ -201,7 +201,7 @@ func (s *Store) deleteRunMetadataInBatches(ctx context.Context, cutoff time.Time
                   SELECT 1 FROM audit_events event WHERE event.run_id = run.id
               )
             ORDER BY run.completed_at, run.id
-            LIMIT $7
+            LIMIT $8
         )
         DELETE FROM runs
         USING retained_runs
@@ -219,7 +219,7 @@ func (s *Store) deleteRunChildrenInBatches(ctx context.Context, query string, cu
 	for {
 		opCtx, cancel := s.operationContext(ctx)
 		result, err := s.db.ExecContext(opCtx, query,
-			cutoff, terminal[0], terminal[1], terminal[2], terminal[3], terminal[4], retentionBatchSize,
+			cutoff, terminal[0], terminal[1], terminal[2], terminal[3], terminal[4], terminal[5], retentionBatchSize,
 		)
 		cancel()
 		if err != nil {

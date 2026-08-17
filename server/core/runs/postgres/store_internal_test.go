@@ -9,6 +9,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ const (
 	testProjectRunID = runs.ID("0198a0df-85f1-7d83-a60b-2e57b725c62b")
 	testAttemptID    = runs.ID("0198a0df-85f1-7d83-a60b-2e57b725c62c")
 	testInstanceID   = runs.ID("0198a0df-85f1-7d83-a60b-2e57b725c62d")
+	testAuditID      = runs.ID("0198a0df-85f1-7d83-a60b-2e57b725c62e")
 )
 
 var testTime = time.Date(2026, 8, 16, 10, 0, 0, 123456000, time.UTC)
@@ -32,11 +34,22 @@ func TestLoadMigrations(t *testing.T) {
 	require.NotEmpty(t, migrations)
 	require.Equal(t, int64(1), migrations[0].version)
 	require.Contains(t, migrations[0].sql, "CREATE TABLE run_output_chunks")
-	require.Equal(t, int64(4), migrations[len(migrations)-1].version)
-	require.Contains(t, migrations[len(migrations)-1].sql, "CREATE TABLE run_attempts")
-	require.Contains(t, migrations[len(migrations)-1].sql, "run_attempts_one_active_concurrency_key_idx")
-	require.Contains(t, migrations[len(migrations)-1].sql, "ON run_attempts (deployment_id, concurrency_key)")
-	require.Contains(t, migrations[len(migrations)-1].sql, "status = 'unknown' AND reconciled_at IS NULL")
+	require.Equal(t, int64(4), migrations[3].version)
+	require.Contains(t, migrations[3].sql, "CREATE TABLE run_attempts")
+	require.Contains(t, migrations[3].sql, "run_attempts_one_active_concurrency_key_idx")
+	require.Contains(t, migrations[3].sql, "ON run_attempts (deployment_id, concurrency_key)")
+	require.Contains(t, migrations[3].sql, "status = 'unknown' AND reconciled_at IS NULL")
+	require.Equal(t, int64(5), migrations[4].version)
+	require.Contains(t, migrations[4].sql, "'unknown'")
+	require.Contains(t, migrations[4].sql, "ALTER TABLE project_runs")
+	require.Equal(t, int64(6), migrations[5].version)
+	require.Contains(t, migrations[5].sql, "attempt_id")
+	require.Contains(t, migrations[5].sql, "UPDATE project_runs AS project")
+	require.Equal(t, int64(7), migrations[6].version)
+	require.Contains(t, migrations[6].sql, "DROP INDEX run_attempts_one_active_concurrency_key_idx")
+	require.Contains(t, migrations[6].sql, "WHERE status IN ('claimed', 'running')")
+	require.Equal(t, int64(8), migrations[len(migrations)-1].version)
+	require.Contains(t, migrations[len(migrations)-1].sql, "plan_workflow_checksum")
 }
 
 func TestRegisterExecutionInstance(t *testing.T) {
@@ -62,18 +75,74 @@ func TestRegisterExecutionInstance(t *testing.T) {
 func TestCreateAttemptMapsActiveConcurrencyConflict(t *testing.T) {
 	store, mock := newMockStore(t)
 	attempt := claimedAttempt()
-	mock.ExpectExec("INSERT INTO run_attempts").
+	mock.ExpectBegin()
+	expectAttemptAdmissionLock(mock, attempt)
+	mock.ExpectQuery("SELECT command FROM runs").WithArgs(attempt.RunID).
+		WillReturnRows(sqlmock.NewRows([]string{"command"}).AddRow(runs.CommandPlan))
+	mock.ExpectQuery("(?s)WITH superseded_attempts AS .*superseded_runs AS .*superseded_project_runs AS").
 		WithArgs(
-			attempt.ID, attempt.RunID, attempt.InstanceID, attempt.DeploymentID, attempt.ConcurrencyKey,
-			attempt.OwnershipClaimID, attempt.Status, attempt.ClaimedAt, nil,
-			attempt.HeartbeatAt, nil, nil, attempt.FailureReason, nil,
-			attempt.ReconciledBy, attempt.ReconciliationSummary, []byte(`{}`),
+			attempt.DeploymentID, attempt.ConcurrencyKey, attempt.OwnershipClaimID, attempt.ClaimedAt,
+			runs.AttemptClaimed, runs.AttemptRunning, runs.AttemptInterrupted, runs.AttemptUnknown,
+			runs.StatusFailed, runs.StatusUnknown, runs.StatusRunning, attempt.RunID,
+			runs.StatusCancelled, runs.StatusPending,
 		).
+		WillReturnRows(sqlmock.NewRows([]string{"attempts", "runs", "projects", "unknown"}).AddRow(0, 0, 0, 0))
+	mock.ExpectExec("INSERT INTO run_attempts").WithArgs(
+		attempt.ID, attempt.RunID, attempt.InstanceID, attempt.DeploymentID, attempt.ConcurrencyKey,
+		attempt.OwnershipClaimID, attempt.Status, attempt.ClaimedAt, nil,
+		attempt.HeartbeatAt, nil, nil, attempt.FailureReason, nil,
+		attempt.ReconciledBy, attempt.ReconciliationSummary, []byte(`{}`),
+	).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery("SELECT .* FROM run_attempts WHERE id = \\$1").
 		WithArgs(testAttemptID).WillReturnError(sql.ErrNoRows)
+	mock.ExpectRollback()
 
 	err := store.CreateAttempt(context.Background(), attempt)
+	require.ErrorIs(t, err, runs.ErrConflict)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestCreateAttemptCommitsUnknownSupersessionBeforeReturningConflict(t *testing.T) {
+	store, mock := newMockStore(t)
+	attempt := claimedAttempt()
+	mock.ExpectBegin()
+	expectAttemptAdmissionLock(mock, attempt)
+	mock.ExpectQuery("SELECT command FROM runs").WithArgs(attempt.RunID).
+		WillReturnRows(sqlmock.NewRows([]string{"command"}).AddRow(runs.CommandPlan))
+	mock.ExpectQuery("(?s)WITH superseded_attempts AS .*completed_at = GREATEST\\(\\$4, claimed_at, started_at, side_effect_started_at\\).*superseded_runs AS .*superseded_project_runs AS").
+		WithArgs(
+			attempt.DeploymentID, attempt.ConcurrencyKey, attempt.OwnershipClaimID, attempt.ClaimedAt,
+			runs.AttemptClaimed, runs.AttemptRunning, runs.AttemptInterrupted, runs.AttemptUnknown,
+			runs.StatusFailed, runs.StatusUnknown, runs.StatusRunning, attempt.RunID,
+			runs.StatusCancelled, runs.StatusPending,
+		).
+		WillReturnRows(sqlmock.NewRows([]string{"attempts", "runs", "projects", "unknown"}).AddRow(1, 1, 1, 0))
+	mock.ExpectExec("INSERT INTO run_attempts").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery("SELECT .* FROM run_attempts WHERE id = \\$1").
+		WithArgs(testAttemptID).WillReturnError(sql.ErrNoRows)
+	mock.ExpectCommit()
+
+	err := store.CreateAttempt(context.Background(), attempt)
+
+	require.ErrorIs(t, err, runs.ErrConflict)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestCreateAttemptBlocksMutationBehindUnknownButNotPlans(t *testing.T) {
+	store, mock := newMockStore(t)
+	attempt := claimedAttempt()
+	mock.ExpectBegin()
+	expectAttemptAdmissionLock(mock, attempt)
+	mock.ExpectQuery("SELECT command FROM runs").WithArgs(attempt.RunID).
+		WillReturnRows(sqlmock.NewRows([]string{"command"}).AddRow(runs.CommandApply))
+	mock.ExpectQuery("(?s)SELECT id FROM run_attempts.*deployment_id = \\$1 AND concurrency_key = \\$2.*status = \\$3").
+		WithArgs(attempt.DeploymentID, attempt.ConcurrencyKey, runs.AttemptUnknown).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(testAttemptID))
+	mock.ExpectRollback()
+
+	err := store.CreateAttempt(context.Background(), attempt)
+
 	require.ErrorIs(t, err, runs.ErrConflict)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -93,6 +162,27 @@ func TestCompleteAttemptUnknownRequiresRecordedSideEffect(t *testing.T) {
 		ID: testAttemptID, Status: runs.AttemptUnknown, CompletedAt: completedAt,
 		FailureReason: "worker heartbeat lost",
 	}))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestReconcileAttemptWritesAuditAtomically(t *testing.T) {
+	store, mock := newMockStore(t)
+	reconciliation := runs.AttemptReconciliation{
+		ID: testAttemptID, AuditEventID: testAuditID, At: testTime.Add(time.Minute),
+		Actor: "operator", Summary: "state inspected; fresh plan required",
+	}
+	mock.ExpectBegin()
+	mock.ExpectExec("UPDATE run_attempts").WithArgs(
+		reconciliation.ID, reconciliation.At, reconciliation.Actor,
+		reconciliation.Summary, runs.AttemptUnknown,
+	).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO audit_events").WithArgs(
+		reconciliation.ID, reconciliation.AuditEventID, reconciliation.Actor,
+		reconciliation.Summary, reconciliation.At,
+	).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	require.NoError(t, store.ReconcileAttempt(context.Background(), reconciliation))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -201,7 +291,7 @@ func TestApplyRetentionKeepsCutoffsIndependent(t *testing.T) {
 		WithArgs(auditBefore, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectExec(regexp.QuoteMeta("WHERE drift_status.identity_hash = retained_drift.identity_hash\n          AND drift_status.last_checked < $1")).
 		WithArgs(driftBefore, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 6))
-	runArgs := []driver.Value{runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, retentionBatchSize}
+	runArgs := []driver.Value{runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, runs.StatusUnknown, retentionBatchSize}
 	mock.ExpectExec("(?s)WITH retained_output AS.*run_attempts.*status IN \\('claimed', 'running'\\).*reconciled_at IS NULL").
 		WithArgs(runArgs...).WillReturnResult(sqlmock.NewResult(0, 8))
 	mock.ExpectExec("(?s)WITH retained_projects AS.*run_attempts.*status IN \\('claimed', 'running'\\).*reconciled_at IS NULL").
@@ -209,10 +299,10 @@ func TestApplyRetentionKeepsCutoffsIndependent(t *testing.T) {
 	mock.ExpectExec("(?s)WITH retained_events AS.*run_attempts.*status IN \\('claimed', 'running'\\).*reconciled_at IS NULL").
 		WithArgs(runArgs...).WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectExec("(?s)WITH retained_runs AS.*run_attempts.*status IN \\('claimed', 'running'\\).*reconciled_at IS NULL").
-		WithArgs(runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, retentionBatchSize).
+		WithArgs(runArgs...).
 		WillReturnResult(sqlmock.NewResult(0, retentionBatchSize))
 	mock.ExpectExec("(?s)WITH retained_runs AS.*run_attempts.*status IN \\('claimed', 'running'\\).*reconciled_at IS NULL").
-		WithArgs(runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, retentionBatchSize).
+		WithArgs(runArgs...).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	result, err := store.ApplyRetention(context.Background(), runs.RetentionPolicy{
@@ -249,6 +339,44 @@ func TestGetRunMapsNotFound(t *testing.T) {
 func TestPageLimitRejectsUnboundedReads(t *testing.T) {
 	_, err := pageLimit(maximumPageLimit + 1)
 	require.Error(t, err)
+}
+
+func TestRecordProjectPlanArtifactReplacesLaterPlanStep(t *testing.T) {
+	store, mock := newMockStore(t)
+	update := runs.ProjectPlanArtifactUpdate{
+		ProjectRunID: testProjectRunID,
+		Artifact: runs.ArtifactReference{
+			Key: "plans/example/network.tfplan", Checksum: "sha256:" + strings.Repeat("a", 64),
+			CreatedAt: testTime,
+		},
+		Identity: runs.PlanArtifactIdentity{RepoConfigVersion: 1, WorkflowChecksum: "sha256:" + strings.Repeat("b", 64)},
+	}
+	mock.ExpectExec("UPDATE project_runs SET").
+		WithArgs(
+			testProjectRunID, update.Artifact.Key, update.Artifact.Checksum,
+			update.Artifact.CreatedAt, nil, update.Identity.RepoConfigVersion, update.Identity.WorkflowChecksum,
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	require.NoError(t, store.RecordProjectPlanArtifact(context.Background(), update))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRecordProjectPlanArtifactRejectsUnknownProjectRun(t *testing.T) {
+	store, mock := newMockStore(t)
+	update := runs.ProjectPlanArtifactUpdate{
+		ProjectRunID: testProjectRunID,
+		Artifact: runs.ArtifactReference{
+			Key: "plans/example/network.tfplan", Checksum: "sha256:" + strings.Repeat("a", 64),
+			CreatedAt: testTime,
+		},
+		Identity: runs.PlanArtifactIdentity{RepoConfigVersion: 1, WorkflowChecksum: "sha256:" + strings.Repeat("b", 64)},
+	}
+	mock.ExpectExec("UPDATE project_runs SET").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	err := store.RecordProjectPlanArtifact(context.Background(), update)
+	require.ErrorIs(t, err, runs.ErrNotFound)
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestAppendOutputValidatesBeforeOpeningTransaction(t *testing.T) {
@@ -295,4 +423,10 @@ func claimedAttempt() runs.RunAttempt {
 		ConcurrencyKey: "sha256:pull-ownership-key", OwnershipClaimID: "claim-1",
 		Status: runs.AttemptClaimed, ClaimedAt: testTime, HeartbeatAt: testTime,
 	}
+}
+
+func expectAttemptAdmissionLock(mock sqlmock.Sqlmock, attempt runs.RunAttempt) {
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").
+		WithArgs(attempt.DeploymentID, attempt.ConcurrencyKey).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 }

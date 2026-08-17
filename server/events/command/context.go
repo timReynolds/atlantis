@@ -108,6 +108,11 @@ type Context struct {
 	// Set true if the command was intentionally skipped without executing work.
 	CommandSkipped bool
 
+	// CommandOutcomeSkipped records a skipped durable outcome without changing
+	// workflow-hook dispatch. Use CommandSkipped only when the command pipeline
+	// itself must stop before post-workflow hooks.
+	CommandOutcomeSkipped bool
+
 	// CommandCancelled is set when atlantis cancel prevents queued project work
 	// from starting. It lets optional lifecycle observers distinguish an
 	// operator cancellation from an execution failure.

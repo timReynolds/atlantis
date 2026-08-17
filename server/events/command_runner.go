@@ -485,6 +485,7 @@ func (c *DefaultCommandRunner) RunCommentCommand(baseRepo models.Repo, maybeHead
 	if err != nil {
 		return
 	}
+	pull.VCSDeliveryID = cmd.VCSDeliveryID
 
 	status, err := c.PullStatusFetcher.GetPullStatus(pull)
 

@@ -1917,6 +1917,8 @@ func TestRunCommentCommand_DisableApplyAllDisabled(t *testing.T) {
 	vcsClient.VerifyWasCalledOnce().CreateComment(
 		Any[logging.SimpleLogging](), Eq(testdata.GithubRepo), Eq(modelPull.Num),
 		Eq("**Error:** Running `atlantis apply` without flags is disabled. You must specify which project to apply via the `-d <dir>`, `-w <workspace>` or `-p <project name>` flags."), Eq("apply"))
+	postWorkflowHooksCommandRunner.(*mocks.MockPostWorkflowHooksCommandRunner).VerifyWasCalledOnce().RunPostHooks(
+		Any[*command.Context](), Any[*events.CommentCommand]())
 }
 
 func TestRunCommentCommand_DisableAutoplan(t *testing.T) {

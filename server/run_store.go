@@ -32,6 +32,11 @@ func validateRunStoreConfig(userConfig UserConfig) error {
 		if strings.TrimSpace(userConfig.RunStorePostgresURL) == "" {
 			return errors.New("run store PostgreSQL URL is required")
 		}
+		if userConfig.WebBasicAuth &&
+			(strings.TrimSpace(userConfig.WebUsername) == "" || strings.TrimSpace(userConfig.WebPassword) == "" ||
+				(userConfig.WebUsername == DefaultWebUsername && userConfig.WebPassword == DefaultWebPassword)) {
+			return errors.New("postgres run history requires non-default web basic-auth credentials")
+		}
 	default:
 		return fmt.Errorf("unknown run store type %q", userConfig.RunStoreType)
 	}
@@ -109,7 +114,7 @@ func (s *runStoreRetentionService) Run(ctx context.Context) {
 func (s *runStoreRetentionService) apply(ctx context.Context) {
 	result, err := s.store.ApplyRetention(ctx, s.policy(s.now()))
 	if err != nil {
-		s.logger.Err("applying run history retention: %v", err)
+		s.logger.Err("applying run history retention %v", err)
 		return
 	}
 	s.logger.Info(

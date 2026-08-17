@@ -62,6 +62,26 @@ func TestInMemoryStorage_StoreStripsPlanOutput(t *testing.T) {
 	Equals(t, "", results[0].PlanOutput)
 }
 
+func TestInMemoryStorage_PreservesLastSuccessfulCheckAcrossFailure(t *testing.T) {
+	storage := drift.NewInMemoryStorage()
+	checkedAt := time.Now().UTC().Add(-time.Hour)
+	project := models.ProjectDrift{
+		ProjectName: "test-project", Path: "modules/vpc", Workspace: "default",
+		Ref: "main", LastChecked: checkedAt,
+	}
+	Ok(t, storage.Store("owner/repo", project))
+	project.LastChecked = checkedAt.Add(time.Hour)
+	project.Error = "provider unavailable"
+	Ok(t, storage.Store("owner/repo", project))
+
+	results, err := storage.Get("owner/repo", drift.GetOptions{})
+	Ok(t, err)
+	Equals(t, 1, len(results))
+	Assert(t, results[0].LastSuccessfulChecked != nil, "expected last successful check")
+	Equals(t, checkedAt, *results[0].LastSuccessfulChecked)
+	Equals(t, project.LastChecked, results[0].LastChecked)
+}
+
 func TestInMemoryStorage_StoreOverwrite(t *testing.T) {
 	storage := drift.NewInMemoryStorage()
 
@@ -97,6 +117,26 @@ func TestInMemoryStorage_StoreOverwrite(t *testing.T) {
 	results, err := storage.Get("owner/repo", drift.GetOptions{})
 	Ok(t, err)
 	Equals(t, 1, len(results))
+	Equals(t, false, results[0].Drift.HasDrift)
+}
+
+func TestInMemoryStorage_StoreDoesNotOverwriteNewerObservation(t *testing.T) {
+	storage := drift.NewInMemoryStorage()
+	newer := models.ProjectDrift{
+		ProjectName: "test-project", Path: "modules/vpc", Workspace: "default",
+		Drift: models.DriftSummary{HasDrift: false}, LastChecked: time.Now(),
+	}
+	older := newer
+	older.Drift = models.DriftSummary{HasDrift: true, ToAdd: 2}
+	older.LastChecked = newer.LastChecked.Add(-time.Minute)
+
+	Ok(t, storage.Store("owner/repo", newer))
+	Ok(t, storage.Store("owner/repo", older))
+
+	results, err := storage.Get("owner/repo", drift.GetOptions{})
+	Ok(t, err)
+	Equals(t, 1, len(results))
+	Equals(t, newer.LastChecked, results[0].LastChecked)
 	Equals(t, false, results[0].Drift.HasDrift)
 }
 
@@ -564,6 +604,27 @@ func TestInMemoryStorage_DeleteMatchingHonorsBaseBranch(t *testing.T) {
 	releaseResults, err := storage.Get("owner/repo", drift.GetOptions{Ref: "v1.0.0", BaseBranch: "release"})
 	Ok(t, err)
 	Equals(t, 1, len(releaseResults))
+}
+
+func TestInMemoryStorage_DeleteObservedKeepsConcurrentlyRefreshedRecord(t *testing.T) {
+	storage := drift.NewInMemoryStorage()
+	repository := "owner/repo"
+	checkedAt := time.Now()
+	old := models.ProjectDrift{
+		ProjectName: "network", Path: "terraform/network", Workspace: "production",
+		Ref: "main", BaseBranch: "main", DetectionID: "old", LastChecked: checkedAt,
+	}
+	Ok(t, storage.Store(repository, old))
+	newer := old
+	newer.DetectionID = "new"
+	newer.LastChecked = checkedAt.Add(time.Second)
+	Ok(t, storage.Store(repository, newer))
+
+	Ok(t, storage.DeleteObserved(repository, old))
+	results, err := storage.Get(repository, drift.GetOptions{Ref: "main", BaseBranch: "main"})
+	Ok(t, err)
+	Equals(t, 1, len(results))
+	Equals(t, "new", results[0].DetectionID)
 }
 
 func TestInMemoryStorage_GetAllEmpty(t *testing.T) {

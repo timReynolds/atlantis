@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Drift remediation {{ .ID }} · atlantis</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/normalize.css">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/skeleton.css">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/custom.css">
+</head>
+<body>
+<div class="container history-page">
+  <nav class="history-nav"><a href="{{ .CleanedBasePath }}/">Atlantis</a><a href="{{ .CleanedBasePath }}/runs">Runs</a><a href="{{ .CleanedBasePath }}/audit">Audit</a><a class="active" href="{{ .CleanedBasePath }}/drift">Drift</a></nav>
+  <header class="history-header"><p class="history-eyebrow">{{ .Repository }} · {{ .Ref }}</p><h2><code>{{ .Action }}</code> remediation</h2><p class="history-id-full">{{ .ID }}</p><span class="history-status history-status-{{ .Status }}">{{ .Status }}</span></header>
+  <section class="history-summary-grid"><div><strong>{{ .TotalProjects }}</strong><span>Projects</span></div><div><strong>{{ .SuccessCount }}</strong><span>Succeeded</span></div><div><strong>{{ .FailureCount }}</strong><span>Failed</span></div></section>
+  <section class="history-facts"><div><span>Started</span><strong>{{ .StartedAt }}</strong></div><div><span>Completed</span><strong>{{ if .CompletedAt }}{{ .CompletedAt }}{{ else }}running{{ end }}</strong></div></section>
+  {{ if .Error }}<p class="history-error">{{ .Error }}</p>{{ end }}
+  {{ if .RunPath }}<p><a class="button button-primary" href="{{ .CleanedBasePath }}{{ .RunPath }}">Open run and permissioned command output</a></p>{{ end }}
+  {{ if .Projects }}<div class="history-table-wrap"><table class="u-full-width history-table">
+    <thead><tr><th>Project</th><th>Status</th><th>Before</th><th>After</th></tr></thead>
+    <tbody>{{ range .Projects }}<tr><td><strong>{{ if .ProjectName }}{{ .ProjectName }}{{ else }}unnamed{{ end }}</strong><br><code>{{ .Directory }}</code> · <code>{{ .Workspace }}</code>{{ if .Error }}<br><span class="history-error">{{ .Error }}</span>{{ end }}</td><td><span class="history-status history-status-{{ .Status }}">{{ .Status }}</span></td><td><pre class="history-metadata">{{ .Before }}</pre></td><td><pre class="history-metadata">{{ .After }}</pre></td></tr>{{ end }}</tbody>
+  </table></div>{{ else }}<div class="history-empty">No project outcomes have been recorded.</div>{{ end }}
+</div>
+<footer>{{ .AtlantisVersion }}</footer>
+</body>
+</html>

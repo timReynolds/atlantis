@@ -187,14 +187,16 @@ type RetentionPolicy struct {
 	RunMetadataBefore *time.Time
 	OutputBefore      *time.Time
 	AuditEventsBefore *time.Time
+	DriftStatusBefore *time.Time
 }
 
 // RetentionResult reports the records removed by a retention pass.
 type RetentionResult struct {
-	RunsDeleted         int64
-	ProjectRunsDeleted  int64
-	OutputChunksDeleted int64
-	AuditEventsDeleted  int64
+	RunsDeleted          int64
+	ProjectRunsDeleted   int64
+	OutputChunksDeleted  int64
+	AuditEventsDeleted   int64
+	DriftStatusesDeleted int64
 }
 
 // Retainer applies independently configurable history retention.

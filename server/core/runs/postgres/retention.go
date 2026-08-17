@@ -14,7 +14,7 @@ import (
 const retentionBatchSize = 1000
 
 func (s *Store) ApplyRetention(ctx context.Context, policy runs.RetentionPolicy) (runs.RetentionResult, error) {
-	if policy.RunMetadataBefore == nil && policy.OutputBefore == nil && policy.AuditEventsBefore == nil {
+	if policy.RunMetadataBefore == nil && policy.OutputBefore == nil && policy.AuditEventsBefore == nil && policy.DriftStatusBefore == nil {
 		return runs.RetentionResult{}, nil
 	}
 	var result runs.RetentionResult
@@ -51,6 +51,24 @@ func (s *Store) ApplyRetention(ctx context.Context, policy runs.RetentionPolicy)
 			return runs.RetentionResult{}, fmt.Errorf("deleting retained audit events: %w", err)
 		}
 		result.AuditEventsDeleted = deleted
+	}
+	if policy.DriftStatusBefore != nil {
+		deleted, err := s.deleteBeforeInBatches(ctx, `WITH retained_drift AS (
+            SELECT identity_hash FROM drift_status
+            WHERE last_checked < $1
+            ORDER BY last_checked, identity_hash
+            LIMIT $2
+        )
+        DELETE FROM drift_status
+        USING retained_drift
+        WHERE drift_status.identity_hash = retained_drift.identity_hash
+          AND drift_status.last_checked < $1`,
+			normalizeTime(*policy.DriftStatusBefore),
+		)
+		if err != nil {
+			return runs.RetentionResult{}, fmt.Errorf("deleting retained drift status: %w", err)
+		}
+		result.DriftStatusesDeleted = deleted
 	}
 	if policy.RunMetadataBefore != nil {
 		deleted, err := s.deleteRunMetadataInBatches(ctx, normalizeTime(*policy.RunMetadataBefore))

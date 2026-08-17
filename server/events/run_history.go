@@ -6,6 +6,8 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -16,6 +18,7 @@ import (
 	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
+	"github.com/runatlantis/atlantis/server/events/vcs"
 	"github.com/runatlantis/atlantis/server/logging"
 )
 
@@ -24,6 +27,8 @@ const (
 	resultOutputChunkBytes   = 32 * 1024
 	resultOutputWriteBatch   = 32
 	runHistoryWriteTimeout   = 5 * time.Second
+	defaultAttemptHeartbeat  = 10 * time.Second
+	defaultAttemptStaleAfter = 30 * time.Second
 )
 
 // RunOutputFinalizer flushes and releases buffered output for a logical Run.
@@ -33,24 +38,47 @@ type RunOutputFinalizer interface {
 }
 
 // RunHistory records command and project lifecycles without owning execution.
-// All persistence errors are logged and remain fail-open for Terraform work.
+// Observation-only writes remain fail-open. Owner-routed attempt admission and
+// side-effect markers fail closed because recovery depends on those records.
 type RunHistory struct {
-	writer          runs.Writer
-	logger          logging.SimpleLogging
-	now             func() time.Time
-	newID           func() (runs.ID, error)
-	sessions        sync.Map
-	outputFinalizer RunOutputFinalizer
+	writer            runs.Writer
+	executionWriter   runs.ExecutionWriter
+	executionRecovery runs.ExecutionRecovery
+	planArtifacts     runs.PlanArtifactStore
+	logger            logging.SimpleLogging
+	now               func() time.Time
+	newID             func() (runs.ID, error)
+	sessions          sync.Map
+	outputFinalizer   RunOutputFinalizer
+	attemptHeartbeat  time.Duration
+	attemptStaleAfter time.Duration
 }
 
 // NewRunHistory returns a lifecycle observer for a configured durable store.
 func NewRunHistory(writer runs.Writer, logger logging.SimpleLogging) *RunHistory {
-	return &RunHistory{writer: writer, logger: logger, now: time.Now, newID: runs.NewID}
+	executionWriter, _ := writer.(runs.ExecutionWriter)
+	executionRecovery, _ := writer.(runs.ExecutionRecovery)
+	planArtifacts, _ := writer.(runs.PlanArtifactStore)
+	return &RunHistory{
+		writer: writer, executionWriter: executionWriter, executionRecovery: executionRecovery,
+		planArtifacts: planArtifacts,
+		logger:        logger, now: time.Now, newID: runs.NewID,
+		attemptHeartbeat: defaultAttemptHeartbeat, attemptStaleAfter: defaultAttemptStaleAfter,
+	}
 }
 
 // SetOutputFinalizer connects the output batching decorator to Run completion.
 func (h *RunHistory) SetOutputFinalizer(finalizer RunOutputFinalizer) {
 	h.outputFinalizer = finalizer
+}
+
+// SetAttemptRecoveryTimeout aligns PostgreSQL stale-attempt classification
+// with the Redis ownership lease. A fresh process or attempt heartbeat still
+// blocks takeover even after Redis issues a new claim.
+func (h *RunHistory) SetAttemptRecoveryTimeout(timeout time.Duration) {
+	if h != nil && timeout > 0 {
+		h.attemptStaleAfter = timeout
+	}
 }
 
 // IsRunHistoryComplete reports whether all persistence attempted so far for a
@@ -81,16 +109,23 @@ func (h *RunHistory) DeferRunComment(runID runs.ID, callback func(complete bool)
 
 // Begin creates a running logical Run and returns its completion scope.
 func (h *RunHistory) Begin(ctx *command.Context, runCommand runs.Command, trigger runs.Trigger) *RunLifecycle {
-	lifecycle := &RunLifecycle{history: h, ctx: ctx}
-	if h == nil || ctx == nil || h.writer == nil || ctx.RunID != "" {
+	// The outer command runner owns the lifecycle across workflow hooks. The
+	// command-specific decorator remains in place for API and direct callers,
+	// but must not create or finish a second lifecycle for the same Context.
+	if ctx != nil && ctx.RunID != "" {
+		return &RunLifecycle{history: h, ctx: ctx, canExecute: true}
+	}
+	requiresDurableAttempt := ctx != nil && (ctx.ExecutionInstanceID != "" || ctx.ExecutionDeploymentID != "" || ctx.ConcurrencyKey != "" || ctx.OwnershipClaimID != "")
+	lifecycle := &RunLifecycle{history: h, ctx: ctx, canExecute: !requiresDurableAttempt}
+	if h == nil || ctx == nil || h.writer == nil {
 		return lifecycle
 	}
+	now := h.now().UTC()
 	runID, err := h.newID()
 	if err != nil {
 		h.logError(ctx.Log, "generating run history ID", err)
 		return lifecycle
 	}
-	now := h.now().UTC()
 	pullNumber := positivePullNumber(ctx.Pull.Num)
 	run := runs.Run{
 		ID: runID, Repository: ctx.Pull.BaseRepo.ID(), PullNumber: pullNumber,
@@ -99,11 +134,21 @@ func (h *RunHistory) Begin(ctx *command.Context, runCommand runs.Command, trigge
 		Status: runs.StatusRunning, CreatedAt: now, StartedAt: &now,
 		Metadata: runMetadata(ctx),
 	}
-	if err := writeRunHistory(func(writeCtx context.Context) error {
-		return h.writer.CreateRun(writeCtx, run)
-	}); err != nil {
-		h.logError(ctx.Log, "creating run history", err)
-		return lifecycle
+	recovery := h.prepareAttemptRecovery(ctx, run, now)
+	if recovery.retryRun != nil {
+		run = *recovery.retryRun
+		runID = run.ID
+	} else {
+		if err := writeRunHistory(func(writeCtx context.Context) error {
+			return h.writer.CreateRun(writeCtx, run)
+		}); err != nil {
+			h.logError(ctx.Log, "creating run history", err)
+			if ctx.ExecutionInstanceID != "" {
+				lifecycle.canExecute = false
+				ctx.CommandHasErrors = true
+			}
+			return lifecycle
+		}
 	}
 	ctx.RunID = runID
 	ctx.ObserveProjectResult = func(projectCtx command.ProjectContext, phase command.Name, output command.ProjectCommandOutput) {
@@ -118,18 +163,131 @@ func (h *RunHistory) Begin(ctx *command.Context, runCommand runs.Command, trigge
 	}
 	h.sessions.Store(runID, session)
 	lifecycle.runID = runID
-	h.appendAudit(ctx.Log, session, string(run.Command)+".requested", nil, now)
+	auditMetadata := recovery.auditMetadata()
+	h.appendAudit(ctx.Log, session, string(run.Command)+".requested", auditMetadata, now)
+	if recovery.err != nil || recovery.blockReason != "" {
+		lifecycle.canExecute = false
+		lifecycle.Fail()
+		ctx.CommandHasErrors = true
+		if recovery.err != nil {
+			h.markPersistenceFailed(ctx.Log, session, "preparing execution attempt takeover", recovery.err)
+		} else {
+			h.logError(ctx.Log, "admitting execution attempt", errors.New(recovery.blockReason))
+		}
+		h.appendAudit(ctx.Log, session, string(run.Command)+".admission_blocked", map[string]any{
+			"reason": recovery.reason(),
+		}, now)
+		return lifecycle
+	}
+	h.beginAttempt(lifecycle, session, now)
 	return lifecycle
+}
+
+type attemptRecoveryDecision struct {
+	retryRun    *runs.Run
+	recovered   *runs.RunAttempt
+	active      *runs.RunAttempt
+	unknown     *runs.RunAttempt
+	blockReason string
+	err         error
+}
+
+func (h *RunHistory) prepareAttemptRecovery(ctx *command.Context, run runs.Run, now time.Time) attemptRecoveryDecision {
+	if ctx.ExecutionInstanceID == "" {
+		return attemptRecoveryDecision{}
+	}
+	if h.executionRecovery == nil {
+		return attemptRecoveryDecision{err: errors.New("execution recovery store is required")}
+	}
+	if ctx.ExecutionDeploymentID == "" || ctx.ConcurrencyKey == "" || ctx.OwnershipClaimID == "" {
+		return attemptRecoveryDecision{err: errors.New("routed execution identity is incomplete")}
+	}
+	result, err := h.executionRecovery.PrepareAttemptTakeover(context.Background(), runs.AttemptTakeoverRequest{
+		DeploymentID: ctx.ExecutionDeploymentID, ConcurrencyKey: ctx.ConcurrencyKey, OwnershipClaimID: ctx.OwnershipClaimID,
+		HeartbeatBefore: now.Add(-h.attemptStaleAfter), RecoveredAt: now,
+		Repository: run.Repository, PullNumber: run.PullNumber, Command: run.Command,
+		Trigger: run.Trigger, Actor: run.Actor, BaseRef: run.BaseRef, HeadRef: run.HeadRef,
+		HeadSHA: run.HeadSHA,
+	})
+	decision := attemptRecoveryDecision{
+		retryRun: result.RetryRun, recovered: result.RecoveredAttempt,
+		active: result.ActiveAttempt, unknown: result.UnreconciledUnknown, err: err,
+	}
+	if err != nil {
+		return decision
+	}
+	if result.ActiveAttempt != nil {
+		decision.blockReason = "another execution attempt remains active for this pull request"
+		return decision
+	}
+	if result.UnreconciledUnknown != nil && commandMayMutateInfrastructure(run.Command) {
+		decision.blockReason = "an earlier infrastructure mutation has an unknown outcome and requires reconciliation"
+	}
+	return decision
+}
+
+func commandMayMutateInfrastructure(runCommand runs.Command) bool {
+	switch runCommand {
+	case runs.CommandApply, runs.CommandImport, runs.CommandStateRemove, runs.CommandDriftRemediation:
+		return true
+	default:
+		return false
+	}
+}
+
+func (d attemptRecoveryDecision) reason() string {
+	if d.err != nil {
+		return d.err.Error()
+	}
+	return d.blockReason
+}
+
+func (d attemptRecoveryDecision) auditMetadata() map[string]any {
+	metadata := map[string]any{}
+	if d.recovered != nil {
+		metadata["recovered_attempt_id"] = d.recovered.ID
+		metadata["recovered_attempt_status"] = d.recovered.Status
+	}
+	if d.retryRun != nil {
+		metadata["retried_run_id"] = d.retryRun.ID
+	}
+	if d.active != nil {
+		metadata["active_attempt_id"] = d.active.ID
+	}
+	if d.unknown != nil {
+		metadata["unreconciled_attempt_id"] = d.unknown.ID
+	}
+	if len(metadata) == 0 {
+		return nil
+	}
+	return metadata
 }
 
 // RunLifecycle controls one logical Run's terminal outcome.
 type RunLifecycle struct {
-	history *RunHistory
-	ctx     *command.Context
-	runID   runs.ID
-	once    sync.Once
-	mu      sync.Mutex
-	status  runs.Status
+	history              *RunHistory
+	ctx                  *command.Context
+	runID                runs.ID
+	once                 sync.Once
+	mu                   sync.Mutex
+	status               runs.Status
+	canExecute           bool
+	attemptID            runs.ID
+	attemptCancel        context.CancelFunc
+	attemptDone          chan struct{}
+	sideEffectMarker     *attemptSideEffectMarker
+	attemptUnknownReason string
+}
+
+// CanExecute reports whether HA admission state was durably persisted. Phase 1
+// observation remains fail-open; durable owner-routed execution fails closed.
+func (l *RunLifecycle) CanExecute() bool {
+	if l == nil {
+		return true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.canExecute
 }
 
 // Fail marks the logical operation failed independently of command.Context.
@@ -167,6 +325,9 @@ func (l *RunLifecycle) Finish() {
 func (l *RunLifecycle) FinishRecovering() {
 	if recovered := recover(); recovered != nil {
 		l.Fail()
+		if l.sideEffectMarker != nil && l.sideEffectMarker.Marked() {
+			l.attemptUnknownReason = "panic after infrastructure side effect started"
+		}
 		l.Finish()
 		panic(recovered)
 	}
@@ -174,6 +335,7 @@ func (l *RunLifecycle) FinishRecovering() {
 }
 
 func (h *RunHistory) finish(lifecycle *RunLifecycle) {
+	lifecycle.stopAttemptHeartbeat()
 	value, ok := h.sessions.LoadAndDelete(lifecycle.runID)
 	if !ok {
 		return
@@ -182,6 +344,7 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 	defer func() { session.finalizeComments(!session.persistenceIncomplete.Load()) }()
 	if h.outputFinalizer != nil && !h.outputFinalizer.FinishRun(lifecycle.runID) {
 		session.persistenceIncomplete.Store(true)
+		session.completionBlocked.Store(true)
 	}
 	now := h.now().UTC()
 	succeeded, failed := 0, 0
@@ -206,7 +369,7 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 		if err := writeRunHistory(func(writeCtx context.Context) error {
 			return h.writer.CompleteProjectRun(writeCtx, completion)
 		}); err != nil {
-			h.markPersistenceFailed(lifecycle.ctx.Log, session, "completing project run history", err)
+			h.blockRunCompletion(lifecycle.ctx.Log, session, "completing project run history", err)
 			return false
 		}
 		if status == runs.StatusFailed || status == runs.StatusPartial || status == runs.StatusCancelled {
@@ -216,14 +379,15 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 		}
 		return true
 	})
-	if session.persistenceIncomplete.Load() {
+	status := lifecycle.terminalStatus(succeeded, failed)
+	attemptComplete := h.completeAttempt(lifecycle, session, status, now)
+	if session.persistenceIncomplete.Load() || session.completionBlocked.Load() || !attemptComplete {
 		if lifecycle.ctx.Log != nil {
 			lifecycle.ctx.Log.Err("leaving run history incomplete after persistence error")
 		}
 		return
 	}
 
-	status := lifecycle.terminalStatus(succeeded, failed)
 	if err := writeRunHistory(func(writeCtx context.Context) error {
 		return h.writer.CompleteRun(writeCtx, runs.RunCompletion{
 			ID: lifecycle.runID, Status: status, CompletedAt: now,
@@ -237,10 +401,182 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 	}, now)
 }
 
+func (h *RunHistory) beginAttempt(lifecycle *RunLifecycle, session *runSession, now time.Time) {
+	ctx := lifecycle.ctx
+	if ctx.ExecutionInstanceID == "" {
+		return
+	}
+	block := func(action string, err error) {
+		lifecycle.mu.Lock()
+		lifecycle.canExecute = false
+		lifecycle.mu.Unlock()
+		lifecycle.Fail()
+		ctx.CommandHasErrors = true
+		h.logError(ctx.Log, action, err)
+	}
+	if h.executionWriter == nil {
+		block("admitting execution attempt", errors.New("execution attempt store is required"))
+		return
+	}
+	if ctx.ExecutionDeploymentID == "" || ctx.ConcurrencyKey == "" || ctx.OwnershipClaimID == "" {
+		block("admitting execution attempt", fmt.Errorf(
+			"routed execution identity is incomplete (deployment=%t concurrency_key=%t ownership_claim=%t)",
+			ctx.ExecutionDeploymentID != "", ctx.ConcurrencyKey != "", ctx.OwnershipClaimID != "",
+		))
+		return
+	}
+	attemptID, err := h.newID()
+	if err != nil {
+		block("generating execution attempt ID", err)
+		return
+	}
+	attempt := runs.RunAttempt{
+		ID: attemptID, RunID: lifecycle.runID, InstanceID: ctx.ExecutionInstanceID,
+		DeploymentID:   ctx.ExecutionDeploymentID,
+		ConcurrencyKey: ctx.ConcurrencyKey, OwnershipClaimID: ctx.OwnershipClaimID,
+		Status: runs.AttemptClaimed, ClaimedAt: now, HeartbeatAt: now,
+	}
+	if err := writeRunHistory(func(writeCtx context.Context) error {
+		return h.executionWriter.CreateAttempt(writeCtx, attempt)
+	}); err != nil {
+		block("creating execution attempt", err)
+		return
+	}
+	lifecycle.attemptID = attemptID
+	ctx.AttemptID = attemptID
+	if err := writeRunHistory(func(writeCtx context.Context) error {
+		return h.executionWriter.StartAttempt(writeCtx, attemptID, now)
+	}); err != nil {
+		completionErr := writeRunHistory(func(writeCtx context.Context) error {
+			return h.executionWriter.CompleteAttempt(writeCtx, runs.AttemptCompletion{
+				ID: attemptID, Status: runs.AttemptInterrupted, CompletedAt: now,
+				FailureReason: "attempt could not enter running state",
+			})
+		})
+		if completionErr != nil {
+			h.blockRunCompletion(ctx.Log, session, "interrupting unstarted execution attempt", completionErr)
+			if ctx.InvalidateOwnership != nil {
+				if invalidateErr := ctx.InvalidateOwnership(); invalidateErr != nil {
+					h.logError(ctx.Log, "invalidating ownership after attempt cleanup failure", invalidateErr)
+				}
+			}
+		}
+		block("starting execution attempt", err)
+		return
+	}
+	marker := &attemptSideEffectMarker{
+		history: h, session: session, logger: ctx.Log, attemptID: attemptID,
+	}
+	lifecycle.sideEffectMarker = marker
+	ctx.SideEffectMarker = marker
+	lifecycle.mu.Lock()
+	lifecycle.canExecute = true
+	lifecycle.mu.Unlock()
+	lifecycle.startAttemptHeartbeat()
+	h.appendAudit(ctx.Log, session, string(session.run.Command)+".attempt_started", map[string]any{
+		"attempt_id": attemptID, "instance_id": ctx.ExecutionInstanceID,
+		"ownership_claim_id": ctx.OwnershipClaimID,
+	}, now)
+}
+
+func (h *RunHistory) completeAttempt(lifecycle *RunLifecycle, session *runSession, runStatus runs.Status, completedAt time.Time) bool {
+	if lifecycle.attemptID == "" || h.executionWriter == nil {
+		return true
+	}
+	status := runs.AttemptSucceeded
+	reason := ""
+	if lifecycle.attemptUnknownReason != "" {
+		status = runs.AttemptUnknown
+		reason = lifecycle.attemptUnknownReason
+	} else if runStatus != runs.StatusSucceeded && runStatus != runs.StatusSkipped {
+		status = runs.AttemptFailed
+		reason = "logical run completed with status " + string(runStatus)
+	}
+	if err := writeRunHistory(func(writeCtx context.Context) error {
+		return h.executionWriter.CompleteAttempt(writeCtx, runs.AttemptCompletion{
+			ID: lifecycle.attemptID, Status: status, CompletedAt: completedAt,
+			FailureReason: reason,
+		})
+	}); err != nil {
+		h.blockRunCompletion(lifecycle.ctx.Log, session, "completing execution attempt", err)
+		return false
+	}
+	return true
+}
+
+func (l *RunLifecycle) startAttemptHeartbeat() {
+	if l == nil || l.history == nil || l.attemptID == "" || l.history.executionWriter == nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	l.attemptCancel = cancel
+	l.attemptDone = make(chan struct{})
+	go func() {
+		defer close(l.attemptDone)
+		ticker := time.NewTicker(l.history.attemptHeartbeat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				err := writeRunHistory(func(writeCtx context.Context) error {
+					return l.history.executionWriter.HeartbeatAttempt(writeCtx, l.attemptID, l.history.now().UTC())
+				})
+				if err != nil {
+					if value, ok := l.history.sessions.Load(l.runID); ok {
+						l.history.markPersistenceFailed(l.ctx.Log, value.(*runSession), "heartbeating execution attempt", err)
+					}
+				}
+			}
+		}
+	}()
+}
+
+func (l *RunLifecycle) stopAttemptHeartbeat() {
+	if l == nil || l.attemptCancel == nil {
+		return
+	}
+	l.attemptCancel()
+	<-l.attemptDone
+}
+
+type attemptSideEffectMarker struct {
+	history   *RunHistory
+	session   *runSession
+	logger    logging.SimpleLogging
+	attemptID runs.ID
+	once      sync.Once
+	err       error
+	marked    atomic.Bool
+}
+
+func (m *attemptSideEffectMarker) MarkSideEffectStarted(context.Context) error {
+	m.once.Do(func() {
+		startedAt := m.history.now().UTC()
+		m.err = writeRunHistory(func(writeCtx context.Context) error {
+			return m.history.executionWriter.MarkAttemptSideEffectStarted(writeCtx, m.attemptID, startedAt)
+		})
+		if m.err != nil {
+			m.history.markPersistenceFailed(m.logger, m.session, "marking execution side effect", m.err)
+			return
+		}
+		m.marked.Store(true)
+	})
+	return m.err
+}
+
+func (m *attemptSideEffectMarker) Marked() bool {
+	return m != nil && m.marked.Load()
+}
+
 func (l *RunLifecycle) terminalStatus(succeeded, failed int) runs.Status {
 	l.mu.Lock()
 	forced := l.status
 	l.mu.Unlock()
+	if l.attemptUnknownReason != "" {
+		return runs.StatusUnknown
+	}
 	if forced != "" {
 		return forced
 	}
@@ -271,6 +607,7 @@ type runSession struct {
 	run                   runs.Run
 	projects              sync.Map
 	persistenceIncomplete atomic.Bool
+	completionBlocked     atomic.Bool
 	commentMu             sync.Mutex
 	comments              []func(bool)
 	commentsFinalized     bool
@@ -331,7 +668,7 @@ func (h *RunHistory) beginProject(ctx command.ProjectContext) command.ProjectCon
 	identity := projectIdentity{name: ctx.ProjectName, directory: ctx.RepoRelDir, workspace: ctx.Workspace}
 	candidateID, err := h.newID()
 	if err != nil {
-		h.markPersistenceFailed(ctx.Log, session, "generating project run history ID", err)
+		h.blockRunCompletion(ctx.Log, session, "generating project run history ID", err)
 		return ctx
 	}
 	candidate := &projectObservation{
@@ -347,14 +684,21 @@ func (h *RunHistory) beginProject(ctx command.ProjectContext) command.ProjectCon
 	now := h.now().UTC()
 	if err := writeRunHistory(func(writeCtx context.Context) error {
 		return h.writer.CreateProjectRun(writeCtx, runs.ProjectRun{
-			ID: project.id, RunID: ctx.RunID, ProjectName: ctx.ProjectName,
+			ID: project.id, RunID: ctx.RunID, AttemptID: idPointer(ctx.AttemptID), ProjectName: ctx.ProjectName,
 			Directory: ctx.RepoRelDir, Workspace: ctx.Workspace,
 			Status: runs.StatusRunning, StartedAt: &now,
 		})
 	}); err != nil {
-		h.markPersistenceFailed(ctx.Log, session, "creating project run history", err)
+		h.blockRunCompletion(ctx.Log, session, "creating project run history", err)
 	}
 	return ctx
+}
+
+func idPointer(id runs.ID) *runs.ID {
+	if id == "" {
+		return nil
+	}
+	return &id
 }
 
 func (h *RunHistory) recordProject(ctx command.ProjectContext, phase command.Name, output command.ProjectCommandOutput) {
@@ -420,7 +764,7 @@ func (h *RunHistory) recordProject(ctx command.ProjectContext, phase command.Nam
 		if err := writeRunHistory(func(writeCtx context.Context) error {
 			return h.writer.AppendOutput(writeCtx, batch)
 		}); err != nil {
-			h.markPersistenceFailed(ctx.Log, session, "persisting suppressed project output", err)
+			h.blockRunCompletion(ctx.Log, session, "persisting suppressed project output", err)
 			return
 		}
 		chunks = chunks[batchSize:]
@@ -491,27 +835,45 @@ func (p *projectObservation) resultOutputChunks(output command.ProjectCommandOut
 	return chunks
 }
 
-// RecordPlanArtifact associates opaque S3 plan metadata with its Project Run.
-func (h *RunHistory) RecordPlanArtifact(ctx command.ProjectContext, artifact runs.ArtifactReference) {
+// RecordPlanArtifact durably associates an expected S3 object with its Project
+// Run before upload, closing the process-loss window after S3 accepts it.
+func (h *RunHistory) RecordPlanArtifact(ctx command.ProjectContext, artifact runs.ArtifactReference) error {
 	if h == nil || artifact.Key == "" {
-		return
+		return errors.New("run history plan artifact context is incomplete")
 	}
 	value, ok := h.sessions.Load(ctx.RunID)
 	if !ok {
-		return
+		return errors.New("plan artifact has no active plan Run")
 	}
-	commandName := value.(*runSession).run.Command
-	if commandName != runs.CommandPlan && commandName != runs.CommandDriftDetection {
-		return
+	runCommand := value.(*runSession).run.Command
+	if runCommand != runs.CommandPlan && runCommand != runs.CommandApply &&
+		runCommand != runs.CommandDriftDetection && runCommand != runs.CommandDriftRemediation {
+		return errors.New("plan artifact has no active plan-capable Run")
 	}
 	project := h.project(ctx)
 	if project == nil {
-		return
+		return errors.New("plan artifact has no active ProjectRun")
+	}
+	if h.planArtifacts == nil {
+		return errors.New("durable plan artifact store is required")
+	}
+	update := runs.ProjectPlanArtifactUpdate{
+		ProjectRunID: ctx.ProjectRunID, Artifact: artifact,
+		Identity: runs.PlanArtifactIdentity{
+			RepoConfigVersion: ctx.RepoConfigVersion, WorkflowChecksum: ctx.WorkflowIdentity,
+		},
+	}
+	if err := writeRunHistory(func(writeCtx context.Context) error {
+		return h.planArtifacts.RecordProjectPlanArtifact(writeCtx, update)
+	}); err != nil {
+		h.markPersistenceFailed(ctx.Log, value.(*runSession), "recording plan artifact expectation", err)
+		return err
 	}
 	artifactCopy := artifact
 	project.mu.Lock()
 	project.artifact = &artifactCopy
 	project.mu.Unlock()
+	return nil
 }
 
 func (h *RunHistory) project(ctx command.ProjectContext) *projectObservation {
@@ -574,6 +936,11 @@ func (h *RunHistory) markPersistenceFailed(log logging.SimpleLogging, session *r
 	h.logError(log, action, err)
 }
 
+func (h *RunHistory) blockRunCompletion(log logging.SimpleLogging, session *runSession, action string, err error) {
+	session.completionBlocked.Store(true)
+	h.markPersistenceFailed(log, session, action, err)
+}
+
 func (h *RunHistory) logError(log logging.SimpleLogging, action string, err error) {
 	if log == nil {
 		log = h.logger
@@ -628,24 +995,90 @@ func errorSummary(output command.ProjectCommandOutput) string {
 	return summary[:cut]
 }
 
+// RunAdmissionFailureReporter tells the requester that fail-closed HA
+// admission prevented execution from starting.
+type RunAdmissionFailureReporter interface {
+	ReportRunAdmissionFailure(ctx *command.Context, commandName command.Name)
+}
+
+// NewVCSRunAdmissionFailureReporter reports durable-admission failures through
+// the same VCS surfaces used by normal command failures.
+func NewVCSRunAdmissionFailureReporter(client vcs.Client, statuses CommitStatusUpdater) RunAdmissionFailureReporter {
+	return &vcsRunAdmissionFailureReporter{client: client, statuses: statuses}
+}
+
+type vcsRunAdmissionFailureReporter struct {
+	client   vcs.Client
+	statuses CommitStatusUpdater
+}
+
+func (r *vcsRunAdmissionFailureReporter) ReportRunAdmissionFailure(ctx *command.Context, commandName command.Name) {
+	if ctx == nil {
+		return
+	}
+	if !ctx.SuppressVCSStatus && r.statuses != nil && (commandName == command.Plan || commandName == command.Apply) {
+		if err := r.statuses.UpdateCombined(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.FailedCommitStatus, commandName); err != nil {
+			ctx.Log.Warn("unable to update status after durable execution admission failure: %s", err)
+		}
+	}
+	if r.client == nil || ctx.Pull.Num <= 0 {
+		return
+	}
+	message := fmt.Sprintf("**Atlantis %s did not start**\n\nAtlantis could not durably record execution ownership. No command was run. Check the Atlantis server logs before retrying.", commandName.String())
+	if err := r.client.CreateComment(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull.Num, message, commandName.String()); err != nil {
+		ctx.Log.Warn("unable to comment after durable execution admission failure: %s", err)
+	}
+}
+
 // NewRunHistoryCommandRunner decorates one accepted logical comment command.
-func NewRunHistoryCommandRunner(history *RunHistory, runner CommentCommandRunner, runCommand runs.Command) CommentCommandRunner {
+func NewRunHistoryCommandRunner(history *RunHistory, runner CommentCommandRunner, runCommand runs.Command, reporters ...RunAdmissionFailureReporter) CommentCommandRunner {
 	if history == nil {
 		return runner
 	}
-	return &runHistoryCommandRunner{history: history, runner: runner, runCommand: runCommand}
+	var reporter RunAdmissionFailureReporter
+	if len(reporters) > 0 {
+		reporter = reporters[0]
+	}
+	return &runHistoryCommandRunner{history: history, runner: runner, runCommand: runCommand, admissionFailureReporter: reporter}
 }
 
 type runHistoryCommandRunner struct {
-	history    *RunHistory
-	runner     CommentCommandRunner
-	runCommand runs.Command
+	history                  *RunHistory
+	runner                   CommentCommandRunner
+	runCommand               runs.Command
+	admissionFailureReporter RunAdmissionFailureReporter
 }
 
 func (r *runHistoryCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
 	lifecycle := r.history.Begin(ctx, r.runCommand, historyTrigger(ctx))
 	defer lifecycle.FinishRecovering()
+	if !lifecycle.CanExecute() {
+		if r.admissionFailureReporter != nil {
+			r.admissionFailureReporter.ReportRunAdmissionFailure(ctx, historyCommandName(r.runCommand, cmd))
+		}
+		return
+	}
 	r.runner.Run(ctx, cmd)
+}
+
+func historyCommandName(runCommand runs.Command, cmd *CommentCommand) command.Name {
+	if cmd != nil {
+		return cmd.CommandName()
+	}
+	switch runCommand {
+	case runs.CommandPlan:
+		return command.Plan
+	case runs.CommandApply:
+		return command.Apply
+	case runs.CommandImport:
+		return command.Import
+	case runs.CommandStateRemove:
+		return command.State
+	case runs.CommandUnlock:
+		return command.Unlock
+	default:
+		return command.Plan
+	}
 }
 
 func (r *runHistoryCommandRunner) ShouldSkipPreWorkflowHooks(ctx *command.Context, cmd *CommentCommand) bool {

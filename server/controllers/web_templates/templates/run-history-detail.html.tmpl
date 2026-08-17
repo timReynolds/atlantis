@@ -25,6 +25,7 @@
     <div><strong>{{ .Summary.Unchanged }}</strong><span>Unchanged</span></div>
     <div><strong>{{ .Summary.Failed }}</strong><span>Failed</span></div>
     <div><strong>{{ .Summary.Partial }}</strong><span>Partial</span></div>
+	<div><strong>{{ .Summary.Unknown }}</strong><span>Unknown</span></div>
     <div><strong>{{ add .Summary.Pending .Summary.Running }}</strong><span>Waiting / running</span></div>
   </section>
 
@@ -39,6 +40,25 @@
   {{ if .Run.PullURL }}<p><a class="button" href="{{ .Run.PullURL }}" rel="noreferrer">Open originating pull request</a></p>{{ end }}
   {{ if .Run.RawMetadata }}<details><summary>Run metadata</summary><pre class="history-metadata">{{ .Run.RawMetadata }}</pre></details>{{ end }}
 
+  <section class="history-section" id="attempts">
+    <div class="history-section-title"><h4>Execution attempts</h4><span>{{ len .Attempts }} shown</span></div>
+    {{ if .Attempts }}
+    <div class="history-table-wrap"><table class="u-full-width history-table history-attempt-table">
+      <thead><tr><th>Attempt</th><th>Replica</th><th>Lifecycle</th><th>Mutation boundary</th><th>Outcome</th></tr></thead>
+      <tbody>{{ $basePath := .CleanedBasePath }}{{ range .Attempts }}
+        <tr>
+          <td><code class="history-id" title="{{ .ID }}">{{ .ID }}</code><br><span class="history-status history-status-{{ .Status }}">{{ .Status }}</span></td>
+          <td><strong>{{ .ReplicaID }}</strong><br><span class="history-muted">deployment {{ .DeploymentID }}</span><details><summary>Process identity</summary><dl class="history-attempt-facts"><dt>Instance</dt><dd><code>{{ .InstanceID }}</code></dd>{{ if .Version }}<dt>Version</dt><dd>{{ .Version }}</dd>{{ end }}{{ if .Commit }}<dt>Commit</dt><dd><code>{{ .Commit }}</code></dd>{{ end }}{{ if .AdvertiseURL }}<dt>Address</dt><dd><code>{{ .AdvertiseURL }}</code></dd>{{ end }}<dt>Ownership claim</dt><dd><code>{{ .OwnershipClaimID }}</code></dd></dl></details></td>
+          <td><span>Claimed {{ .ClaimedAt }}</span>{{ if .StartedAt }}<br><span>Started {{ .StartedAt }}</span>{{ end }}<br><span>Last heartbeat {{ .HeartbeatAt }}</span>{{ if .CompletedAt }}<br><span>Completed {{ .CompletedAt }}</span>{{ end }}</td>
+          <td>{{ if .SideEffectStartedAt }}<strong class="history-warning">Infrastructure mutation started</strong><br>{{ .SideEffectStartedAt }}{{ else }}<span class="history-muted">No mutation recorded</span>{{ end }}</td>
+          <td>{{ if .FailureReason }}<span class="history-error">{{ .FailureReason }}</span>{{ end }}{{ if .ReconciledAt }}<div class="history-reconciled"><strong>Reconciled by {{ .ReconciledBy }}</strong><br>{{ .ReconciledAt }}<p>{{ .ReconciliationSummary }}</p></div>{{ end }}{{ if .CanReconcile }}<div class="history-alert"><strong>Manual reconciliation required</strong><p>Inspect the recorded output and Terraform state, then generate a fresh plan before deciding whether another apply is safe.</p><form class="history-reconcile-form" method="post" action="{{ $basePath }}{{ .ReconcilePath }}"><input type="hidden" name="csrf_token" value="{{ .CSRFToken }}"><label>Operator findings<textarea name="summary" maxlength="4096" required placeholder="State inspected; fresh plan generated; outcome confirmed…"></textarea></label><button class="button-primary" type="submit">Mark reconciled</button></form></div>{{ end }}</td>
+        </tr>
+      {{ end }}</tbody>
+    </table></div>
+    {{ else }}<div class="history-empty">This run predates durable HA attempt tracking.</div>{{ end }}
+	{{ if .AttemptNextPath }}<a class="button history-next" href="{{ .CleanedBasePath }}{{ .AttemptNextPath }}#attempts">Next 100 attempts</a>{{ end }}
+  </section>
+
   <section class="history-section">
     <div class="history-section-title"><h4>Projects</h4><span>{{ .Summary.Total }} total</span></div>
     <form class="history-filter history-filter-project" method="get">
@@ -50,11 +70,11 @@
     </form>
     {{ if .Projects }}
     <div class="history-table-wrap"><table class="u-full-width history-table">
-      <thead><tr><th>Project</th><th>Directory</th><th>Workspace</th><th>Changes</th><th>Status</th><th>Completed</th></tr></thead>
+      <thead><tr><th>Project</th><th>Attempt</th><th>Directory</th><th>Workspace</th><th>Changes</th><th>Status</th><th>Completed</th></tr></thead>
       <tbody>{{ $basePath := .CleanedBasePath }}{{ range .Projects }}
         <tr>
           <td><a href="{{ $basePath }}{{ .DetailPath }}">{{ if .ProjectName }}{{ .ProjectName }}{{ else }}unnamed{{ end }}</a>{{ if .ErrorSummary }}<br><span class="history-error">{{ .ErrorSummary }}</span>{{ end }}</td>
-          <td><code>{{ .Directory }}</code></td><td><code>{{ .Workspace }}</code></td>
+          <td>{{ if .AttemptID }}<code class="history-id" title="{{ .AttemptID }}">{{ .AttemptID }}</code>{{ else }}<span class="history-muted">legacy</span>{{ end }}</td><td><code>{{ .Directory }}</code></td><td><code>{{ .Workspace }}</code></td>
           <td><span class="history-change-add">+{{ .Additions }}</span> <span class="history-change-update">~{{ .Changes }}</span> <span class="history-change-destroy">-{{ .Destructions }}</span>{{ if .Imports }} <span>↳{{ .Imports }}</span>{{ end }}{{ if .Forgets }} <span>forget {{ .Forgets }}</span>{{ end }}</td>
           <td><span class="history-status history-status-{{ .Status }}">{{ .Status }}</span></td><td class="history-nowrap">{{ .CompletedAt }}</td>
         </tr>

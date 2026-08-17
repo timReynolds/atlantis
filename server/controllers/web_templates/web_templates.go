@@ -156,6 +156,7 @@ type RunHistoryRun struct {
 // RunHistoryProject is the presentation model for one project execution.
 type RunHistoryProject struct {
 	ID                string
+	AttemptID         string
 	ProjectName       string
 	Directory         string
 	Workspace         string
@@ -174,6 +175,31 @@ type RunHistoryProject struct {
 	ArtifactExpiresAt string
 	DetailPath        string
 	RawMetadata       string
+}
+
+// RunHistoryAttempt is one durable process attempt and its replica identity.
+type RunHistoryAttempt struct {
+	ID                    string
+	Status                string
+	InstanceID            string
+	ReplicaID             string
+	DeploymentID          string
+	AdvertiseURL          string
+	Version               string
+	Commit                string
+	OwnershipClaimID      string
+	ClaimedAt             string
+	StartedAt             string
+	HeartbeatAt           string
+	SideEffectStartedAt   string
+	CompletedAt           string
+	FailureReason         string
+	ReconciledAt          string
+	ReconciledBy          string
+	ReconciliationSummary string
+	CanReconcile          bool
+	ReconcilePath         string
+	CSRFToken             string
 }
 
 // RunHistoryFilter preserves run-list filter inputs in the server-rendered UI.
@@ -212,6 +238,8 @@ type RunHistoryDetailData struct {
 	CleanedBasePath string
 	Run             RunHistoryRun
 	Summary         runs.ProjectRunSummary
+	Attempts        []RunHistoryAttempt
+	AttemptNextPath string
 	Projects        []RunHistoryProject
 	Filter          RunHistoryProjectFilter
 	NextPath        string

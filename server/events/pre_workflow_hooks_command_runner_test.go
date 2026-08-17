@@ -152,9 +152,13 @@ func TestRunPreHooks_Clone(t *testing.T) {
 		When(whPreWorkflowHookRunner.Run(Any[models.WorkflowHookCommandContext](), Eq(testHook.RunCommand),
 			Any[string](), Any[string](), Eq(repoDir))).ThenReturn(result, runtimeDesc, nil)
 
-		err := preWh.RunPreHooks(ctx, planCmd)
+		marker := &countingSideEffectMarker{}
+		hookCtx := *ctx
+		hookCtx.SideEffectMarker = marker
+		err := preWh.RunPreHooks(&hookCtx, planCmd)
 
 		Ok(t, err)
+		Equals(t, 1, marker.calls)
 		whPreWorkflowHookRunner.VerifyWasCalledOnce().Run(Any[models.WorkflowHookCommandContext](),
 			Eq(testHook.RunCommand), Eq(defaultShell), Eq(defaultShellArgs), Eq(repoDir))
 		Assert(t, *unlockCalled == true, "unlock function called")

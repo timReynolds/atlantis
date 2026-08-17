@@ -231,6 +231,9 @@ func (a *ApplyCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
 
 	preApplyPullStatus := ctx.PullStatus
 	result := runProjectCmdsWithCancellationTracker(ctx, projectCmds, a.cancellationTracker, a.parallelPoolSize, a.isParallelEnabled(projectCmds), a.prjCmdRunner.Apply)
+	if commandSuperseded(ctx, result) {
+		return
+	}
 	finalLivePull, err := a.refreshLivePullIdentity(ctx)
 	if err != nil {
 		ctx.Log.Err("fetching live pull request after apply: %s", err)

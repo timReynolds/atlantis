@@ -27,3 +27,14 @@ func (c Result) HasErrors() bool {
 	}
 	return false
 }
+
+// LostOwnership reports whether this command generation was rejected by its
+// distributed execution fence.
+func (c Result) LostOwnership() bool {
+	for _, result := range c.ProjectResults {
+		if result.OwnershipLost {
+			return true
+		}
+	}
+	return false
+}

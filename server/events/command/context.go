@@ -4,11 +4,25 @@
 package command
 
 import (
+	"context"
+
 	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/logging"
 	tally "github.com/uber-go/tally/v4"
 )
+
+// ExecutionLease fences the start of routed command work against its current
+// distributed ownership claim.
+type ExecutionLease interface {
+	Admit(context.Context) error
+}
+
+// RoutingContext carries owner-local execution state through command runners.
+type RoutingContext struct {
+	Lease                ExecutionLease
+	RecoverExternalPlans bool
+}
 
 // Trigger represents the how the command was triggered
 type Trigger int
@@ -122,8 +136,18 @@ type Context struct {
 	// project outcomes that do not pass through ProjectCommandRunner.
 	ObserveProjectResult func(ProjectContext, Name, ProjectCommandOutput)
 
+	// Set true when distributed ownership changed while this command was
+	// queued or executing. Superseded generations must not publish results.
+	CommandSuperseded bool
+
 	// PreferLocalRepoCfgForTargetedIgnore makes targeted ignore checks read a
 	// cloned repo config before falling back to VCS content. This is used after
 	// pre-workflow hooks may have generated or updated atlantis.yaml.
 	PreferLocalRepoCfgForTargetedIgnore bool
+
+	// ExecutionLease is present only for commands accepted through replica routing.
+	ExecutionLease ExecutionLease
+
+	// RecoverExternalPlans marks a newly prepared local ownership generation.
+	RecoverExternalPlans bool
 }

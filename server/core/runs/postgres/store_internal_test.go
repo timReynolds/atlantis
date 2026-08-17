@@ -20,6 +20,8 @@ import (
 const (
 	testRunID        = runs.ID("0198a0df-85f1-7d83-a60b-2e57b725c62a")
 	testProjectRunID = runs.ID("0198a0df-85f1-7d83-a60b-2e57b725c62b")
+	testAttemptID    = runs.ID("0198a0df-85f1-7d83-a60b-2e57b725c62c")
+	testInstanceID   = runs.ID("0198a0df-85f1-7d83-a60b-2e57b725c62d")
 )
 
 var testTime = time.Date(2026, 8, 16, 10, 0, 0, 123456000, time.UTC)
@@ -30,6 +32,68 @@ func TestLoadMigrations(t *testing.T) {
 	require.NotEmpty(t, migrations)
 	require.Equal(t, int64(1), migrations[0].version)
 	require.Contains(t, migrations[0].sql, "CREATE TABLE run_output_chunks")
+	require.Equal(t, int64(4), migrations[len(migrations)-1].version)
+	require.Contains(t, migrations[len(migrations)-1].sql, "CREATE TABLE run_attempts")
+	require.Contains(t, migrations[len(migrations)-1].sql, "run_attempts_one_active_concurrency_key_idx")
+	require.Contains(t, migrations[len(migrations)-1].sql, "ON run_attempts (deployment_id, concurrency_key)")
+	require.Contains(t, migrations[len(migrations)-1].sql, "status = 'unknown' AND reconciled_at IS NULL")
+}
+
+func TestRegisterExecutionInstance(t *testing.T) {
+	store, mock := newMockStore(t)
+	instance := runs.ExecutionInstance{
+		ID: testInstanceID, ReplicaID: "atlantis-0", DeploymentID: "prod-eu",
+		AdvertiseURL: "http://atlantis-0.atlantis:4141", StartedAt: testTime,
+		HeartbeatAt: testTime, Version: "1.0.0", Commit: "abc123",
+		Metadata: runs.Metadata(`{"zone":"eu-west-2a"}`),
+	}
+	mock.ExpectExec("INSERT INTO execution_instances").
+		WithArgs(
+			instance.ID, instance.ReplicaID, instance.DeploymentID, instance.AdvertiseURL,
+			instance.StartedAt, instance.HeartbeatAt, nil, instance.Version, instance.Commit,
+			[]byte(`{"zone":"eu-west-2a"}`),
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	require.NoError(t, store.RegisterInstance(context.Background(), instance))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestCreateAttemptMapsActiveConcurrencyConflict(t *testing.T) {
+	store, mock := newMockStore(t)
+	attempt := claimedAttempt()
+	mock.ExpectExec("INSERT INTO run_attempts").
+		WithArgs(
+			attempt.ID, attempt.RunID, attempt.InstanceID, attempt.DeploymentID, attempt.ConcurrencyKey,
+			attempt.OwnershipClaimID, attempt.Status, attempt.ClaimedAt, nil,
+			attempt.HeartbeatAt, nil, nil, attempt.FailureReason, nil,
+			attempt.ReconciledBy, attempt.ReconciliationSummary, []byte(`{}`),
+		).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery("SELECT .* FROM run_attempts WHERE id = \\$1").
+		WithArgs(testAttemptID).WillReturnError(sql.ErrNoRows)
+
+	err := store.CreateAttempt(context.Background(), attempt)
+	require.ErrorIs(t, err, runs.ErrConflict)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestCompleteAttemptUnknownRequiresRecordedSideEffect(t *testing.T) {
+	store, mock := newMockStore(t)
+	completedAt := testTime.Add(time.Minute)
+	mock.ExpectExec("UPDATE run_attempts").
+		WithArgs(
+			testAttemptID, runs.AttemptUnknown, completedAt, "worker heartbeat lost",
+			runs.AttemptSucceeded, runs.AttemptFailed, runs.AttemptRunning,
+			runs.AttemptInterrupted, runs.AttemptClaimed, runs.AttemptUnknown,
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	require.NoError(t, store.CompleteAttempt(context.Background(), runs.AttemptCompletion{
+		ID: testAttemptID, Status: runs.AttemptUnknown, CompletedAt: completedAt,
+		FailureReason: "worker heartbeat lost",
+	}))
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestCreateRun(t *testing.T) {
@@ -138,16 +202,16 @@ func TestApplyRetentionKeepsCutoffsIndependent(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta("WHERE drift_status.identity_hash = retained_drift.identity_hash\n          AND drift_status.last_checked < $1")).
 		WithArgs(driftBefore, retentionBatchSize).WillReturnResult(sqlmock.NewResult(0, 6))
 	runArgs := []driver.Value{runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, retentionBatchSize}
-	mock.ExpectExec("WITH retained_output AS").
+	mock.ExpectExec("(?s)WITH retained_output AS.*run_attempts.*status IN \\('claimed', 'running'\\).*reconciled_at IS NULL").
 		WithArgs(runArgs...).WillReturnResult(sqlmock.NewResult(0, 8))
-	mock.ExpectExec("WITH retained_projects AS").
+	mock.ExpectExec("(?s)WITH retained_projects AS.*run_attempts.*status IN \\('claimed', 'running'\\).*reconciled_at IS NULL").
 		WithArgs(runArgs...).WillReturnResult(sqlmock.NewResult(0, 5))
-	mock.ExpectExec("WITH retained_events AS").
+	mock.ExpectExec("(?s)WITH retained_events AS.*run_attempts.*status IN \\('claimed', 'running'\\).*reconciled_at IS NULL").
 		WithArgs(runArgs...).WillReturnResult(sqlmock.NewResult(0, 2))
-	mock.ExpectExec("WITH retained_runs AS").
+	mock.ExpectExec("(?s)WITH retained_runs AS.*run_attempts.*status IN \\('claimed', 'running'\\).*reconciled_at IS NULL").
 		WithArgs(runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, retentionBatchSize).
 		WillReturnResult(sqlmock.NewResult(0, retentionBatchSize))
-	mock.ExpectExec("WITH retained_runs AS").
+	mock.ExpectExec("(?s)WITH retained_runs AS.*run_attempts.*status IN \\('claimed', 'running'\\).*reconciled_at IS NULL").
 		WithArgs(runBefore, runs.StatusSucceeded, runs.StatusFailed, runs.StatusPartial, runs.StatusCancelled, runs.StatusSkipped, retentionBatchSize).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -221,5 +285,14 @@ func pendingRun() runs.Run {
 		BaseRef: "main", HeadRef: "feature", HeadSHA: "abc123",
 		Status: runs.StatusPending, CreatedAt: testTime,
 		Metadata: runs.Metadata(`{"team":"platform","environment":"prod"}`),
+	}
+}
+
+func claimedAttempt() runs.RunAttempt {
+	return runs.RunAttempt{
+		ID: testAttemptID, RunID: testRunID, InstanceID: testInstanceID,
+		DeploymentID:   "prod-eu",
+		ConcurrencyKey: "sha256:pull-ownership-key", OwnershipClaimID: "claim-1",
+		Status: runs.AttemptClaimed, ClaimedAt: testTime, HeartbeatAt: testTime,
 	}
 }

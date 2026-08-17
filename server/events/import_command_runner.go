@@ -76,6 +76,9 @@ func (v *ImportCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
 	} else {
 		result = runProjectCmds(projectCmds, v.prjCmdRunner.Import)
 	}
+	if commandSuperseded(ctx, result) {
+		return
+	}
 	if err := v.dbUpdater.updateDBForDiscardedPlans(ctx, ctx.Pull, result.ProjectResults); err != nil {
 		result.Error = fmt.Errorf("writing discarded plan status: %w", err)
 		ctx.CommandHasErrors = true

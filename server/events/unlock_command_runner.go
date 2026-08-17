@@ -48,6 +48,7 @@ func (u *UnlockCommandRunner) Run(ctx *command.Context, _ *CommentCommand) {
 		labels, err = u.vcsClient.GetPullLabels(ctx.Log, baseRepo, ctx.Pull)
 		if err != nil {
 			vcsMessage = "Failed to retrieve PR labels... Not unlocking"
+			ctx.CommandHasErrors = true
 			ctx.Log.Err("Failed to retrieve PR labels for pull %s", err.Error())
 		}
 		hasLabel = slices.Contains(labels, disableUnlockLabel)
@@ -62,6 +63,7 @@ func (u *UnlockCommandRunner) Run(ctx *command.Context, _ *CommentCommand) {
 		numLocks, err = u.deleteLockCommand.DeleteLocksByPull(ctx.Log, baseRepo.FullName, pullNum)
 		if err != nil {
 			vcsMessage = "Failed to delete PR locks"
+			ctx.CommandHasErrors = true
 			ctx.Log.Err("failed to delete locks by pull %s", err.Error())
 		}
 	}
@@ -75,6 +77,7 @@ func (u *UnlockCommandRunner) Run(ctx *command.Context, _ *CommentCommand) {
 	}
 
 	if commentErr := u.vcsClient.CreateComment(ctx.Log, baseRepo, pullNum, vcsMessage, command.Unlock.String()); commentErr != nil {
+		ctx.CommandHasErrors = true
 		ctx.Log.Err("unable to comment: %s", commentErr)
 	}
 }

@@ -19,6 +19,7 @@ type ProjectResult struct {
 // ProjectCommandOutput is the output of a plan/policy_check/apply for a specific project.
 type ProjectCommandOutput struct {
 	Error              error
+	Cancelled          bool `json:"-"`
 	Failure            string
 	PlanSuccess        *models.PlanSuccess
 	PolicyCheckResults *models.PolicyCheckResults

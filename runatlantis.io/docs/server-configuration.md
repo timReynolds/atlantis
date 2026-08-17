@@ -1459,6 +1459,42 @@ Stable identifier shared by every replica in one durable HA deployment. Setting 
 
 Durable HA also requires `--run-store-type=postgres`, `--enable-external-stores`, and an S3 `external_stores.plan_store`. Atlantis records a new process-lifetime `instance_id` at startup and persists replica, deployment, version, commit, heartbeat, and graceful-stop information. The `instance_id` is operational history and never changes a logical run ID.
 
+### `--replica-deployment-id`
+
+```bash
+atlantis server --replica-deployment-id="prod-eu"
+# or
+ATLANTIS_REPLICA_DEPLOYMENT_ID=prod-eu
+```
+
+Stable identifier shared by every replica in one durable HA deployment. Setting it enables durable process identity and namespaces Redis ownership keys so independent Atlantis deployments can share Redis without claiming each other's pull requests.
+
+Durable HA also requires `--run-store-type=postgres`, `--enable-external-stores`, and an S3 `external_stores.plan_store`. Atlantis records a new process-lifetime `instance_id` at startup and persists replica, deployment, version, commit, heartbeat, and graceful-stop information. The `instance_id` is operational history and never changes a logical run ID.
+
+### `--replica-deployment-id`
+
+```bash
+atlantis server --replica-deployment-id="prod-eu"
+# or
+ATLANTIS_REPLICA_DEPLOYMENT_ID=prod-eu
+```
+
+Stable identifier shared by every replica in one durable HA deployment. Setting it enables durable process identity and namespaces Redis ownership keys so independent Atlantis deployments can share Redis without claiming each other's pull requests.
+
+Durable HA also requires `--run-store-type=postgres`, `--enable-external-stores`, and an S3 `external_stores.plan_store`. Atlantis records a new process-lifetime `instance_id` at startup and persists replica, deployment, version, commit, heartbeat, and graceful-stop information. The `instance_id` is operational history and never changes a logical run ID.
+
+### `--replica-deployment-id`
+
+```bash
+atlantis server --replica-deployment-id="prod-eu"
+# or
+ATLANTIS_REPLICA_DEPLOYMENT_ID=prod-eu
+```
+
+Stable identifier shared by every replica in one durable HA deployment. Setting it enables durable process identity and namespaces Redis ownership keys so independent Atlantis deployments can share Redis without claiming each other's pull requests.
+
+Durable HA also requires `--run-store-type=postgres`, `--enable-external-stores`, and an S3 `external_stores.plan_store`. Atlantis records a new process-lifetime `instance_id` at startup and persists replica, deployment, version, commit, heartbeat, and graceful-stop information. The `instance_id` is operational history and never changes a logical run ID.
+
 ### `--replica-id`
 
 ```bash
@@ -1653,6 +1689,16 @@ Selects the durable run history store. Valid values are `noop` and `postgres`; t
 When `postgres` is selected, Atlantis registers read-only history pages at `/runs`, repository and pull-request scoped routes under `/repos`, project output pages under `/runs/{run-id}`, and `/audit`. Repository routes preserve provider namespaces such as `group/subgroup/repo`. With drift detection enabled it also registers `/drift`, `/drift/detections/{id}`, and `/drift/remediations/{id}`. The drift view surfaces current drift, failed or locked checks, checks with no success in the last 24 hours, resolved commits, plan summaries, and remediation attempts. Because Terraform output can contain secrets, these routes are available only when [`--web-basic-auth`](#--web-basic-auth) is enabled. They return `404 Not Found` when web authentication is disabled, and Atlantis rejects the publicly known default web credentials when history and web authentication are both enabled.
 
 With both PostgreSQL history and web Basic Auth enabled, non-verbose commands returning at least 50 project results produce one concise VCS summary with a link to the authenticated Run page. Existing comment-suppression options are honored first. Smaller runs and explicit verbose commands keep the standard Atlantis comment rendering. Successful `import` and `state rm` results also retain the standard renderer at every size so their destructive-command output and operator guidance are not hidden; their comments are therefore not bounded by this threshold.
+
+### `--shutdown-grace-period-seconds`
+
+```bash
+atlantis server --shutdown-grace-period-seconds=540
+# or
+ATLANTIS_SHUTDOWN_GRACE_PERIOD_SECONDS=540
+```
+
+Maximum time Atlantis allows accepted executable work to drain after SIGTERM. The default is `5` seconds. Configure this below the platform termination grace period so Atlantis retains time to persist final attempt and process state and stop Redis lease renewal. If work exceeds the deadline, an incomplete plan becomes `interrupted`; an execution with a recorded infrastructure-side-effect marker becomes `unknown` and is not automatically retried.
 
 ### `--silence-allowlist-errors` <Badge text="v0.28.0+" type="info"/>
 

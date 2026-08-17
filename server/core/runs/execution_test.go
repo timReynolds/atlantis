@@ -88,3 +88,18 @@ func TestRunAttemptRequiresDeploymentScopedConcurrency(t *testing.T) {
 	attempt.DeploymentID = "prod-eu"
 	require.NoError(t, attempt.Validate())
 }
+
+func TestAttemptTakeoverAllowsAPIExecutionWithoutPullNumber(t *testing.T) {
+	now := time.Date(2026, 8, 16, 10, 0, 0, 0, time.UTC)
+	request := runs.AttemptTakeoverRequest{
+		DeploymentID:   "prod-eu",
+		ConcurrencyKey: "sha256:api-ref", OwnershipClaimID: "api:claim",
+		HeartbeatBefore: now, RecoveredAt: now.Add(time.Minute),
+		Repository: "github.com/org/repo", Command: runs.CommandApply,
+		Trigger: runs.TriggerAPI, HeadSHA: "refs/heads/main",
+	}
+
+	require.NoError(t, request.Validate())
+	request.Trigger = runs.TriggerComment
+	require.ErrorContains(t, request.Validate(), "pull number is required")
+}

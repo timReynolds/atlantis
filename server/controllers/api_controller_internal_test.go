@@ -143,6 +143,28 @@ func TestAPIResolvePRHead_MergeCheckoutUsesHEADSecondParent(t *testing.T) {
 	Assert(t, ctx.Pull.HeadCommit != mergeHead, "expected PR head, not merge commit")
 }
 
+func TestAPIRefConcurrencyKeyNormalizesEquivalentRefs(t *testing.T) {
+	repo := models.Repo{
+		FullName: "runatlantis/atlantis",
+		VCSHost:  models.VCSHost{Hostname: "GitHub.com"},
+	}
+	shorthand, err := apiRefConcurrencyKey("prod-eu", models.PullRequest{
+		BaseRepo: repo, BaseBranch: "main", HeadBranch: "main",
+	})
+	Ok(t, err)
+	full, err := apiRefConcurrencyKey("prod-eu", models.PullRequest{
+		BaseRepo: repo, BaseBranch: "refs/heads/main", HeadBranch: "refs/heads/main",
+	})
+	Ok(t, err)
+	Equals(t, shorthand, full)
+
+	other, err := apiRefConcurrencyKey("prod-eu", models.PullRequest{
+		BaseRepo: repo, BaseBranch: "main", HeadBranch: "other-branch",
+	})
+	Ok(t, err)
+	Assert(t, shorthand != other, "expected a distinct ref to produce a distinct concurrency key")
+}
+
 func initReachabilityRepo(t *testing.T) string {
 	t.Helper()
 	repoDir := newReachabilityGitTempDir(t, "reachability-origin-*")

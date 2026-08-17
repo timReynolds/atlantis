@@ -79,12 +79,13 @@ func TestCreateAttemptMapsActiveConcurrencyConflict(t *testing.T) {
 	expectAttemptAdmissionLock(mock, attempt)
 	mock.ExpectQuery("SELECT command FROM runs").WithArgs(attempt.RunID).
 		WillReturnRows(sqlmock.NewRows([]string{"command"}).AddRow(runs.CommandPlan))
+	staleBefore := testTime.Add(time.Hour)
 	mock.ExpectQuery("(?s)WITH superseded_attempts AS .*superseded_runs AS .*superseded_project_runs AS").
 		WithArgs(
 			attempt.DeploymentID, attempt.ConcurrencyKey, attempt.OwnershipClaimID, attempt.ClaimedAt,
 			runs.AttemptClaimed, runs.AttemptRunning, runs.AttemptInterrupted, runs.AttemptUnknown,
 			runs.StatusFailed, runs.StatusUnknown, runs.StatusRunning, attempt.RunID,
-			runs.StatusCancelled, runs.StatusPending,
+			runs.StatusCancelled, runs.StatusPending, staleBefore,
 		).
 		WillReturnRows(sqlmock.NewRows([]string{"attempts", "runs", "projects", "unknown"}).AddRow(0, 0, 0, 0))
 	mock.ExpectExec("INSERT INTO run_attempts").WithArgs(
@@ -98,7 +99,7 @@ func TestCreateAttemptMapsActiveConcurrencyConflict(t *testing.T) {
 		WithArgs(testAttemptID).WillReturnError(sql.ErrNoRows)
 	mock.ExpectRollback()
 
-	err := store.CreateAttempt(context.Background(), attempt)
+	err := store.CreateAttempt(context.Background(), attempt, staleBefore)
 	require.ErrorIs(t, err, runs.ErrConflict)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -110,12 +111,13 @@ func TestCreateAttemptCommitsUnknownSupersessionBeforeReturningConflict(t *testi
 	expectAttemptAdmissionLock(mock, attempt)
 	mock.ExpectQuery("SELECT command FROM runs").WithArgs(attempt.RunID).
 		WillReturnRows(sqlmock.NewRows([]string{"command"}).AddRow(runs.CommandPlan))
+	staleBefore := testTime.Add(time.Hour)
 	mock.ExpectQuery("(?s)WITH superseded_attempts AS .*completed_at = GREATEST\\(\\$4, claimed_at, started_at, side_effect_started_at\\).*superseded_runs AS .*superseded_project_runs AS").
 		WithArgs(
 			attempt.DeploymentID, attempt.ConcurrencyKey, attempt.OwnershipClaimID, attempt.ClaimedAt,
 			runs.AttemptClaimed, runs.AttemptRunning, runs.AttemptInterrupted, runs.AttemptUnknown,
 			runs.StatusFailed, runs.StatusUnknown, runs.StatusRunning, attempt.RunID,
-			runs.StatusCancelled, runs.StatusPending,
+			runs.StatusCancelled, runs.StatusPending, staleBefore,
 		).
 		WillReturnRows(sqlmock.NewRows([]string{"attempts", "runs", "projects", "unknown"}).AddRow(1, 1, 1, 0))
 	mock.ExpectExec("INSERT INTO run_attempts").WillReturnResult(sqlmock.NewResult(0, 0))
@@ -123,7 +125,7 @@ func TestCreateAttemptCommitsUnknownSupersessionBeforeReturningConflict(t *testi
 		WithArgs(testAttemptID).WillReturnError(sql.ErrNoRows)
 	mock.ExpectCommit()
 
-	err := store.CreateAttempt(context.Background(), attempt)
+	err := store.CreateAttempt(context.Background(), attempt, staleBefore)
 
 	require.ErrorIs(t, err, runs.ErrConflict)
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -141,7 +143,7 @@ func TestCreateAttemptBlocksMutationBehindUnknownButNotPlans(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(testAttemptID))
 	mock.ExpectRollback()
 
-	err := store.CreateAttempt(context.Background(), attempt)
+	err := store.CreateAttempt(context.Background(), attempt, testTime.Add(time.Hour))
 
 	require.ErrorIs(t, err, runs.ErrConflict)
 	require.NoError(t, mock.ExpectationsWereMet())

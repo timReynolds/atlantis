@@ -74,6 +74,11 @@ func TestUserConfig_ToAllowCommandNames(t *testing.T) {
 	}
 }
 
+func TestUserConfigRejectsNegativeShutdownGracePeriodWithoutReplicaRouting(t *testing.T) {
+	err := (server.UserConfig{ShutdownGracePeriodSeconds: -1}).ValidateReplicaRouting()
+	require.EqualError(t, err, "--shutdown-grace-period-seconds cannot be negative")
+}
+
 func TestUserConfig_ToBlockedExtraArgs(t *testing.T) {
 	tests := []struct {
 		name             string

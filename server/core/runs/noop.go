@@ -46,6 +46,18 @@ func (NoopStore) CompleteAttempt(context.Context, AttemptCompletion) error { ret
 
 func (NoopStore) ReconcileAttempt(context.Context, AttemptReconciliation) error { return nil }
 
+func (NoopStore) PrepareAttemptTakeover(context.Context, AttemptTakeoverRequest) (AttemptTakeoverResult, error) {
+	return AttemptTakeoverResult{}, nil
+}
+
+func (NoopStore) RecordProjectPlanArtifact(context.Context, ProjectPlanArtifactUpdate) error {
+	return nil
+}
+
+func (NoopStore) FindPlanArtifact(context.Context, PlanArtifactLookup) (PlanArtifactExpectation, error) {
+	return PlanArtifactExpectation{}, ErrNotFound
+}
+
 func (NoopStore) GetRun(context.Context, ID) (Run, error) {
 	return Run{}, ErrNotFound
 }

@@ -324,6 +324,36 @@ func TestDefaultProjectCommandRunner_PlanSuppressesCustomRunStepStreaming(t *tes
 	mockRun.VerifyWasCalledOnce().Run(ctx, nil, "", repoDir, map[string]string{}, false, nil, nil)
 }
 
+func TestDefaultProjectCommandRunner_PlanMarksCustomRunAsSideEffect(t *testing.T) {
+	RegisterMockTestingT(t)
+	mockRun := mocks.NewMockCustomStepRunner()
+	mockWorkingDir := mocks.NewMockWorkingDir()
+	mockLocker := mocks.NewMockProjectLocker()
+	mockRequirements := mocks.NewMockCommandRequirementHandler()
+	marker := &countingSideEffectMarker{}
+	runner := events.DefaultProjectCommandRunner{
+		Locker: mockLocker, LockURLGenerator: mockURLGenerator{}, RunStepRunner: mockRun,
+		WorkingDir: mockWorkingDir, WorkingDirLocker: events.NewDefaultWorkingDirLocker(),
+		CommandRequirementHandler: mockRequirements,
+	}
+	repoDir := t.TempDir()
+	When(mockWorkingDir.Clone(Any[logging.SimpleLogging](), Any[models.Repo](), Any[models.PullRequest](), Any[string]())).ThenReturn(repoDir, nil)
+	When(mockWorkingDir.GitReadLock(Any[models.Repo](), Any[models.PullRequest](), Any[string]())).ThenReturn(func() {})
+	When(mockLocker.TryLock(Any[logging.SimpleLogging](), Any[models.PullRequest](), Any[models.User](), Any[string](), Any[models.Project](), AnyBool())).
+		ThenReturn(&events.TryLockResponse{LockAcquired: true, LockKey: "lock-key"}, nil)
+	ctx := command.ProjectContext{
+		Log: logging.NewNoopLogger(t), Steps: []valid.Step{{StepName: "run"}},
+		Workspace: "default", RepoRelDir: ".", SideEffectMarker: marker,
+	}
+	When(mockRun.Run(ctx, nil, "", repoDir, map[string]string{}, true, nil, nil)).ThenReturn("run", nil)
+
+	result := runner.Plan(ctx)
+
+	Assert(t, result.PlanSuccess != nil, "expected plan success")
+	Equals(t, 1, marker.calls)
+	Equals(t, 1, marker.persisted)
+}
+
 func TestProjectOutputWrapper(t *testing.T) {
 	RegisterMockTestingT(t)
 	ctx := command.ProjectContext{
@@ -2851,6 +2881,20 @@ func (f executionLeaseFunc) Admit(ctx context.Context) error {
 	return f(ctx)
 }
 
+type countingSideEffectMarker struct {
+	calls     int
+	persisted int
+	err       error
+}
+
+func (m *countingSideEffectMarker) MarkSideEffectStarted(context.Context) error {
+	m.calls++
+	if m.persisted == 0 && m.err == nil {
+		m.persisted++
+	}
+	return m.err
+}
+
 // restoringPlanStore writes contents to planPath on Load, simulating an
 // external store restoring a plan after a container restart / re-clone.
 type restoringPlanStore struct {
@@ -3242,12 +3286,14 @@ func TestDefaultProjectCommandRunner_Apply(t *testing.T) {
 				LockKey:      "lock-key",
 			}, nil)
 
+			marker := &countingSideEffectMarker{}
 			ctx := command.ProjectContext{
 				Log:               logging.NewNoopLogger(t),
 				Steps:             c.steps,
 				Workspace:         "default",
 				ApplyRequirements: c.applyReqs,
 				RepoRelDir:        ".",
+				SideEffectMarker:  marker,
 				PullReqStatus: models.PullReqStatus{
 					ApprovalStatus: models.ApprovalStatus{
 						IsApproved: true,
@@ -3267,6 +3313,8 @@ func TestDefaultProjectCommandRunner_Apply(t *testing.T) {
 			res := runner.Apply(ctx)
 			Equals(t, c.expOut, res.ApplySuccess)
 			Equals(t, c.expFailure, res.Failure)
+			Equals(t, 2, marker.calls)
+			Equals(t, 1, marker.persisted)
 
 			for _, step := range c.expSteps {
 				switch step {

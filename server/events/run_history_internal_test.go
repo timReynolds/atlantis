@@ -21,6 +21,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const (
+	testPlanChecksum     = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testWorkflowIdentity = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+)
+
 func TestRunHistoryAggregatesPlanAndPolicyIntoOneProjectRun(t *testing.T) {
 	writer := &recordingRunWriter{}
 	history := newTestRunHistory(t, writer)
@@ -34,7 +39,7 @@ func TestRunHistoryAggregatesPlanAndPolicyIntoOneProjectRun(t *testing.T) {
 
 	projectCtx := history.beginProject(command.ProjectContext{
 		RunID: ctx.RunID, ProjectName: "network", RepoRelDir: "terraform/network",
-		Workspace: "production", Log: ctx.Log,
+		Workspace: "production", WorkflowIdentity: testWorkflowIdentity, Log: ctx.Log,
 	})
 	history.recordProject(projectCtx, command.Plan, command.ProjectCommandOutput{
 		PlanSuccess: &models.PlanSuccess{TerraformOutput: "Plan: 1 to import, 2 to add, 3 to change, 4 to destroy, 5 to forget."},
@@ -50,9 +55,9 @@ func TestRunHistoryAggregatesPlanAndPolicyIntoOneProjectRun(t *testing.T) {
 			{PolicySetName: "production", Passed: false},
 		}},
 	})
-	history.RecordPlanArtifact(projectCtx, runs.ArtifactReference{
-		Key: "plans/network.tfplan", Checksum: "sha256:abc", CreatedAt: testHistoryTime,
-	})
+	require.NoError(t, history.RecordPlanArtifact(projectCtx, runs.ArtifactReference{
+		Key: "plans/network.tfplan", Checksum: testPlanChecksum, CreatedAt: testHistoryTime,
+	}))
 	ctx.CommandHasErrors = true
 	lifecycle.Finish()
 
@@ -305,6 +310,7 @@ func TestRunHistoryLeavesRunIncompleteWhenProjectCompletionCannotPersist(t *test
 	writer := &recordingRunWriter{completeProjectErr: errors.New("store unavailable")}
 	history := newTestRunHistory(t, writer)
 	ctx := testRunContext(t)
+	enableHAContext(ctx)
 	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
 	projectCtx := history.beginProject(command.ProjectContext{
 		RunID: ctx.RunID, ProjectName: "network", RepoRelDir: "network", Workspace: "default", Log: ctx.Log,
@@ -319,6 +325,8 @@ func TestRunHistoryLeavesRunIncompleteWhenProjectCompletionCannotPersist(t *test
 
 	require.Empty(t, writer.runsCompleted, "the running record must remain visibly incomplete")
 	require.Equal(t, 1, writer.completeProjectCalls, "one store outage must stop later completion writes")
+	require.Len(t, writer.attemptsCompleted, 1, "attempt admission must not remain active")
+	require.Equal(t, runs.AttemptSucceeded, writer.attemptsCompleted[0].Status)
 }
 
 func TestRunHistoryLeavesRunIncompleteWhenFinalOutputCannotPersist(t *testing.T) {
@@ -360,6 +368,246 @@ func TestRunLifecycleFinishRecoveringMarksPanicFailed(t *testing.T) {
 	require.Equal(t, runs.StatusFailed, writer.runsCompleted[0].Status)
 }
 
+func TestRunHistoryRecordsRoutedExecutionAttempt(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ExecutionDeploymentID = "prod-eu"
+	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
+	ctx.OwnershipClaimID = "claim-1"
+
+	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerComment)
+	require.True(t, lifecycle.CanExecute())
+	require.NotEmpty(t, ctx.AttemptID)
+	require.NotNil(t, ctx.SideEffectMarker)
+	require.NoError(t, ctx.SideEffectMarker.MarkSideEffectStarted(context.Background()))
+	lifecycle.Finish()
+
+	require.Len(t, writer.attemptsCreated, 1)
+	require.Equal(t, runs.AttemptClaimed, writer.attemptsCreated[0].Status)
+	require.Equal(t, ctx.RunID, writer.attemptsCreated[0].RunID)
+	require.Equal(t, ctx.ExecutionInstanceID, writer.attemptsCreated[0].InstanceID)
+	require.Equal(t, ctx.ExecutionDeploymentID, writer.attemptsCreated[0].DeploymentID)
+	require.Equal(t, []runs.ID{ctx.AttemptID}, writer.attemptsStarted)
+	require.Equal(t, []runs.ID{ctx.AttemptID}, writer.sideEffectsStarted)
+	require.Len(t, writer.attemptsCompleted, 1)
+	require.Equal(t, runs.AttemptSucceeded, writer.attemptsCompleted[0].Status)
+	require.Equal(t, []string{"apply.requested", "apply.attempt_started", "apply.completed"}, writer.auditTypes())
+}
+
+func TestRunHistoryFailsClosedWhenAttemptAdmissionIsNotDurable(t *testing.T) {
+	writer := &recordingRunWriter{createAttemptErr: errors.New("database unavailable")}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ExecutionDeploymentID = "prod-eu"
+	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
+	ctx.OwnershipClaimID = "claim-1"
+
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+	require.False(t, lifecycle.CanExecute())
+	require.True(t, ctx.CommandHasErrors)
+	lifecycle.Finish()
+
+	require.Empty(t, writer.attemptsStarted)
+	require.Equal(t, runs.StatusFailed, writer.runsCompleted[0].Status)
+}
+
+func TestRunHistoryRoutedExecutionStartsBlockedUntilRunIsDurable(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		configure func(*RunHistory, *recordingRunWriter)
+	}{
+		{
+			name: "run ID generation fails",
+			configure: func(history *RunHistory, _ *recordingRunWriter) {
+				history.newID = func() (runs.ID, error) { return "", errors.New("entropy unavailable") }
+			},
+		},
+		{
+			name: "run creation fails",
+			configure: func(_ *RunHistory, writer *recordingRunWriter) {
+				writer.createRunErr = errors.New("database unavailable")
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			writer := &recordingRunWriter{}
+			history := newTestRunHistory(t, writer)
+			test.configure(history, writer)
+			ctx := testRunContext(t)
+			enableHAContext(ctx)
+
+			lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+
+			require.False(t, lifecycle.CanExecute())
+			require.Empty(t, writer.attemptsCreated)
+		})
+	}
+}
+
+func TestRunHistoryInvalidatesOwnershipWhenUnstartedAttemptCannotBeInterrupted(t *testing.T) {
+	writer := &recordingRunWriter{
+		startAttemptErr: errors.New("start unavailable"), completeAttemptErr: errors.New("cleanup unavailable"),
+	}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	enableHAContext(ctx)
+	invalidations := 0
+	ctx.InvalidateOwnership = func() error {
+		invalidations++
+		return nil
+	}
+
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+
+	require.False(t, lifecycle.CanExecute())
+	require.Equal(t, 1, invalidations)
+}
+
+func TestRunHistoryCommandRunnerReportsAttemptAdmissionFailure(t *testing.T) {
+	writer := &recordingRunWriter{createAttemptErr: errors.New("database unavailable")}
+	history := newTestRunHistory(t, writer)
+	underlying := &recordingCommentCommandRunner{}
+	reporter := &recordingAdmissionFailureReporter{}
+	runner := NewRunHistoryCommandRunner(history, underlying, runs.CommandApply, reporter)
+	ctx := testRunContext(t)
+	enableHAContext(ctx)
+
+	runner.Run(ctx, &CommentCommand{Name: command.Apply})
+
+	require.False(t, underlying.called)
+	require.Equal(t, 1, reporter.calls)
+	require.Equal(t, command.Apply, reporter.commandName)
+	require.Equal(t, runs.StatusFailed, writer.runsCompleted[0].Status)
+}
+
+func TestRunHistoryMarksPanicAfterSideEffectUnknown(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ExecutionDeploymentID = "prod-eu"
+	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
+	ctx.OwnershipClaimID = "claim-1"
+	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerComment)
+	require.NoError(t, ctx.SideEffectMarker.MarkSideEffectStarted(context.Background()))
+
+	func() {
+		defer func() { require.Equal(t, "boom", recover()) }()
+		defer lifecycle.FinishRecovering()
+		panic("boom")
+	}()
+
+	require.Equal(t, runs.StatusUnknown, writer.runsCompleted[0].Status)
+	require.Equal(t, runs.AttemptUnknown, writer.attemptsCompleted[0].Status)
+	require.Contains(t, writer.attemptsCompleted[0].FailureReason, "side effect")
+}
+
+func TestRunHistoryReusesLogicalRunForInterruptedPlan(t *testing.T) {
+	retryID := runs.ID("0198a0df-85f1-7d83-a60b-2e57b725c620")
+	oldAttemptID := runs.ID("0198a0df-85f1-7d83-a60b-2e57b725c621")
+	oldInstanceID := runs.ID("0198a0df-85f1-7d83-a60b-2e57b725c622")
+	startedAt := testHistoryTime.Add(-time.Minute)
+	retryRun := runs.Run{
+		ID: retryID, Repository: "org/repo", PullNumber: intPointer(42),
+		Command: runs.CommandPlan, Trigger: runs.TriggerComment, Actor: "operator",
+		BaseRef: "main", HeadRef: "feature", HeadSHA: "abc123",
+		Status: runs.StatusRunning, CreatedAt: startedAt, StartedAt: &startedAt,
+	}
+	recovered := runs.RunAttempt{
+		ID: oldAttemptID, RunID: retryID, InstanceID: oldInstanceID,
+		DeploymentID:   "prod-eu",
+		ConcurrencyKey: "sha256:pull-ownership-key", OwnershipClaimID: "claim-old",
+		Status: runs.AttemptInterrupted, ClaimedAt: startedAt, StartedAt: &startedAt,
+		HeartbeatAt: testHistoryTime, CompletedAt: &testHistoryTime,
+		FailureReason: "replica disappeared",
+	}
+	writer := &recordingRunWriter{takeoverResult: runs.AttemptTakeoverResult{
+		RecoveredAttempt: &recovered, RetryRun: &retryRun,
+	}}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ExecutionDeploymentID = "prod-eu"
+	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
+	ctx.OwnershipClaimID = "claim-new"
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+
+	require.True(t, lifecycle.CanExecute())
+	require.Equal(t, retryID, ctx.RunID)
+	require.Empty(t, writer.runsCreated)
+	require.Len(t, writer.attemptsCreated, 1)
+	require.Equal(t, retryID, writer.attemptsCreated[0].RunID)
+	require.Equal(t, "claim-new", writer.attemptsCreated[0].OwnershipClaimID)
+	lifecycle.Finish()
+	require.Equal(t, runs.StatusSucceeded, writer.runsCompleted[0].Status)
+}
+
+func TestRunHistoryBlocksMutationWithUnreconciledUnknownAttempt(t *testing.T) {
+	unknown := claimedAttemptForHistory(t)
+	unknown.Status = runs.AttemptUnknown
+	unknown.StartedAt = &testHistoryTime
+	unknown.SideEffectStartedAt = &testHistoryTime
+	unknown.CompletedAt = &testHistoryTime
+	unknown.FailureReason = "apply outcome is unknown"
+	writer := &recordingRunWriter{takeoverResult: runs.AttemptTakeoverResult{
+		UnreconciledUnknown: &unknown,
+	}}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ExecutionDeploymentID = "prod-eu"
+	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
+	ctx.OwnershipClaimID = "claim-new"
+	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerComment)
+
+	require.False(t, lifecycle.CanExecute())
+	require.True(t, ctx.CommandHasErrors)
+	require.Empty(t, writer.attemptsCreated)
+	lifecycle.Finish()
+	require.Equal(t, runs.StatusFailed, writer.runsCompleted[0].Status)
+	require.Contains(t, writer.auditTypes(), "apply.admission_blocked")
+}
+
+func TestRunHistoryAllowsFreshPlanWithUnreconciledUnknownAttempt(t *testing.T) {
+	unknown := claimedAttemptForHistory(t)
+	unknown.Status = runs.AttemptUnknown
+	unknown.StartedAt = &testHistoryTime
+	unknown.SideEffectStartedAt = &testHistoryTime
+	unknown.CompletedAt = &testHistoryTime
+	unknown.FailureReason = "apply outcome is unknown"
+	writer := &recordingRunWriter{takeoverResult: runs.AttemptTakeoverResult{
+		UnreconciledUnknown: &unknown,
+	}}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ExecutionDeploymentID = "prod-eu"
+	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
+	ctx.OwnershipClaimID = "claim-new"
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+
+	require.True(t, lifecycle.CanExecute())
+	require.Len(t, writer.attemptsCreated, 1)
+	lifecycle.Finish()
+}
+
+func claimedAttemptForHistory(t *testing.T) runs.RunAttempt {
+	t.Helper()
+	return runs.RunAttempt{
+		ID:             "0198a0df-85f1-7d83-a60b-2e57b725c62c",
+		RunID:          "0198a0df-85f1-7d83-a60b-2e57b725c620",
+		InstanceID:     "0198a0df-85f1-7d83-a60b-2e57b725c622",
+		DeploymentID:   "prod-eu",
+		ConcurrencyKey: "sha256:pull-ownership-key", OwnershipClaimID: "claim-old",
+		Status: runs.AttemptClaimed, ClaimedAt: testHistoryTime, HeartbeatAt: testHistoryTime,
+	}
+}
+
+func intPointer(value int) *int { return &value }
+
 var testHistoryTime = time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
 
 func newTestRunHistory(t *testing.T, writer runs.Writer) *RunHistory {
@@ -386,6 +634,13 @@ func testRunContext(t *testing.T) *command.Context {
 	}
 }
 
+func enableHAContext(ctx *command.Context) {
+	ctx.ExecutionInstanceID = "0198a0df-85f1-7d83-a60b-2e57b725c62d"
+	ctx.ExecutionDeploymentID = "prod-eu"
+	ctx.ConcurrencyKey = "sha256:pull-ownership-key"
+	ctx.OwnershipClaimID = "claim-1"
+}
+
 type recordingRunWriter struct {
 	mu                   sync.Mutex
 	runsCreated          []runs.Run
@@ -399,11 +654,30 @@ type recordingRunWriter struct {
 	completeProjectErr   error
 	completeProjectCalls int
 	appendOutputErr      error
+	createRunErr         error
+	createAttemptErr     error
+	startAttemptErr      error
+	completeAttemptErr   error
+	attemptsCreated      []runs.RunAttempt
+	attemptsStarted      []runs.ID
+	attemptHeartbeats    []runs.ID
+	sideEffectsStarted   []runs.ID
+	attemptsCompleted    []runs.AttemptCompletion
+	takeoverRequests     []runs.AttemptTakeoverRequest
+	takeoverResult       runs.AttemptTakeoverResult
+	takeoverErr          error
+	artifactUpdates      []runs.ProjectPlanArtifactUpdate
+	artifactResult       runs.PlanArtifactExpectation
+	artifactLookup       runs.PlanArtifactLookup
+	artifactErr          error
 }
 
 func (w *recordingRunWriter) CreateRun(_ context.Context, run runs.Run) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.createRunErr != nil {
+		return w.createRunErr
+	}
 	w.runsCreated = append(w.runsCreated, run)
 	return nil
 }
@@ -477,4 +751,110 @@ func (w *recordingRunWriter) auditTypes() []string {
 		result[i] = event.EventType
 	}
 	return result
+}
+
+func (w *recordingRunWriter) RegisterInstance(context.Context, runs.ExecutionInstance) error {
+	return nil
+}
+
+func (w *recordingRunWriter) HeartbeatInstance(context.Context, runs.ID, time.Time) error {
+	return nil
+}
+
+func (w *recordingRunWriter) StopInstance(context.Context, runs.ID, time.Time) error {
+	return nil
+}
+
+func (w *recordingRunWriter) CreateAttempt(_ context.Context, attempt runs.RunAttempt) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.createAttemptErr != nil {
+		return w.createAttemptErr
+	}
+	w.attemptsCreated = append(w.attemptsCreated, attempt)
+	return nil
+}
+
+func (w *recordingRunWriter) StartAttempt(_ context.Context, id runs.ID, _ time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.startAttemptErr != nil {
+		return w.startAttemptErr
+	}
+	w.attemptsStarted = append(w.attemptsStarted, id)
+	return nil
+}
+
+func (w *recordingRunWriter) HeartbeatAttempt(_ context.Context, id runs.ID, _ time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.attemptHeartbeats = append(w.attemptHeartbeats, id)
+	return nil
+}
+
+func (w *recordingRunWriter) MarkAttemptSideEffectStarted(_ context.Context, id runs.ID, _ time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.sideEffectsStarted = append(w.sideEffectsStarted, id)
+	return nil
+}
+
+func (w *recordingRunWriter) CompleteAttempt(_ context.Context, completion runs.AttemptCompletion) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.completeAttemptErr != nil {
+		return w.completeAttemptErr
+	}
+	w.attemptsCompleted = append(w.attemptsCompleted, completion)
+	return nil
+}
+
+func (w *recordingRunWriter) ReconcileAttempt(context.Context, runs.AttemptReconciliation) error {
+	return nil
+}
+
+func (w *recordingRunWriter) PrepareAttemptTakeover(_ context.Context, request runs.AttemptTakeoverRequest) (runs.AttemptTakeoverResult, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.takeoverRequests = append(w.takeoverRequests, request)
+	return w.takeoverResult, w.takeoverErr
+}
+
+type recordingCommentCommandRunner struct {
+	called bool
+}
+
+func (r *recordingCommentCommandRunner) Run(*command.Context, *CommentCommand) {
+	r.called = true
+}
+
+type recordingAdmissionFailureReporter struct {
+	calls       int
+	commandName command.Name
+}
+
+func (r *recordingAdmissionFailureReporter) ReportRunAdmissionFailure(_ *command.Context, commandName command.Name) {
+	r.calls++
+	r.commandName = commandName
+}
+
+var _ CommentCommandRunner = (*recordingCommentCommandRunner)(nil)
+var _ RunAdmissionFailureReporter = (*recordingAdmissionFailureReporter)(nil)
+
+func (w *recordingRunWriter) RecordProjectPlanArtifact(_ context.Context, update runs.ProjectPlanArtifactUpdate) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.artifactErr != nil {
+		return w.artifactErr
+	}
+	if err := update.Validate(); err != nil {
+		return err
+	}
+	w.artifactUpdates = append(w.artifactUpdates, update)
+	return nil
+}
+
+func (w *recordingRunWriter) FindPlanArtifact(_ context.Context, lookup runs.PlanArtifactLookup) (runs.PlanArtifactExpectation, error) {
+	w.artifactLookup = lookup
+	return w.artifactResult, w.artifactErr
 }

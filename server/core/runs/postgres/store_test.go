@@ -44,7 +44,7 @@ func TestStoreConformance(t *testing.T) {
 	pull := 17
 	run := runs.Run{
 		ID: runID, Repository: "example/infrastructure", PullNumber: &pull,
-		Command: runs.CommandPlan, Trigger: runs.TriggerComment, Actor: "operator",
+		Command: runs.CommandApply, Trigger: runs.TriggerComment, Actor: "operator",
 		BaseRef: "main", HeadRef: "feature", HeadSHA: "deadbeef",
 		Status: runs.StatusPending, CreatedAt: createdAt,
 		Metadata: runs.Metadata(`{"source":"conformance"}`),
@@ -78,6 +78,18 @@ func TestStoreConformance(t *testing.T) {
 	}
 	require.NoError(t, store.CreateAttempt(ctx, attempt))
 	require.NoError(t, store.CreateAttempt(ctx, attempt), "attempt replay must be idempotent")
+	takeoverAttempt := attempt
+	takeoverAttempt.ID = mustID(t)
+	takeoverAttempt.OwnershipClaimID = "claim-2"
+	takeoverAttempt.ClaimedAt = createdAt.Add(500 * time.Millisecond)
+	takeoverAttempt.HeartbeatAt = takeoverAttempt.ClaimedAt
+	require.NoError(t, store.CreateAttempt(ctx, takeoverAttempt), "a new lease generation must retire its predecessor")
+	interruptedAttempt, err := store.GetAttempt(ctx, attemptID)
+	require.NoError(t, err)
+	require.Equal(t, runs.AttemptInterrupted, interruptedAttempt.Status)
+	require.Contains(t, interruptedAttempt.FailureReason, "ownership transferred")
+	attempt = takeoverAttempt
+	attemptID = takeoverAttempt.ID
 	otherInstance := instance
 	otherInstance.ID = mustID(t)
 	otherInstance.ReplicaID = "atlantis-other-0"
@@ -108,7 +120,7 @@ func TestStoreConformance(t *testing.T) {
 		"unreconciled unknown apply must retain the durable admission fence")
 	reconciledAt := startedAt.Add(900 * time.Millisecond)
 	require.NoError(t, store.ReconcileAttempt(ctx, runs.AttemptReconciliation{
-		ID: attemptID, At: reconciledAt, Actor: "operator",
+		ID: attemptID, AuditEventID: mustID(t), At: reconciledAt, Actor: "operator",
 		Summary: "state inspected; fresh plan required",
 	}))
 	require.NoError(t, store.CreateAttempt(ctx, replacementAttempt),
@@ -131,7 +143,7 @@ func TestStoreConformance(t *testing.T) {
 	}))
 
 	projectRun := runs.ProjectRun{
-		ID: projectRunID, RunID: runID, ProjectName: "network",
+		ID: projectRunID, RunID: runID, AttemptID: &attemptID, ProjectName: "network",
 		Directory: "terraform/network", Workspace: "production",
 		Status: runs.StatusPending,
 	}
@@ -148,19 +160,31 @@ func TestStoreConformance(t *testing.T) {
 	completedAt := startedAt.Add(time.Second)
 	artifactCreatedAt := startedAt
 	artifactExpiresAt := completedAt.Add(24 * time.Hour)
+	artifact := &runs.ArtifactReference{
+		Key:       "plans/example/17/network.tfplan",
+		Checksum:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		CreatedAt: artifactCreatedAt, ExpiresAt: &artifactExpiresAt,
+	}
+	artifactIdentity := runs.PlanArtifactIdentity{
+		RepoConfigVersion: 3,
+		WorkflowChecksum:  "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	}
+	require.NoError(t, store.RecordProjectPlanArtifact(ctx, runs.ProjectPlanArtifactUpdate{
+		ProjectRunID: projectRunID, Artifact: *artifact, Identity: artifactIdentity,
+	}))
+	require.NoError(t, store.RecordProjectPlanArtifact(ctx, runs.ProjectPlanArtifactUpdate{
+		ProjectRunID: projectRunID, Artifact: *artifact, Identity: artifactIdentity,
+	}), "artifact replay must be idempotent")
 	projectCompletion := runs.ProjectRunCompletion{
 		ID: projectRunID, Status: runs.StatusSucceeded, Additions: 1, Changes: 2,
-		CompletedAt: completedAt,
-		Metadata:    runs.Metadata(`{"phases":["plan","policy_check"]}`),
-		PlanArtifact: &runs.ArtifactReference{
-			Key: "plans/example/17/network.tfplan", Checksum: "sha256:abc",
-			CreatedAt: artifactCreatedAt, ExpiresAt: &artifactExpiresAt,
-		},
+		CompletedAt:  completedAt,
+		Metadata:     runs.Metadata(`{"phases":["plan","policy_check"]}`),
+		PlanArtifact: artifact,
 	}
 	require.NoError(t, store.CompleteProjectRun(ctx, projectCompletion))
 	require.NoError(t, store.CompleteProjectRun(ctx, projectCompletion), "completion replay must be idempotent")
 	require.NoError(t, store.CompleteRun(ctx, runs.RunCompletion{
-		ID: runID, Status: runs.StatusSucceeded, CompletedAt: completedAt,
+		ID: runID, Status: runs.StatusUnknown, CompletedAt: completedAt,
 	}))
 
 	event := runs.AuditEvent{
@@ -173,17 +197,25 @@ func TestStoreConformance(t *testing.T) {
 
 	storedRun, err := store.GetRun(ctx, runID)
 	require.NoError(t, err)
-	require.Equal(t, runs.StatusSucceeded, storedRun.Status)
+	require.Equal(t, runs.StatusUnknown, storedRun.Status)
 	require.Equal(t, run.HeadSHA, storedRun.HeadSHA)
 	storedProject, err := store.GetProjectRun(ctx, projectRunID)
 	require.NoError(t, err)
 	require.Equal(t, projectCompletion.Additions, storedProject.Additions)
 	require.Equal(t, projectCompletion.PlanArtifact, storedProject.PlanArtifact)
 	require.JSONEq(t, string(projectCompletion.Metadata), string(storedProject.Metadata))
+	expectedArtifact, err := store.FindPlanArtifact(ctx, runs.PlanArtifactLookup{
+		Repository: run.Repository, PullNumber: pull, HeadSHA: run.HeadSHA,
+		ProjectName: projectRun.ProjectName, Directory: projectRun.Directory, Workspace: projectRun.Workspace,
+	})
+	require.NoError(t, err)
+	require.Equal(t, projectRunID, expectedArtifact.ProjectRunID)
+	require.Equal(t, *artifact, expectedArtifact.Artifact)
+	require.Equal(t, artifactIdentity, expectedArtifact.Identity)
 
 	runPage, err := store.ListRuns(ctx, runs.RunFilter{
 		Repository: run.Repository, PullNumber: &pull,
-		Commands: []runs.Command{runs.CommandPlan}, Statuses: []runs.Status{runs.StatusSucceeded},
+		Commands: []runs.Command{runs.CommandApply}, Statuses: []runs.Status{runs.StatusUnknown},
 	}, runs.PageRequest{Limit: 1})
 	require.NoError(t, err)
 	require.Len(t, runPage.Runs, 1)
@@ -210,17 +242,243 @@ func TestStoreConformance(t *testing.T) {
 	require.Len(t, auditPage.Events, 1)
 	require.NoError(t, store.StopInstance(ctx, instanceID, completedAt))
 
-	retentionCutoff := completedAt.Add(time.Second)
+	// A stale plan attempt under an older Redis claim is interrupted and a
+	// duplicate delivery reuses the same logical Run while preserving both
+	// attempts and both sets of project results.
+	retryCreatedAt := completedAt.Add(2 * time.Second)
+	retryStartedAt := retryCreatedAt.Add(time.Second)
+	retryPull := 23
+	retryRunID := mustID(t)
+	retryRun := runs.Run{
+		ID: retryRunID, Repository: "example/infrastructure", PullNumber: &retryPull,
+		Command: runs.CommandPlan, Trigger: runs.TriggerComment, Actor: "operator",
+		BaseRef: "main", HeadRef: "retry-plan", HeadSHA: "feedface",
+		Status: runs.StatusRunning, CreatedAt: retryCreatedAt, StartedAt: &retryStartedAt,
+	}
+	require.NoError(t, store.CreateRun(ctx, retryRun))
+	staleInstanceID := mustID(t)
+	require.NoError(t, store.RegisterInstance(ctx, runs.ExecutionInstance{
+		ID: staleInstanceID, ReplicaID: "atlantis-1", DeploymentID: "conformance",
+		StartedAt: retryCreatedAt, HeartbeatAt: retryStartedAt,
+	}))
+	staleAttemptID := mustID(t)
+	require.NoError(t, store.CreateAttempt(ctx, runs.RunAttempt{
+		ID: staleAttemptID, RunID: retryRunID, InstanceID: staleInstanceID,
+		DeploymentID:   "conformance",
+		ConcurrencyKey: "sha256:retry-plan", OwnershipClaimID: "old-plan-claim",
+		Status: runs.AttemptClaimed, ClaimedAt: retryCreatedAt, HeartbeatAt: retryCreatedAt,
+	}))
+	require.NoError(t, store.StartAttempt(ctx, staleAttemptID, retryStartedAt))
+	staleProjectID := mustID(t)
+	require.NoError(t, store.CreateProjectRun(ctx, runs.ProjectRun{
+		ID: staleProjectID, RunID: retryRunID, AttemptID: &staleAttemptID,
+		ProjectName: "network", Directory: "terraform/network", Workspace: "production",
+		Status: runs.StatusRunning, StartedAt: &retryStartedAt,
+	}))
+	recoveredAt := retryStartedAt.Add(2 * time.Minute)
+	takeover, err := store.PrepareAttemptTakeover(ctx, runs.AttemptTakeoverRequest{
+		DeploymentID: "conformance", ConcurrencyKey: "sha256:retry-plan", OwnershipClaimID: "new-plan-claim",
+		HeartbeatBefore: recoveredAt.Add(-time.Minute), RecoveredAt: recoveredAt,
+		Repository: retryRun.Repository, PullNumber: &retryPull, Command: retryRun.Command,
+		Trigger: retryRun.Trigger, Actor: retryRun.Actor, BaseRef: retryRun.BaseRef,
+		HeadRef: retryRun.HeadRef, HeadSHA: retryRun.HeadSHA,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, takeover.RetryRun)
+	require.Equal(t, retryRunID, takeover.RetryRun.ID)
+	require.Equal(t, runs.AttemptInterrupted, takeover.RecoveredAttempt.Status)
+	require.Nil(t, takeover.UnreconciledUnknown)
+	staleProject, err := store.GetProjectRun(ctx, staleProjectID)
+	require.NoError(t, err)
+	require.Equal(t, runs.StatusFailed, staleProject.Status)
+
+	replacementInstanceID := mustID(t)
+	require.NoError(t, store.RegisterInstance(ctx, runs.ExecutionInstance{
+		ID: replacementInstanceID, ReplicaID: "atlantis-2", DeploymentID: "conformance",
+		StartedAt: recoveredAt, HeartbeatAt: recoveredAt,
+	}))
+	replacementAttemptID := mustID(t)
+	require.NoError(t, store.CreateAttempt(ctx, runs.RunAttempt{
+		ID: replacementAttemptID, RunID: retryRunID, InstanceID: replacementInstanceID,
+		DeploymentID:   "conformance",
+		ConcurrencyKey: "sha256:retry-plan", OwnershipClaimID: "new-plan-claim",
+		Status: runs.AttemptClaimed, ClaimedAt: recoveredAt, HeartbeatAt: recoveredAt,
+	}))
+	require.NoError(t, store.StartAttempt(ctx, replacementAttemptID, recoveredAt))
+	replacementProjectID := mustID(t)
+	require.NoError(t, store.CreateProjectRun(ctx, runs.ProjectRun{
+		ID: replacementProjectID, RunID: retryRunID, AttemptID: &replacementAttemptID,
+		ProjectName: "network", Directory: "terraform/network", Workspace: "production",
+		Status: runs.StatusRunning, StartedAt: &recoveredAt,
+	}))
+	retryCompletedAt := recoveredAt.Add(time.Minute)
+	require.NoError(t, store.CompleteProjectRun(ctx, runs.ProjectRunCompletion{
+		ID: replacementProjectID, Status: runs.StatusSucceeded, CompletedAt: retryCompletedAt,
+	}))
+	require.NoError(t, store.CompleteAttempt(ctx, runs.AttemptCompletion{
+		ID: replacementAttemptID, Status: runs.AttemptSucceeded, CompletedAt: retryCompletedAt,
+	}))
+	require.NoError(t, store.CompleteRun(ctx, runs.RunCompletion{
+		ID: retryRunID, Status: runs.StatusSucceeded, CompletedAt: retryCompletedAt,
+	}))
+	retryAttempts, err := store.ListRunAttempts(ctx, retryRunID, runs.PageRequest{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, retryAttempts.Attempts, 2)
+	retryProjects, err := store.ListProjectRuns(ctx, retryRunID, runs.ProjectRunFilter{}, runs.PageRequest{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, retryProjects.ProjectRuns, 2)
+
+	// Older releases completed the Run before terminalizing its attempt. A
+	// takeover repairs that ordering idempotently instead of blocking forever.
+	terminalCreatedAt := retryCompletedAt.Add(time.Second)
+	terminalRunID := mustID(t)
+	terminalPull := 28
+	terminalRun := runs.Run{
+		ID: terminalRunID, Repository: "example/infrastructure", PullNumber: &terminalPull,
+		Command: runs.CommandPlan, Trigger: runs.TriggerComment, Actor: "operator",
+		BaseRef: "main", HeadRef: "terminal-parent", HeadSHA: "cab004e",
+		Status: runs.StatusRunning, CreatedAt: terminalCreatedAt, StartedAt: &terminalCreatedAt,
+	}
+	require.NoError(t, store.CreateRun(ctx, terminalRun))
+	terminalInstanceID := mustID(t)
+	require.NoError(t, store.RegisterInstance(ctx, runs.ExecutionInstance{
+		ID: terminalInstanceID, ReplicaID: "atlantis-terminal", DeploymentID: "conformance",
+		StartedAt: terminalCreatedAt, HeartbeatAt: terminalCreatedAt,
+	}))
+	terminalAttemptID := mustID(t)
+	require.NoError(t, store.CreateAttempt(ctx, runs.RunAttempt{
+		ID: terminalAttemptID, RunID: terminalRunID, InstanceID: terminalInstanceID,
+		DeploymentID: "conformance", ConcurrencyKey: "sha256:terminal-parent",
+		OwnershipClaimID: "old-terminal-claim", Status: runs.AttemptClaimed,
+		ClaimedAt: terminalCreatedAt, HeartbeatAt: terminalCreatedAt,
+	}))
+	require.NoError(t, store.StartAttempt(ctx, terminalAttemptID, terminalCreatedAt))
+	terminalCompletedAt := terminalCreatedAt.Add(time.Minute)
+	require.NoError(t, store.CompleteRun(ctx, runs.RunCompletion{
+		ID: terminalRunID, Status: runs.StatusSucceeded, CompletedAt: terminalCompletedAt,
+	}))
+	terminalRecoveredAt := terminalCompletedAt.Add(time.Minute)
+	terminalTakeover, err := store.PrepareAttemptTakeover(ctx, runs.AttemptTakeoverRequest{
+		DeploymentID: "conformance", ConcurrencyKey: "sha256:terminal-parent", OwnershipClaimID: "new-terminal-claim",
+		HeartbeatBefore: terminalRecoveredAt.Add(-time.Minute), RecoveredAt: terminalRecoveredAt,
+		Repository: terminalRun.Repository, PullNumber: &terminalPull, Command: terminalRun.Command,
+		Trigger: terminalRun.Trigger, Actor: terminalRun.Actor, BaseRef: terminalRun.BaseRef,
+		HeadRef: terminalRun.HeadRef, HeadSHA: terminalRun.HeadSHA,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, terminalTakeover.RecoveredAttempt)
+	require.Equal(t, runs.AttemptSucceeded, terminalTakeover.RecoveredAttempt.Status)
+	require.Nil(t, terminalTakeover.RetryRun)
+	storedTerminalRun, err := store.GetRun(ctx, terminalRunID)
+	require.NoError(t, err)
+	require.Equal(t, runs.StatusSucceeded, storedTerminalRun.Status)
+
+	// A stale apply after the side-effect marker becomes unknown and blocks
+	// further mutating admission until an operator records reconciliation.
+	unknownCreatedAt := retryCompletedAt.Add(time.Second)
+	unknownRunID := mustID(t)
+	unknownPull := 29
+	unknownRun := runs.Run{
+		ID: unknownRunID, Repository: "example/infrastructure", PullNumber: &unknownPull,
+		Command: runs.CommandApply, Trigger: runs.TriggerComment, Actor: "operator",
+		BaseRef: "main", HeadRef: "unknown-apply", HeadSHA: "cab005e",
+		Status: runs.StatusRunning, CreatedAt: unknownCreatedAt, StartedAt: &unknownCreatedAt,
+	}
+	require.NoError(t, store.CreateRun(ctx, unknownRun))
+	unknownInstanceID := mustID(t)
+	require.NoError(t, store.RegisterInstance(ctx, runs.ExecutionInstance{
+		ID: unknownInstanceID, ReplicaID: "atlantis-3", DeploymentID: "conformance",
+		StartedAt: unknownCreatedAt, HeartbeatAt: unknownCreatedAt,
+	}))
+	unknownAttemptID := mustID(t)
+	require.NoError(t, store.CreateAttempt(ctx, runs.RunAttempt{
+		ID: unknownAttemptID, RunID: unknownRunID, InstanceID: unknownInstanceID,
+		DeploymentID:   "conformance",
+		ConcurrencyKey: "sha256:unknown-apply", OwnershipClaimID: "old-apply-claim",
+		Status: runs.AttemptClaimed, ClaimedAt: unknownCreatedAt, HeartbeatAt: unknownCreatedAt,
+	}))
+	require.NoError(t, store.StartAttempt(ctx, unknownAttemptID, unknownCreatedAt))
+	require.NoError(t, store.MarkAttemptSideEffectStarted(ctx, unknownAttemptID, unknownCreatedAt))
+	unknownRecoveredAt := unknownCreatedAt.Add(2 * time.Minute)
+	unknownRequest := runs.AttemptTakeoverRequest{
+		DeploymentID: "conformance", ConcurrencyKey: "sha256:unknown-apply", OwnershipClaimID: "new-apply-claim",
+		HeartbeatBefore: unknownRecoveredAt.Add(-time.Minute), RecoveredAt: unknownRecoveredAt,
+		Repository: unknownRun.Repository, PullNumber: &unknownPull, Command: unknownRun.Command,
+		Trigger: unknownRun.Trigger, Actor: unknownRun.Actor, BaseRef: unknownRun.BaseRef,
+		HeadRef: unknownRun.HeadRef, HeadSHA: unknownRun.HeadSHA,
+	}
+	unknownTakeover, err := store.PrepareAttemptTakeover(ctx, unknownRequest)
+	require.NoError(t, err)
+	require.Equal(t, runs.AttemptUnknown, unknownTakeover.RecoveredAttempt.Status)
+	require.Equal(t, unknownAttemptID, unknownTakeover.UnreconciledUnknown.ID)
+	require.Nil(t, unknownTakeover.RetryRun)
+	storedUnknownRun, err := store.GetRun(ctx, unknownRunID)
+	require.NoError(t, err)
+	require.Equal(t, runs.StatusUnknown, storedUnknownRun.Status)
+
+	// The unknown apply remains a mutation fence, but must not prevent a fresh
+	// plan from producing the evidence an operator needs for reconciliation.
+	freshPlanRunID := mustID(t)
+	require.NoError(t, store.CreateRun(ctx, runs.Run{
+		ID: freshPlanRunID, Repository: unknownRun.Repository, PullNumber: &unknownPull,
+		Command: runs.CommandPlan, Trigger: runs.TriggerComment, Status: runs.StatusRunning,
+		CreatedAt: unknownRecoveredAt, StartedAt: &unknownRecoveredAt,
+	}))
+	freshPlanAttemptID := mustID(t)
+	require.NoError(t, store.CreateAttempt(ctx, runs.RunAttempt{
+		ID: freshPlanAttemptID, RunID: freshPlanRunID, InstanceID: unknownInstanceID,
+		DeploymentID: "conformance", ConcurrencyKey: "sha256:unknown-apply",
+		OwnershipClaimID: "fresh-plan-claim", Status: runs.AttemptClaimed,
+		ClaimedAt: unknownRecoveredAt, HeartbeatAt: unknownRecoveredAt,
+	}))
+	require.NoError(t, store.CompleteAttempt(ctx, runs.AttemptCompletion{
+		ID: freshPlanAttemptID, Status: runs.AttemptInterrupted,
+		CompletedAt: unknownRecoveredAt.Add(time.Millisecond), FailureReason: "test plan admission completed",
+	}))
+
+	blockedApplyRunID := mustID(t)
+	require.NoError(t, store.CreateRun(ctx, runs.Run{
+		ID: blockedApplyRunID, Repository: unknownRun.Repository, PullNumber: &unknownPull,
+		Command: runs.CommandApply, Trigger: runs.TriggerComment, Status: runs.StatusRunning,
+		CreatedAt: unknownRecoveredAt, StartedAt: &unknownRecoveredAt,
+	}))
+	require.ErrorIs(t, store.CreateAttempt(ctx, runs.RunAttempt{
+		ID: mustID(t), RunID: blockedApplyRunID, InstanceID: unknownInstanceID,
+		DeploymentID: "conformance", ConcurrencyKey: "sha256:unknown-apply",
+		OwnershipClaimID: "blocked-apply-claim", Status: runs.AttemptClaimed,
+		ClaimedAt: unknownRecoveredAt, HeartbeatAt: unknownRecoveredAt,
+	}), runs.ErrConflict)
+
+	stillBlocked, err := store.PrepareAttemptTakeover(ctx, unknownRequest)
+	require.NoError(t, err)
+	require.Equal(t, unknownAttemptID, stillBlocked.UnreconciledUnknown.ID)
+	require.NoError(t, store.ReconcileAttempt(ctx, runs.AttemptReconciliation{
+		ID: unknownAttemptID, AuditEventID: mustID(t), At: unknownRecoveredAt.Add(time.Second), Actor: "operator",
+		Summary: "state inspected; fresh plan generated",
+	}))
+	afterReconciliation, err := store.PrepareAttemptTakeover(ctx, unknownRequest)
+	require.NoError(t, err)
+	require.Nil(t, afterReconciliation.UnreconciledUnknown)
+	reconciliationAudit, err := store.ListAuditEvents(ctx, runs.AuditFilter{
+		Repository: "example/infrastructure", EventTypes: []string{"execution_attempt.reconciled"},
+	}, runs.PageRequest{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, reconciliationAudit.Events, 2)
+	require.Contains(t, string(reconciliationAudit.Events[0].Metadata), "attempt_id")
+
+	retentionCutoff := unknownRecoveredAt.Add(2 * time.Second)
 	retention, err := store.ApplyRetention(ctx, runs.RetentionPolicy{
 		RunMetadataBefore: &retentionCutoff,
 	})
 	require.NoError(t, err)
-	require.Equal(t, runs.RetentionResult{}, retention,
-		"unreconciled unknown attempts must retain their run, project output, and admission fence")
+	require.Equal(t, int64(3), retention.RunsDeleted)
+	require.Equal(t, int64(2), retention.ProjectRunsDeleted)
+	require.Equal(t, int64(0), retention.OutputChunksDeleted)
 	_, err = store.GetRun(ctx, runID)
-	require.NoError(t, err)
+	require.NoError(t, err,
+		"unreconciled unknown attempts must retain their run, project output, and admission fence")
 	require.NoError(t, store.ReconcileAttempt(ctx, runs.AttemptReconciliation{
-		ID: replacementAttempt.ID, At: completedAt.Add(time.Millisecond), Actor: "operator",
+		ID: replacementAttempt.ID, AuditEventID: mustID(t), At: completedAt.Add(time.Millisecond), Actor: "operator",
 		Summary: "state inspected after retention protection test",
 	}))
 	retention, err = store.ApplyRetention(ctx, runs.RetentionPolicy{
@@ -232,6 +490,98 @@ func TestStoreConformance(t *testing.T) {
 	require.Equal(t, int64(2), retention.OutputChunksDeleted)
 	_, err = store.GetRun(ctx, runID)
 	require.ErrorIs(t, err, runs.ErrNotFound)
+}
+
+func TestAttemptTakeoverFinalizesSupersededRun(t *testing.T) {
+	if testing.Short() {
+		t.Skip("PostgreSQL conformance test is disabled in short mode")
+	}
+	testURL := os.Getenv("ATLANTIS_POSTGRES_TEST_URL")
+	if testURL == "" {
+		t.Skip("ATLANTIS_POSTGRES_TEST_URL is not set")
+	}
+	for _, test := range []struct {
+		name              string
+		sideEffectStarted bool
+		expectedStatus    runs.Status
+		expectedAttempt   runs.AttemptStatus
+	}{
+		{name: "before side effect", expectedStatus: runs.StatusFailed, expectedAttempt: runs.AttemptInterrupted},
+		{name: "after side effect", sideEffectStarted: true, expectedStatus: runs.StatusUnknown, expectedAttempt: runs.AttemptUnknown},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			store, cleanup := newIsolatedStore(t, ctx, testURL)
+			defer cleanup()
+
+			createdAt := time.Now().UTC().Truncate(time.Microsecond)
+			startedAt := createdAt.Add(time.Second)
+			oldRunID, newRunID := mustID(t), mustID(t)
+			for _, runID := range []runs.ID{oldRunID, newRunID} {
+				run := runs.Run{
+					ID: runID, Repository: "example/infrastructure", Command: runs.CommandApply,
+					Trigger: runs.TriggerComment, Status: runs.StatusPending, CreatedAt: createdAt,
+				}
+				require.NoError(t, store.CreateRun(ctx, run))
+				require.NoError(t, store.StartRun(ctx, runID, startedAt))
+			}
+			instanceID := mustID(t)
+			require.NoError(t, store.RegisterInstance(ctx, runs.ExecutionInstance{
+				ID: instanceID, ReplicaID: "atlantis-0", DeploymentID: "takeover-test",
+				StartedAt: createdAt, HeartbeatAt: createdAt,
+			}))
+			oldAttemptID := mustID(t)
+			oldAttempt := runs.RunAttempt{
+				ID: oldAttemptID, RunID: oldRunID, InstanceID: instanceID,
+				DeploymentID: "takeover-test", ConcurrencyKey: "sha256:pull",
+				OwnershipClaimID: "claim-1", Status: runs.AttemptClaimed,
+				ClaimedAt: createdAt, HeartbeatAt: createdAt,
+			}
+			require.NoError(t, store.CreateAttempt(ctx, oldAttempt))
+			require.NoError(t, store.StartAttempt(ctx, oldAttemptID, startedAt))
+			projectRunID := mustID(t)
+			require.NoError(t, store.CreateProjectRun(ctx, runs.ProjectRun{
+				ID: projectRunID, RunID: oldRunID, Directory: "terraform/network",
+				Workspace: "production", Status: runs.StatusPending,
+			}))
+			require.NoError(t, store.StartProjectRun(ctx, projectRunID, startedAt))
+			if test.sideEffectStarted {
+				require.NoError(t, store.MarkAttemptSideEffectStarted(ctx, oldAttemptID, startedAt.Add(time.Millisecond)))
+			}
+
+			takeoverAt := startedAt.Add(-2 * time.Millisecond)
+			createErr := store.CreateAttempt(ctx, runs.RunAttempt{
+				ID: mustID(t), RunID: newRunID, InstanceID: instanceID,
+				DeploymentID: "takeover-test", ConcurrencyKey: "sha256:pull",
+				OwnershipClaimID: "claim-2", Status: runs.AttemptClaimed,
+				ClaimedAt: takeoverAt, HeartbeatAt: takeoverAt,
+			})
+			expectedCompletedAt := startedAt
+			if test.sideEffectStarted {
+				require.ErrorIs(t, createErr, runs.ErrConflict)
+				expectedCompletedAt = startedAt.Add(time.Millisecond)
+			} else {
+				require.NoError(t, createErr)
+			}
+
+			storedAttempt, err := store.GetAttempt(ctx, oldAttemptID)
+			require.NoError(t, err)
+			require.Equal(t, test.expectedAttempt, storedAttempt.Status)
+			require.Equal(t, expectedCompletedAt, *storedAttempt.CompletedAt)
+			storedRun, err := store.GetRun(ctx, oldRunID)
+			require.NoError(t, err)
+			require.Equal(t, test.expectedStatus, storedRun.Status)
+			require.Equal(t, expectedCompletedAt, *storedRun.CompletedAt)
+			storedProject, err := store.GetProjectRun(ctx, projectRunID)
+			require.NoError(t, err)
+			require.Equal(t, test.expectedStatus, storedProject.Status)
+			require.Equal(t, expectedCompletedAt, *storedProject.CompletedAt)
+			currentRun, err := store.GetRun(ctx, newRunID)
+			require.NoError(t, err)
+			require.Equal(t, runs.StatusRunning, currentRun.Status)
+		})
+	}
 }
 
 func newIsolatedStore(t *testing.T, ctx context.Context, rawURL string) (*postgres.Store, func()) {

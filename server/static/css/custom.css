@@ -303,6 +303,7 @@ tbody {
 .history-status-succeeded, .history-status-success, .history-status-unchanged, .history-status-clean { background: #e5f7ed; color: #176b3a; }
 .history-status-failed, .history-status-cancelled { background: #fde9e8; color: #a12622; }
 .history-status-partial, .history-status-drifted, .history-status-locked { background: #fff0d5; color: #8b5700; }
+.history-status-unknown { background: #fff0d5; color: #8b3a00; }
 .history-status-pending, .history-status-running { background: #e4f4fb; color: #126989; }
 .history-status-skipped { background: #edf0f2; color: #59676f; }
 .history-muted { color: #7b8b95; }
@@ -359,6 +360,18 @@ tbody {
 }
 .history-output-stderr { color: #ffb5ad; }
 .history-output-system { color: #a9dff2; }
+.history-attempt-table td { min-width: 14rem; }
+.history-attempt-table td:nth-child(2), .history-attempt-table td:nth-child(5) { min-width: 24rem; }
+.history-attempt-facts { margin: 1rem 0 0; }
+.history-attempt-facts dt { color: #667781; font-size: 1rem; margin-top: .6rem; text-transform: uppercase; }
+.history-attempt-facts dd { margin: 0; overflow-wrap: anywhere; }
+.history-warning { color: #8b3a00; }
+.history-reconciled { background: #e5f7ed; border-left: 3px solid #2d8b53; margin-top: 1rem; padding: 1rem; }
+.history-reconciled p { margin: .6rem 0 0; }
+.history-reconcile-form { margin: 1.2rem 0 0; }
+.history-reconcile-form label { font-size: 1.1rem; text-transform: uppercase; }
+.history-reconcile-form textarea { box-sizing: border-box; min-height: 9rem; width: 100%; }
+.history-reconcile-form button { margin-bottom: 0; }
 
 @media (max-width: 1000px) {
   .history-filter, .history-filter-project, .history-filter-audit { grid-template-columns: repeat(2, minmax(12rem, 1fr)); }

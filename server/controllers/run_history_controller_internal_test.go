@@ -5,10 +5,12 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -119,6 +121,127 @@ func TestRunHistoryControllerDoesNotExposeProjectOutputWithoutAuthentication(t *
 	require.False(t, reader.readCalled)
 }
 
+func TestRunHistoryControllerReconcilesUnknownAttemptThroughConfirmedAPI(t *testing.T) {
+	runID := mustRunHistoryID(t)
+	attemptID := mustRunHistoryID(t)
+	reader := &recordingRunReader{attemptResult: runs.RunAttempt{
+		ID: attemptID, RunID: runID, Status: runs.AttemptUnknown,
+	}}
+	controller := testRunHistoryController(t, reader, &recordingHistoryTemplate{})
+	controller.WebAuthentication = true
+	request := mux.SetURLVars(httptest.NewRequest(http.MethodPost,
+		"/runs/x/attempts/y/reconcile", strings.NewReader(`{"summary":"state inspected; fresh plan required"}`)),
+		map[string]string{"run-id": string(runID), "attempt-id": string(attemptID)})
+	request.SetBasicAuth("operator", "password")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Atlantis-Reconcile-Unknown", "true")
+	recorder := httptest.NewRecorder()
+
+	controller.ReconcileAttempt(recorder, request)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Equal(t, attemptID, reader.reconciliation.ID)
+	require.Equal(t, "operator", reader.reconciliation.Actor)
+	require.Equal(t, "state inspected; fresh plan required", reader.reconciliation.Summary)
+	require.NotEmpty(t, reader.reconciliation.AuditEventID)
+	_, err := runs.ParseID(string(reader.reconciliation.AuditEventID))
+	require.NoError(t, err)
+	require.Contains(t, recorder.Body.String(), `"status":"reconciled"`)
+}
+
+func TestRunHistoryControllerAllowsMaximumDecodedSummaryAfterTransportEncoding(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		summary     string
+		contentType string
+		body        func(*RunHistoryController, runs.ID, runs.ID, string) string
+		wantStatus  int
+	}{
+		{
+			name: "JSON escapes", summary: strings.Repeat("\"", maxReconciliationBytes),
+			contentType: "application/json", wantStatus: http.StatusOK,
+			body: func(_ *RunHistoryController, _, _ runs.ID, summary string) string {
+				encoded, err := json.Marshal(map[string]string{"summary": summary})
+				require.NoError(t, err)
+				return string(encoded)
+			},
+		},
+		{
+			name: "form percent encoding", summary: strings.Repeat("é", maxReconciliationBytes/2),
+			contentType: "application/x-www-form-urlencoded", wantStatus: http.StatusSeeOther,
+			body: func(controller *RunHistoryController, runID, attemptID runs.ID, summary string) string {
+				return url.Values{
+					"csrf_token": {controller.reconciliationToken(runID, attemptID)},
+					"summary":    {summary},
+				}.Encode()
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			runID := mustRunHistoryID(t)
+			attemptID := mustRunHistoryID(t)
+			reader := &recordingRunReader{attemptResult: runs.RunAttempt{
+				ID: attemptID, RunID: runID, Status: runs.AttemptUnknown,
+			}}
+			controller := testRunHistoryController(t, reader, &recordingHistoryTemplate{})
+			controller.WebAuthentication = true
+			request := mux.SetURLVars(httptest.NewRequest(http.MethodPost,
+				"/runs/x/attempts/y/reconcile",
+				strings.NewReader(testCase.body(controller, runID, attemptID, testCase.summary))),
+				map[string]string{"run-id": string(runID), "attempt-id": string(attemptID)})
+			request.SetBasicAuth("operator", "password")
+			request.Header.Set("Content-Type", testCase.contentType)
+			request.Header.Set("X-Atlantis-Reconcile-Unknown", "true")
+			recorder := httptest.NewRecorder()
+
+			controller.ReconcileAttempt(recorder, request)
+
+			require.Equal(t, testCase.wantStatus, recorder.Code)
+			require.Equal(t, maxReconciliationBytes, len([]byte(reader.reconciliation.Summary)))
+			require.Equal(t, testCase.summary, reader.reconciliation.Summary)
+		})
+	}
+}
+
+func TestRunHistoryControllerRejectsSummaryOverDecodedLimit(t *testing.T) {
+	runID := mustRunHistoryID(t)
+	attemptID := mustRunHistoryID(t)
+	reader := &recordingRunReader{attemptResult: runs.RunAttempt{
+		ID: attemptID, RunID: runID, Status: runs.AttemptUnknown,
+	}}
+	controller := testRunHistoryController(t, reader, &recordingHistoryTemplate{})
+	controller.WebAuthentication = true
+	encoded, err := json.Marshal(map[string]string{"summary": strings.Repeat("a", maxReconciliationBytes+1)})
+	require.NoError(t, err)
+	request := mux.SetURLVars(httptest.NewRequest(http.MethodPost,
+		"/runs/x/attempts/y/reconcile", strings.NewReader(string(encoded))),
+		map[string]string{"run-id": string(runID), "attempt-id": string(attemptID)})
+	request.SetBasicAuth("operator", "password")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Atlantis-Reconcile-Unknown", "true")
+	recorder := httptest.NewRecorder()
+
+	controller.ReconcileAttempt(recorder, request)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Empty(t, reader.reconciliation.ID)
+}
+
+func TestRunHistoryControllerReconciliationRequiresConfirmationHeader(t *testing.T) {
+	reader := &recordingRunReader{}
+	controller := testRunHistoryController(t, reader, &recordingHistoryTemplate{})
+	controller.WebAuthentication = true
+	request := httptest.NewRequest(http.MethodPost, "/runs/x/attempts/y/reconcile", strings.NewReader(`{"summary":"checked"}`))
+	request.SetBasicAuth("operator", "password")
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	controller.ReconcileAttempt(recorder, request)
+
+	require.Equal(t, http.StatusForbidden, recorder.Code)
+	require.False(t, reader.readCalled)
+}
+
 func TestRunHistoryControllerReturnsTypedProjectOutputPage(t *testing.T) {
 	runID := mustRunHistoryID(t)
 	projectID := mustRunHistoryID(t)
@@ -174,7 +297,110 @@ func TestRunHistoryControllerParsesAuditDateRange(t *testing.T) {
 	require.Equal(t, time.Date(2026, 8, 17, 0, 0, 0, 0, time.UTC), *reader.auditFilter.CreatedTo)
 }
 
-func testRunHistoryController(t *testing.T, reader runs.Reader, template web_templates.TemplateWriter) *RunHistoryController {
+func TestRunHistoryControllerPresentsAttemptReplicaIdentity(t *testing.T) {
+	runID := mustRunHistoryID(t)
+	attemptID := mustRunHistoryID(t)
+	instanceID := mustRunHistoryID(t)
+	startedAt := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	reader := &recordingRunReader{
+		getRunResult: runs.Run{ID: runID, Repository: "org/repo", Command: runs.CommandPlan,
+			Trigger: runs.TriggerComment, Status: runs.StatusRunning, CreatedAt: startedAt, StartedAt: &startedAt},
+		attemptPage: runs.AttemptPage{Attempts: []runs.RunAttempt{
+			{
+				ID: attemptID, RunID: runID, InstanceID: instanceID,
+				ConcurrencyKey: "sha256:key", OwnershipClaimID: "claim-2",
+				Status: runs.AttemptRunning, ClaimedAt: startedAt, StartedAt: &startedAt, HeartbeatAt: startedAt,
+			},
+			{
+				ID: mustRunHistoryID(t), RunID: runID, InstanceID: instanceID,
+				ConcurrencyKey: "sha256:key", OwnershipClaimID: "claim-1",
+				Status: runs.AttemptInterrupted, ClaimedAt: startedAt, HeartbeatAt: startedAt,
+			},
+		}, NextCursor: "next-attempt"},
+		instanceResult: runs.ExecutionInstance{
+			ID: instanceID, ReplicaID: "atlantis-2", DeploymentID: "production",
+			StartedAt: startedAt, HeartbeatAt: startedAt, Version: "1.2.3", Commit: "abc123",
+		},
+	}
+	template := &recordingHistoryTemplate{}
+	controller := testRunHistoryController(t, reader, template)
+	controller.WebAuthentication = true
+	request := mux.SetURLVars(httptest.NewRequest(http.MethodGet, "/runs/"+string(runID)+"?attempt_cursor=current-attempt", nil), map[string]string{
+		"run-id": string(runID),
+	})
+	request.SetBasicAuth("operator", "password")
+	recorder := httptest.NewRecorder()
+
+	controller.GetRun(recorder, request)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	data, ok := template.data.(web_templates.RunHistoryDetailData)
+	require.True(t, ok)
+	require.Len(t, data.Attempts, 2)
+	require.Equal(t, "atlantis-2", data.Attempts[0].ReplicaID)
+	require.Equal(t, "production", data.Attempts[0].DeploymentID)
+	require.Equal(t, "abc123", data.Attempts[0].Commit)
+	require.Equal(t, 1, reader.instanceReads)
+	require.Equal(t, "current-attempt", reader.attemptPageRequest.Cursor)
+	require.Contains(t, data.AttemptNextPath, "attempt_cursor=next-attempt")
+}
+
+func TestRunHistoryControllerReconcilesUnknownAttemptWithAuditIdentity(t *testing.T) {
+	runID := mustRunHistoryID(t)
+	attemptID := mustRunHistoryID(t)
+	reader := &recordingRunReader{attemptResult: runs.RunAttempt{
+		ID: attemptID, RunID: runID, Status: runs.AttemptUnknown,
+	}}
+	controller := testRunHistoryController(t, reader, &recordingHistoryTemplate{})
+	controller.WebAuthentication = true
+	form := url.Values{
+		"csrf_token": {controller.reconciliationToken(runID, attemptID)},
+		"summary":    {"State inspected; fresh plan confirms no pending changes."},
+	}
+	request := mux.SetURLVars(httptest.NewRequest(http.MethodPost,
+		"/runs/"+string(runID)+"/attempts/"+string(attemptID)+"/reconcile",
+		strings.NewReader(form.Encode())), map[string]string{
+		"run-id": string(runID), "attempt-id": string(attemptID),
+	})
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.SetBasicAuth("operator", "password")
+	recorder := httptest.NewRecorder()
+
+	controller.ReconcileAttempt(recorder, request)
+
+	require.Equal(t, http.StatusSeeOther, recorder.Code)
+	require.Equal(t, attemptID, reader.reconciliation.ID)
+	require.Equal(t, "operator", reader.reconciliation.Actor)
+	require.Equal(t, form.Get("summary"), reader.reconciliation.Summary)
+	_, err := runs.ParseID(string(reader.reconciliation.AuditEventID))
+	require.NoError(t, err)
+	require.Equal(t, "/atlantis/runs/"+string(runID)+"#attempts", recorder.Header().Get("Location"))
+}
+
+func TestRunHistoryControllerRejectsReconciliationWithoutCSRFToken(t *testing.T) {
+	runID := mustRunHistoryID(t)
+	attemptID := mustRunHistoryID(t)
+	reader := &recordingRunReader{attemptResult: runs.RunAttempt{
+		ID: attemptID, RunID: runID, Status: runs.AttemptUnknown,
+	}}
+	controller := testRunHistoryController(t, reader, &recordingHistoryTemplate{})
+	controller.WebAuthentication = true
+	request := mux.SetURLVars(httptest.NewRequest(http.MethodPost,
+		"/runs/"+string(runID)+"/attempts/"+string(attemptID)+"/reconcile",
+		strings.NewReader(url.Values{"summary": {"inspected"}}.Encode())), map[string]string{
+		"run-id": string(runID), "attempt-id": string(attemptID),
+	})
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.SetBasicAuth("operator", "password")
+	recorder := httptest.NewRecorder()
+
+	controller.ReconcileAttempt(recorder, request)
+
+	require.Equal(t, http.StatusForbidden, recorder.Code)
+	require.Empty(t, reader.reconciliation.ID)
+}
+
+func testRunHistoryController(t *testing.T, reader runHistoryStore, template web_templates.TemplateWriter) *RunHistoryController {
 	t.Helper()
 	return &RunHistoryController{
 		AtlantisVersion: "test", AtlantisURL: &url.URL{Path: "/atlantis"},
@@ -202,17 +428,23 @@ func (t *recordingHistoryTemplate) Execute(_ io.Writer, data any) error {
 }
 
 type recordingRunReader struct {
-	failOnRead       bool
-	readCalled       bool
-	listRunsFilter   runs.RunFilter
-	listRunsPage     runs.PageRequest
-	listRunsResult   runs.RunPage
-	getRunResult     runs.Run
-	getProjectResult runs.ProjectRun
-	getOutputResult  runs.OutputPage
-	outputAfter      int64
-	outputLimit      int
-	auditFilter      runs.AuditFilter
+	failOnRead         bool
+	readCalled         bool
+	listRunsFilter     runs.RunFilter
+	listRunsPage       runs.PageRequest
+	listRunsResult     runs.RunPage
+	getRunResult       runs.Run
+	getProjectResult   runs.ProjectRun
+	getOutputResult    runs.OutputPage
+	outputAfter        int64
+	outputLimit        int
+	auditFilter        runs.AuditFilter
+	attemptPage        runs.AttemptPage
+	attemptPageRequest runs.PageRequest
+	attemptResult      runs.RunAttempt
+	instanceResult     runs.ExecutionInstance
+	instanceReads      int
+	reconciliation     runs.AttemptReconciliation
 }
 
 func (r *recordingRunReader) markRead() {
@@ -262,4 +494,27 @@ func (r *recordingRunReader) ListAuditEvents(_ context.Context, filter runs.Audi
 	return runs.AuditPage{}, nil
 }
 
+func (r *recordingRunReader) GetInstance(context.Context, runs.ID) (runs.ExecutionInstance, error) {
+	r.markRead()
+	r.instanceReads++
+	return r.instanceResult, nil
+}
+
+func (r *recordingRunReader) GetAttempt(context.Context, runs.ID) (runs.RunAttempt, error) {
+	r.markRead()
+	return r.attemptResult, nil
+}
+
+func (r *recordingRunReader) ListRunAttempts(_ context.Context, _ runs.ID, page runs.PageRequest) (runs.AttemptPage, error) {
+	r.markRead()
+	r.attemptPageRequest = page
+	return r.attemptPage, nil
+}
+
+func (r *recordingRunReader) ReconcileAttempt(_ context.Context, reconciliation runs.AttemptReconciliation) error {
+	r.reconciliation = reconciliation
+	return nil
+}
+
 var _ runs.Reader = (*recordingRunReader)(nil)
+var _ runHistoryStore = (*recordingRunReader)(nil)

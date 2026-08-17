@@ -70,6 +70,9 @@ const (
 	StatusPartial   Status = "partial"
 	StatusCancelled Status = "cancelled"
 	StatusSkipped   Status = "skipped"
+	// StatusUnknown means infrastructure side effects may have occurred but the
+	// executing process disappeared before Atlantis observed a result.
+	StatusUnknown Status = "unknown"
 )
 
 // Metadata is an optional JSON object for information that is useful to
@@ -135,8 +138,11 @@ type ArtifactReference struct {
 
 // ProjectRun records one project's participation in a Run.
 type ProjectRun struct {
-	ID           ID
-	RunID        ID
+	ID    ID
+	RunID ID
+	// AttemptID is set for HA execution so project results and output remain
+	// attributable when one logical Run spans multiple process attempts.
+	AttemptID    *ID
 	ProjectName  string
 	Directory    string
 	Workspace    string
@@ -160,6 +166,11 @@ func (p ProjectRun) Validate() error {
 	}
 	if _, err := ParseID(string(p.RunID)); err != nil {
 		return fmt.Errorf("validating parent run ID: %w", err)
+	}
+	if p.AttemptID != nil {
+		if _, err := ParseID(string(*p.AttemptID)); err != nil {
+			return fmt.Errorf("validating project attempt ID: %w", err)
+		}
 	}
 	if p.Directory == "" {
 		return fmt.Errorf("directory is required")
@@ -302,7 +313,7 @@ func (t Trigger) valid() bool {
 func (s Status) validForRun() bool {
 	switch s {
 	case StatusPending, StatusRunning, StatusSucceeded, StatusFailed, StatusPartial,
-		StatusCancelled, StatusSkipped:
+		StatusCancelled, StatusSkipped, StatusUnknown:
 		return true
 	default:
 		return false
@@ -346,7 +357,13 @@ func validateLifecycle(status Status, createdAt time.Time, startedAt, completedA
 }
 
 func (s Status) validForProject() bool {
-	return s.validForRun() || s == StatusUnchanged
+	switch s {
+	case StatusPending, StatusRunning, StatusSucceeded, StatusUnchanged, StatusFailed,
+		StatusPartial, StatusCancelled, StatusSkipped, StatusUnknown:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s OutputStream) valid() bool {

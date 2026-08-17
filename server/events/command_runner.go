@@ -15,6 +15,7 @@ import (
 	"github.com/drmaxgit/go-azuredevops/azuredevops"
 	"github.com/google/go-github/v88/github"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/events/vcs"
@@ -147,6 +148,37 @@ type DefaultCommandRunner struct {
 	TeamAllowlistChecker           command.TeamAllowlistChecker          `validate:"required"`
 	VarFileAllowlistChecker        *VarFileAllowlistChecker              `validate:"required"`
 	CommitStatusUpdater            CommitStatusUpdater                   `validate:"required"`
+	RunHistory                     *RunHistory
+	RunAdmissionFailureReporter    RunAdmissionFailureReporter
+}
+
+func (c *DefaultCommandRunner) beginRunLifecycle(ctx *command.Context, commandName command.Name) (*RunLifecycle, bool) {
+	if c.RunHistory == nil {
+		return nil, true
+	}
+	var runCommand runs.Command
+	switch commandName {
+	case command.Plan, command.Autoplan:
+		runCommand = runs.CommandPlan
+	case command.Apply:
+		runCommand = runs.CommandApply
+	case command.Unlock:
+		runCommand = runs.CommandUnlock
+	case command.Import:
+		runCommand = runs.CommandImport
+	case command.State:
+		runCommand = runs.CommandStateRemove
+	default:
+		return nil, true
+	}
+	lifecycle := c.RunHistory.Begin(ctx, runCommand, historyTrigger(ctx))
+	if lifecycle.CanExecute() {
+		return lifecycle, true
+	}
+	if c.RunAdmissionFailureReporter != nil {
+		c.RunAdmissionFailureReporter.ReportRunAdmissionFailure(ctx, commandName)
+	}
+	return lifecycle, false
 }
 
 // RunAutoplanCommand runs plan and policy_checks when a pull request is opened or updated.
@@ -204,15 +236,20 @@ func (c *DefaultCommandRunner) runAutoplanCommand(baseRepo models.Repo, headRepo
 	}
 
 	ctx := &command.Context{
-		User:                 user,
-		Log:                  log,
-		Scope:                scope,
-		Pull:                 pull,
-		HeadRepo:             headRepo,
-		PullStatus:           status,
-		Trigger:              command.AutoTrigger,
-		ExecutionLease:       routing.Lease,
-		RecoverExternalPlans: routing.RecoverExternalPlans,
+		User:                  user,
+		Log:                   log,
+		Scope:                 scope,
+		Pull:                  pull,
+		HeadRepo:              headRepo,
+		PullStatus:            status,
+		Trigger:               command.AutoTrigger,
+		ExecutionLease:        routing.Lease,
+		RecoverExternalPlans:  routing.RecoverExternalPlans,
+		ExecutionInstanceID:   routing.InstanceID,
+		ExecutionDeploymentID: routing.DeploymentID,
+		ConcurrencyKey:        routing.ConcurrencyKey,
+		OwnershipClaimID:      routing.OwnershipClaimID,
+		InvalidateOwnership:   routing.InvalidateOwnership,
 	}
 	if !c.validateCtxAndComment(ctx, command.Autoplan, true) {
 		return
@@ -240,6 +277,13 @@ func (c *DefaultCommandRunner) runAutoplanCommand(baseRepo models.Repo, headRepo
 		return
 	}
 	if shouldSkipPreWorkflowHooks(ctx, cmdRunner, cmd) {
+		return
+	}
+	lifecycle, canExecute := c.beginRunLifecycle(ctx, command.Autoplan)
+	if lifecycle != nil {
+		defer lifecycle.FinishRecovering()
+	}
+	if !canExecute {
 		return
 	}
 
@@ -540,18 +584,23 @@ func (c *DefaultCommandRunner) runCommentCommand(baseRepo models.Repo, maybeHead
 	}
 
 	ctx := &command.Context{
-		User:                 user,
-		Log:                  log,
-		Pull:                 pull,
-		PullStatus:           status,
-		HeadRepo:             headRepo,
-		Scope:                scope,
-		Trigger:              command.CommentTrigger,
-		PolicySet:            cmd.PolicySet,
-		ClearPolicyApproval:  cmd.ClearPolicyApproval,
-		TeamAllowlistChecker: c.TeamAllowlistChecker,
-		ExecutionLease:       routing.Lease,
-		RecoverExternalPlans: routing.RecoverExternalPlans,
+		User:                  user,
+		Log:                   log,
+		Pull:                  pull,
+		PullStatus:            status,
+		HeadRepo:              headRepo,
+		Scope:                 scope,
+		Trigger:               command.CommentTrigger,
+		PolicySet:             cmd.PolicySet,
+		ClearPolicyApproval:   cmd.ClearPolicyApproval,
+		TeamAllowlistChecker:  c.TeamAllowlistChecker,
+		ExecutionLease:        routing.Lease,
+		RecoverExternalPlans:  routing.RecoverExternalPlans,
+		ExecutionInstanceID:   routing.InstanceID,
+		ExecutionDeploymentID: routing.DeploymentID,
+		ConcurrencyKey:        routing.ConcurrencyKey,
+		OwnershipClaimID:      routing.OwnershipClaimID,
+		InvalidateOwnership:   routing.InvalidateOwnership,
 	}
 
 	if !c.validateCtxAndComment(ctx, cmd.Name, true) {
@@ -568,6 +617,13 @@ func (c *DefaultCommandRunner) runCommentCommand(baseRepo models.Repo, maybeHead
 	}
 
 	if !c.validateCommentCommand(ctx, baseRepo, pullNum, user, cmd, !targetInitiallyIgnored) {
+		return
+	}
+	lifecycle, canExecute := c.beginRunLifecycle(ctx, cmd.CommandName())
+	if lifecycle != nil {
+		defer lifecycle.FinishRecovering()
+	}
+	if !canExecute {
 		return
 	}
 

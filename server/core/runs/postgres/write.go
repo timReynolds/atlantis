@@ -144,18 +144,18 @@ func (s *Store) CreateProjectRun(ctx context.Context, projectRun runs.ProjectRun
 	defer cancel()
 
 	result, err := s.db.ExecContext(opCtx, `INSERT INTO project_runs (
-        id, run_id, project_name, directory, workspace, status, additions, changes,
+        id, run_id, attempt_id, project_name, directory, workspace, status, additions, changes,
         destructions, imports, forgets, started_at, completed_at, error_summary,
         plan_artifact_key, plan_artifact_checksum, plan_artifact_created_at,
         plan_artifact_expires_at, metadata
     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-        $14, $15, $16, $17, $18, $19)
+        $14, $15, $16, $17, $18, $19, $20)
     ON CONFLICT DO NOTHING`,
-		projectRun.ID, projectRun.RunID, projectRun.ProjectName, projectRun.Directory,
-		projectRun.Workspace, projectRun.Status, projectRun.Additions, projectRun.Changes,
-		projectRun.Destructions, projectRun.Imports, projectRun.Forgets, projectRun.StartedAt,
-		projectRun.CompletedAt, projectRun.ErrorSummary, artifact.key, artifact.checksum,
-		artifact.createdAt, artifact.expiresAt, []byte(projectRun.Metadata),
+		projectRun.ID, projectRun.RunID, projectRun.AttemptID, projectRun.ProjectName,
+		projectRun.Directory, projectRun.Workspace, projectRun.Status, projectRun.Additions,
+		projectRun.Changes, projectRun.Destructions, projectRun.Imports, projectRun.Forgets,
+		projectRun.StartedAt, projectRun.CompletedAt, projectRun.ErrorSummary, artifact.key,
+		artifact.checksum, artifact.createdAt, artifact.expiresAt, []byte(projectRun.Metadata),
 	)
 	if err != nil {
 		return fmt.Errorf("creating project run: %w", err)

@@ -39,8 +39,10 @@ import (
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/drift"
+	driftpostgres "github.com/runatlantis/atlantis/server/core/drift/postgres"
 	"github.com/runatlantis/atlantis/server/core/redis"
 	"github.com/runatlantis/atlantis/server/core/runs"
+	runspostgres "github.com/runatlantis/atlantis/server/core/runs/postgres"
 	"github.com/runatlantis/atlantis/server/core/terraform/tfclient"
 	"github.com/runatlantis/atlantis/server/jobs"
 	"github.com/runatlantis/atlantis/server/metrics"
@@ -117,6 +119,7 @@ type Server struct {
 	JobsController                 *controllers.JobsController
 	APIController                  *controllers.APIController
 	RunHistoryController           *controllers.RunHistoryController
+	DriftHistoryController         *controllers.DriftHistoryController
 	IndexTemplate                  web_templates.TemplateWriter
 	LockDetailTemplate             web_templates.TemplateWriter
 	ProjectJobsTemplate            web_templates.TemplateWriter
@@ -1151,11 +1154,29 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		RunHistory:                      runHistory,
 	}
 
+	var driftHistoryController *controllers.DriftHistoryController
 	if userConfig.EnableDriftDetection {
 		logger.Info("Drift detection is enabled")
-		driftStorage := drift.NewInMemoryStorage()
+		var driftStorage drift.Storage = drift.NewInMemoryStorage()
+		var remediationStore drift.RemediationResultStore = drift.NewInMemoryRemediationResultStore()
+		if postgresStore, ok := runStore.(*runspostgres.Store); ok {
+			logger.Info("utilizing PostgreSQL drift status storage")
+			driftStorage = driftpostgres.New(postgresStore.Database(), 0)
+			historyStore := driftpostgres.NewHistoryStore(postgresStore.Database(), 0)
+			remediationStore = driftpostgres.NewRemediationStore(postgresStore.Database(), 0)
+			apiController.DriftHistory = historyStore
+			driftHistoryController = &controllers.DriftHistoryController{
+				AtlantisVersion: config.AtlantisVersion, AtlantisURL: parsedURL,
+				Logger: logger, History: historyStore, Remediations: remediationStore,
+				ListTemplate:        web_templates.DriftHistoryListTemplate,
+				DetectionTemplate:   web_templates.DriftDetectionTemplate,
+				RemediationTemplate: web_templates.DriftRemediationTemplate,
+				WebAuthentication:   userConfig.WebBasicAuth,
+				WebUsername:         userConfig.WebUsername, WebPassword: userConfig.WebPassword,
+			}
+		}
 		apiController.DriftStorage = driftStorage
-		apiController.RemediationService = drift.NewInMemoryRemediationService(driftStorage)
+		apiController.RemediationService = drift.NewRemediationService(driftStorage, remediationStore)
 
 		driftWebhookSender, err := webhooks.NewDriftWebhookSender(webhooksConfig, webhookClients)
 		if err != nil {
@@ -1216,6 +1237,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		StatusController:               statusController,
 		APIController:                  apiController,
 		RunHistoryController:           runHistoryController,
+		DriftHistoryController:         driftHistoryController,
 		IndexTemplate:                  web_templates.IndexTemplate,
 		LockDetailTemplate:             web_templates.LockTemplate,
 		ProjectJobsTemplate:            web_templates.ProjectJobsTemplate,
@@ -1280,6 +1302,11 @@ func (s *Server) SetupRoutes() {
 		s.Router.HandleFunc("/runs/{run-id}", s.RunHistoryController.GetRun).Methods("GET").Name(RunHistoryViewRouteName)
 		s.Router.HandleFunc("/runs/{run-id}/projects/{project-id}", s.RunHistoryController.GetProject).Methods("GET")
 		s.Router.HandleFunc("/audit", s.RunHistoryController.ListAudit).Methods("GET")
+	}
+	if s.DriftHistoryController != nil {
+		s.Router.HandleFunc("/drift", s.DriftHistoryController.List).Methods("GET")
+		s.Router.HandleFunc("/drift/detections/{detection-id}", s.DriftHistoryController.GetDetection).Methods("GET")
+		s.Router.HandleFunc("/drift/remediations/{remediation-id}", s.DriftHistoryController.GetRemediation).Methods("GET")
 	}
 
 	r, ok := s.StatsReporter.(prometheus.Reporter)
@@ -1488,12 +1515,13 @@ func (s *Server) Index(w http.ResponseWriter, _ *http.Request) {
 	sort.SliceStable(lockResults, func(i, j int) bool { return lockResults[i].Time.After(lockResults[j].Time) })
 
 	err = s.IndexTemplate.Execute(w, web_templates.IndexData{
-		Locks:             lockResults,
-		PullToJobMapping:  preparePullToJobMappings(s),
-		ApplyLock:         applyLockData,
-		AtlantisVersion:   s.AtlantisVersion,
-		RunHistoryEnabled: s.RunHistoryController != nil && s.WebAuthentication,
-		CleanedBasePath:   s.AtlantisURL.Path,
+		Locks:               lockResults,
+		PullToJobMapping:    preparePullToJobMappings(s),
+		ApplyLock:           applyLockData,
+		AtlantisVersion:     s.AtlantisVersion,
+		RunHistoryEnabled:   s.RunHistoryController != nil && s.WebAuthentication,
+		DriftHistoryEnabled: s.DriftHistoryController != nil && s.WebAuthentication,
+		CleanedBasePath:     s.AtlantisURL.Path,
 	})
 	if err != nil {
 		s.Logger.Err("%s", err.Error())

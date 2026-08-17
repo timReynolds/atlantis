@@ -136,6 +136,7 @@ var testFlags = map[string]any{
 	RepoConfigFlag:                   "",
 	RepoConfigJSONFlag:               "",
 	RunStoreAuditRetentionDaysFlag:   0,
+	RunStoreDriftRetentionDaysFlag:   365,
 	RunStoreMaxIdleConnsFlag:         5,
 	RunStoreMaxOpenConnsFlag:         10,
 	RunStoreOutputRetentionDaysFlag:  90,

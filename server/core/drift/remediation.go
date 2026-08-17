@@ -8,7 +8,6 @@ package drift
 import (
 	"fmt"
 	"slices"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -30,6 +29,21 @@ type RemediationService interface {
 	ListResults(repository string, limit int) ([]*models.RemediationResult, error)
 }
 
+// RemediationResultPersistenceError reports that remediation execution
+// completed but its final result could not be persisted. Callers can still
+// return the completed result without inviting a retry of successful applies.
+type RemediationResultPersistenceError struct {
+	Err error
+}
+
+func (e *RemediationResultPersistenceError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *RemediationResultPersistenceError) Unwrap() error {
+	return e.Err
+}
+
 // RemediationExecutor executes the actual plan/apply operations.
 // This interface allows the service to be decoupled from the API controller.
 type RemediationExecutor interface {
@@ -40,20 +54,25 @@ type RemediationExecutor interface {
 	ExecuteApplyProjects(repository, ref, vcsType string, projects []models.ProjectDrift) ([]models.ProjectRemediationResult, error)
 }
 
-// InMemoryRemediationService implements RemediationService with in-memory storage.
+// InMemoryRemediationService implements RemediationService. Its historical name
+// is retained for compatibility; NewRemediationService can supply a durable
+// result store while the default constructor remains entirely in-memory.
 type InMemoryRemediationService struct {
-	mu           sync.RWMutex
-	results      map[string]*models.RemediationResult
-	repoResults  map[string][]string // repository -> result IDs
 	driftStorage Storage
+	resultStore  RemediationResultStore
 }
 
 // NewInMemoryRemediationService creates a new in-memory remediation service.
 func NewInMemoryRemediationService(driftStorage Storage) *InMemoryRemediationService {
+	return NewRemediationService(driftStorage, NewInMemoryRemediationResultStore())
+}
+
+// NewRemediationService creates a remediation service using the supplied
+// latest-state and result stores.
+func NewRemediationService(driftStorage Storage, resultStore RemediationResultStore) *InMemoryRemediationService {
 	return &InMemoryRemediationService{
-		results:      make(map[string]*models.RemediationResult),
-		repoResults:  make(map[string][]string),
 		driftStorage: driftStorage,
+		resultStore:  resultStore,
 	}
 }
 
@@ -68,15 +87,26 @@ func (s *InMemoryRemediationService) Remediate(req models.RemediationRequest, ex
 	}
 
 	// Generate unique ID
-	id := uuid.New().String()
+	id := req.RunID
+	if id == "" {
+		generated, err := uuid.NewV7()
+		if err != nil {
+			return nil, fmt.Errorf("generating remediation ID: %w", err)
+		}
+		id = generated.String()
+	}
 
 	// Create result
 	result := models.NewRemediationResult(id, req.Repository, req.Ref, req.Action)
+	result.RunID = req.RunID
 	result.StorageRepository = remediationStorageRepository(req)
+	result.BaseBranch = remediationBaseBranch(req)
 	result.Status = models.RemediationStatusRunning
 
 	// Store initial result
-	s.storeResult(result)
+	if err := s.storeResult(result); err != nil {
+		return nil, err
+	}
 
 	// Get projects to remediate
 	projects, err := s.getProjectsToRemediate(req)
@@ -85,7 +115,9 @@ func (s *InMemoryRemediationService) Remediate(req models.RemediationRequest, ex
 		result.Status = models.RemediationStatusFailed
 		completedAt := time.Now()
 		result.CompletedAt = &completedAt
-		s.storeResult(result)
+		if err := s.storeResult(result); err != nil {
+			return nil, err
+		}
 		return result, nil
 	}
 	projects, err = deduplicateRemediationTargets(req, projects)
@@ -94,7 +126,9 @@ func (s *InMemoryRemediationService) Remediate(req models.RemediationRequest, ex
 		result.Status = models.RemediationStatusFailed
 		completedAt := time.Now()
 		result.CompletedAt = &completedAt
-		s.storeResult(result)
+		if err := s.storeResult(result); err != nil {
+			return nil, err
+		}
 		return result, nil
 	}
 
@@ -107,7 +141,9 @@ func (s *InMemoryRemediationService) Remediate(req models.RemediationRequest, ex
 		} else {
 			result.Complete()
 		}
-		s.storeResult(result)
+		if err := s.storeResult(result); err != nil {
+			return nil, err
+		}
 		return result, nil
 	}
 
@@ -117,7 +153,9 @@ func (s *InMemoryRemediationService) Remediate(req models.RemediationRequest, ex
 				result.AddProjectResult(projectResult)
 			}
 			result.Complete()
-			s.storeResult(result)
+			if err := s.storeResult(result); err != nil {
+				return nil, err
+			}
 			return result, nil
 		}
 		for _, projectResult := range s.remediateProjectsWithApply(req, projects, executor) {
@@ -133,7 +171,9 @@ func (s *InMemoryRemediationService) Remediate(req models.RemediationRequest, ex
 
 	// Mark as complete
 	result.Complete()
-	s.storeResult(result)
+	if err := s.storeResult(result); err != nil {
+		return result, &RemediationResultPersistenceError{Err: err}
+	}
 
 	return result, nil
 }
@@ -583,23 +623,14 @@ func (s *InMemoryRemediationService) remediateProject(req models.RemediationRequ
 }
 
 // storeResult stores a remediation result.
-func (s *InMemoryRemediationService) storeResult(result *models.RemediationResult) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.results[result.ID] = cloneRemediationResult(result)
-
-	repositoryKey := remediationResultRepositoryKey(result)
-
-	// Track by repository
-	if _, ok := s.repoResults[repositoryKey]; !ok {
-		s.repoResults[repositoryKey] = []string{}
+func (s *InMemoryRemediationService) storeResult(result *models.RemediationResult) error {
+	if s.resultStore == nil {
+		return fmt.Errorf("remediation result store is required")
 	}
-
-	// Check if ID already exists in repo results
-	if !slices.Contains(s.repoResults[repositoryKey], result.ID) {
-		s.repoResults[repositoryKey] = append(s.repoResults[repositoryKey], result.ID)
+	if err := s.resultStore.Put(result); err != nil {
+		return fmt.Errorf("storing remediation result: %w", err)
 	}
+	return nil
 }
 
 func remediationProjectKey(projectName, path, workspace string) string {
@@ -668,34 +699,18 @@ func remediationResultRepositoryKey(result *models.RemediationResult) string {
 
 // GetResult retrieves a remediation result by ID.
 func (s *InMemoryRemediationService) GetResult(id string) (*models.RemediationResult, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	result, ok := s.results[id]
-	if !ok {
-		return nil, fmt.Errorf("remediation result not found: %s", id)
+	if s.resultStore == nil {
+		return nil, fmt.Errorf("remediation result store is required")
 	}
-	return cloneRemediationResult(result), nil
+	return s.resultStore.GetResult(id)
 }
 
 // ListResults returns all remediation results for a repository.
 func (s *InMemoryRemediationService) ListResults(repository string, limit int) ([]*models.RemediationResult, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	ids, ok := s.repoResults[repository]
-	if !ok {
-		return []*models.RemediationResult{}, nil
+	if s.resultStore == nil {
+		return nil, fmt.Errorf("remediation result store is required")
 	}
-
-	results := make([]*models.RemediationResult, 0, len(ids))
-	for i := len(ids) - 1; i >= 0 && (limit <= 0 || len(results) < limit); i-- {
-		if result, ok := s.results[ids[i]]; ok {
-			results = append(results, cloneRemediationResult(result))
-		}
-	}
-
-	return results, nil
+	return s.resultStore.ListResults(repository, limit)
 }
 
 // RemediationHistory represents the history of remediations for tracking.

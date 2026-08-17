@@ -21,6 +21,8 @@ import (
 
 const (
 	maximumErrorSummaryBytes = 2048
+	resultOutputChunkBytes   = 32 * 1024
+	resultOutputWriteBatch   = 32
 	runHistoryWriteTimeout   = 5 * time.Second
 )
 
@@ -314,6 +316,7 @@ type projectObservation struct {
 	artifact       *runs.ArtifactReference
 	phases         map[string]bool
 	policyOutcomes map[string]bool
+	outputSequence int64
 }
 
 func (h *RunHistory) beginProject(ctx command.ProjectContext) command.ProjectContext {
@@ -360,7 +363,6 @@ func (h *RunHistory) recordProject(ctx command.ProjectContext, phase command.Nam
 		return
 	}
 	project.mu.Lock()
-	defer project.mu.Unlock()
 	project.phases[phase.String()] = true
 	if output.Cancelled {
 		project.status = runs.StatusCancelled
@@ -396,6 +398,94 @@ func (h *RunHistory) recordProject(ctx command.ProjectContext, phase command.Nam
 			project.policyOutcomes[policySet.PolicySetName] = policySet.Passed
 		}
 	}
+	var chunks []runs.OutputChunk
+	if ctx.SuppressJobOutput {
+		chunks = project.resultOutputChunks(output, h.now().UTC())
+	}
+	project.mu.Unlock()
+	if len(chunks) == 0 {
+		return
+	}
+	sessionValue, ok := h.sessions.Load(ctx.RunID)
+	if !ok {
+		return
+	}
+	session := sessionValue.(*runSession)
+	for len(chunks) > 0 {
+		batchSize := min(len(chunks), resultOutputWriteBatch)
+		batch := chunks[:batchSize]
+		if err := writeRunHistory(func(writeCtx context.Context) error {
+			return h.writer.AppendOutput(writeCtx, batch)
+		}); err != nil {
+			h.markPersistenceFailed(ctx.Log, session, "persisting suppressed project output", err)
+			return
+		}
+		chunks = chunks[batchSize:]
+	}
+}
+
+func (p *projectObservation) resultOutputChunks(output command.ProjectCommandOutput, createdAt time.Time) []runs.OutputChunk {
+	var sources []struct {
+		stream  runs.OutputStream
+		content string
+	}
+	appendSource := func(stream runs.OutputStream, content string) {
+		if content == "" {
+			return
+		}
+		sources = append(sources, struct {
+			stream  runs.OutputStream
+			content string
+		}{stream: stream, content: content})
+	}
+	if output.PlanSuccess != nil {
+		appendSource(runs.OutputStdout, output.PlanSuccess.TerraformOutput)
+	}
+	if output.PolicyCheckResults != nil {
+		appendSource(runs.OutputStdout, output.PolicyCheckResults.PreConftestOutput)
+		appendSource(runs.OutputStdout, output.PolicyCheckResults.CombinedOutput())
+		appendSource(runs.OutputStdout, output.PolicyCheckResults.PostConftestOutput)
+	}
+	appendSource(runs.OutputStdout, output.ApplySuccess)
+	appendSource(runs.OutputStdout, output.VersionSuccess)
+	if output.ImportSuccess != nil {
+		appendSource(runs.OutputStdout, output.ImportSuccess.Output)
+	}
+	if output.StateRmSuccess != nil {
+		appendSource(runs.OutputStdout, output.StateRmSuccess.Output)
+	}
+	if output.Error != nil {
+		appendSource(runs.OutputStderr, output.Error.Error())
+	}
+	appendSource(runs.OutputStderr, output.Failure)
+
+	var chunks []runs.OutputChunk
+	for _, source := range sources {
+		content := strings.ReplaceAll(source.content, "\x00", "�")
+		content = strings.ToValidUTF8(content, "�")
+		if !strings.HasSuffix(content, "\n") && !strings.HasSuffix(content, "\r") {
+			content += "\n"
+		}
+		for content != "" {
+			length := min(len(content), resultOutputChunkBytes)
+			for length > 0 && length < len(content) && !utf8.RuneStart(content[length]) {
+				length--
+			}
+			if length == 0 {
+				length = min(len(content), resultOutputChunkBytes)
+			}
+			chunks = append(chunks, runs.OutputChunk{
+				ProjectRunID: p.id,
+				Sequence:     p.outputSequence,
+				Stream:       source.stream,
+				Content:      content[:length],
+				CreatedAt:    createdAt,
+			})
+			p.outputSequence++
+			content = content[length:]
+		}
+	}
+	return chunks
 }
 
 // RecordPlanArtifact associates opaque S3 plan metadata with its Project Run.
@@ -404,7 +494,11 @@ func (h *RunHistory) RecordPlanArtifact(ctx command.ProjectContext, artifact run
 		return
 	}
 	value, ok := h.sessions.Load(ctx.RunID)
-	if !ok || value.(*runSession).run.Command != runs.CommandPlan {
+	if !ok {
+		return
+	}
+	commandName := value.(*runSession).run.Command
+	if commandName != runs.CommandPlan && commandName != runs.CommandDriftDetection {
 		return
 	}
 	project := h.project(ctx)

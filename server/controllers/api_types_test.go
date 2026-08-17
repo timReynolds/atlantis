@@ -5,6 +5,7 @@ package controllers_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/runatlantis/atlantis/server/controllers"
 	"github.com/runatlantis/atlantis/server/events/command"
@@ -40,11 +41,14 @@ func TestNewDriftProjectAPI_IncludesForgetCount(t *testing.T) {
 }
 
 func TestNewDriftProjectAPI_NeverCopiesPlanOutput(t *testing.T) {
+	lastSuccessful := time.Now().UTC()
 	pd := models.ProjectDrift{
-		Drift:      models.DriftSummary{HasDrift: true},
-		PlanOutput: "Terraform will perform the following actions...",
+		Drift:                 models.DriftSummary{HasDrift: true},
+		PlanOutput:            "Terraform will perform the following actions...",
+		LastSuccessfulChecked: &lastSuccessful,
 	}
 
 	result := controllers.NewDriftProjectAPI(pd)
 	Equals(t, "", result.PlanOutput)
+	Equals(t, lastSuccessful, *result.LastSuccessfulChecked)
 }

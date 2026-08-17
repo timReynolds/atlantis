@@ -283,6 +283,8 @@ func newProjectCommandContext(ctx *command.Context,
 	}
 
 	return command.ProjectContext{
+		RunID:                      ctx.RunID,
+		ObserveProjectResult:       ctx.ObserveProjectResult,
 		CommandName:                cmd,
 		SubCommand:                 subCommand,
 		ApplyCmd:                   applyCmd,

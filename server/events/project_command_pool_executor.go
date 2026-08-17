@@ -78,15 +78,7 @@ func runProjectCmdsParallel(
 
 	if cancelledAt != -1 {
 		for _, pCmd := range cmds[cancelledAt:] {
-			results = append(results, command.ProjectResult{
-				Command: pCmd.CommandName,
-				ProjectCommandOutput: command.ProjectCommandOutput{
-					Error: fmt.Errorf("operation cancelled via `atlantis cancel` command"),
-				},
-				RepoRelDir:  pCmd.RepoRelDir,
-				Workspace:   pCmd.Workspace,
-				ProjectName: pCmd.ProjectName,
-			})
+			results = append(results, cancelledProjectResult(pCmd))
 		}
 	}
 
@@ -224,16 +216,23 @@ func createCancelledResults(remainingGroups [][]command.ProjectContext) []comman
 	var cancelledResults []command.ProjectResult
 	for _, group := range remainingGroups {
 		for _, cmd := range group {
-			cancelledResults = append(cancelledResults, command.ProjectResult{
-				Command: cmd.CommandName,
-				ProjectCommandOutput: command.ProjectCommandOutput{
-					Error: fmt.Errorf("operation cancelled via `atlantis cancel` command"),
-				},
-				RepoRelDir:  cmd.RepoRelDir,
-				Workspace:   cmd.Workspace,
-				ProjectName: cmd.ProjectName,
-			})
+			cancelledResults = append(cancelledResults, cancelledProjectResult(cmd))
 		}
 	}
 	return cancelledResults
+}
+
+func cancelledProjectResult(ctx command.ProjectContext) command.ProjectResult {
+	output := command.ProjectCommandOutput{
+		Error:     fmt.Errorf("operation cancelled via `atlantis cancel` command"),
+		Cancelled: true,
+	}
+	if ctx.ObserveProjectResult != nil {
+		ctx.ObserveProjectResult(ctx, ctx.CommandName, output)
+	}
+	return command.ProjectResult{
+		Command: ctx.CommandName, ProjectCommandOutput: output,
+		RepoRelDir: ctx.RepoRelDir, Workspace: ctx.Workspace, ProjectName: ctx.ProjectName,
+		SilencePRComments: ctx.SilencePRComments,
+	}
 }

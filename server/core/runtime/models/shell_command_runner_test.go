@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	. "github.com/petergtz/pegomock/v4"
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/core/runtime/models"
 	"github.com/runatlantis/atlantis/server/events/command"
+	"github.com/runatlantis/atlantis/server/jobs"
 	"github.com/runatlantis/atlantis/server/jobs/mocks"
 	logmocks "github.com/runatlantis/atlantis/server/logging/mocks"
 	. "github.com/runatlantis/atlantis/testing"
@@ -81,6 +84,43 @@ func TestShellCommandRunner_Run(t *testing.T) {
 		})
 	}
 }
+
+func TestShellCommandRunnerPreservesOutputStreamIdentity(t *testing.T) {
+	RegisterMockTestingT(t)
+	log := logmocks.NewMockSimpleLogging()
+	When(log.With(Any[string](), Any[any]())).ThenReturn(log)
+	handler := &recordingStreamHandler{}
+	ctx := command.ProjectContext{Log: log, Workspace: "default", RepoRelDir: "."}
+	cwd, err := os.Getwd()
+	Ok(t, err)
+	runner := models.NewShellCommandRunner(nil, "printf 'out\\n'; printf 'err\\n' >&2", nil, cwd, true, handler)
+
+	_, err = runner.Run(ctx)
+	Ok(t, err)
+
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	Equals(t, runs.OutputStdout, handler.streams["out"])
+	Equals(t, runs.OutputStderr, handler.streams["err"])
+}
+
+type recordingStreamHandler struct {
+	jobs.NoopProjectOutputHandler
+	mu      sync.Mutex
+	streams map[string]runs.OutputStream
+}
+
+func (h *recordingStreamHandler) SendStream(_ command.ProjectContext, message string, stream runs.OutputStream, _ bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.streams == nil {
+		h.streams = make(map[string]runs.OutputStream)
+	}
+	h.streams[message] = stream
+}
+
+var _ jobs.ProjectCommandOutputHandler = (*recordingStreamHandler)(nil)
+var _ jobs.StreamProjectCommandOutputHandler = (*recordingStreamHandler)(nil)
 
 func TestShellCommandRunner_RunLongOutputLines(t *testing.T) {
 	// Regression test: lines longer than the default bufio.Scanner token

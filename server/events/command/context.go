@@ -4,6 +4,7 @@
 package command
 
 import (
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/logging"
 	tally "github.com/uber-go/tally/v4"
@@ -23,6 +24,9 @@ const (
 // Context represents the context of a command that should be executed
 // for a pull request.
 type Context struct {
+	// RunID links this command to optional durable run history. It is empty
+	// when durable history is disabled or the command is outside its scope.
+	RunID runs.ID
 	// HeadRepo is the repository that is getting merged into the BaseRepo.
 	// If the pull request branch is from the same repository then HeadRepo will
 	// be the same as BaseRepo.
@@ -103,6 +107,15 @@ type Context struct {
 
 	// Set true if the command was intentionally skipped without executing work.
 	CommandSkipped bool
+
+	// CommandCancelled is set when atlantis cancel prevents queued project work
+	// from starting. It lets optional lifecycle observers distinguish an
+	// operator cancellation from an execution failure.
+	CommandCancelled bool
+
+	// ObserveProjectResult lets optional execution observers record synthetic
+	// project outcomes that do not pass through ProjectCommandRunner.
+	ObserveProjectResult func(ProjectContext, Name, ProjectCommandOutput)
 
 	// PreferLocalRepoCfgForTargetedIgnore makes targeted ignore checks read a
 	// cloned repo config before falling back to VCS content. This is used after

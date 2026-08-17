@@ -13,6 +13,13 @@ import (
 	"github.com/runatlantis/atlantis/server/logging"
 )
 
+const (
+	// RunStoreNoop preserves the existing ephemeral execution behavior.
+	RunStoreNoop = "noop"
+	// RunStorePostgres enables durable run history in PostgreSQL.
+	RunStorePostgres = "postgres"
+)
+
 // UserConfig holds config values passed in by the user.
 // The mapstructure tags correspond to flags in cmd/server.go and are used when
 // the config is parsed from a YAML file.
@@ -114,6 +121,13 @@ type UserConfig struct {
 	RepoConfig                      string `mapstructure:"repo-config"`
 	RepoConfigJSON                  string `mapstructure:"repo-config-json"`
 	RepoAllowlist                   string `mapstructure:"repo-allowlist"`
+	RunStoreType                    string `mapstructure:"run-store-type"`
+	RunStorePostgresURL             string `mapstructure:"run-store-postgres-url"`
+	RunStoreMaxOpenConns            int    `mapstructure:"run-store-max-open-conns"`
+	RunStoreMaxIdleConns            int    `mapstructure:"run-store-max-idle-conns"`
+	RunStoreRetentionDays           int    `mapstructure:"run-store-retention-days"`
+	RunStoreOutputRetentionDays     int    `mapstructure:"run-store-output-retention-days"`
+	RunStoreAuditRetentionDays      int    `mapstructure:"run-store-audit-retention-days"`
 
 	// SilenceNoProjects is whether Atlantis should respond to a PR if no projects are found.
 	SilenceNoProjects   bool `mapstructure:"silence-no-projects"`

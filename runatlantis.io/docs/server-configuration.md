@@ -1461,6 +1461,78 @@ ATLANTIS_RESTRICT_FILE_LIST=true
 When `--enable-regexp-cmd` is also enabled, regex project plans such as `atlantis plan -p .*` are scoped to matching projects with files modified in the pull request.
 Defaults to `false`.
 
+### `--run-store-audit-retention-days`
+
+```bash
+atlantis server --run-store-audit-retention-days=365
+# or
+ATLANTIS_RUN_STORE_AUDIT_RETENTION_DAYS=365
+```
+
+Delete audit events older than this many days. The default `0` retains audit events indefinitely.
+
+### `--run-store-max-idle-conns`
+
+```bash
+atlantis server --run-store-max-idle-conns=5
+# or
+ATLANTIS_RUN_STORE_MAX_IDLE_CONNS=5
+```
+
+Maximum number of idle PostgreSQL connections retained by the durable run history store. Defaults to `5` and must not exceed `--run-store-max-open-conns`. Set to `0` to retain no idle connections.
+
+### `--run-store-max-open-conns`
+
+```bash
+atlantis server --run-store-max-open-conns=10
+# or
+ATLANTIS_RUN_STORE_MAX_OPEN_CONNS=10
+```
+
+Maximum number of open PostgreSQL connections used by the durable run history store. Defaults to `10`.
+
+### `--run-store-output-retention-days`
+
+```bash
+atlantis server --run-store-output-retention-days=90
+# or
+ATLANTIS_RUN_STORE_OUTPUT_RETENTION_DAYS=90
+```
+
+Delete raw command output older than this many days without deleting its run metadata or project summaries. Defaults to `90`; set to `0` to retain output indefinitely.
+
+### `--run-store-postgres-url`
+
+```bash
+ATLANTIS_RUN_STORE_POSTGRES_URL="postgres://atlantis:password@postgres.example.com/atlantis?sslmode=require"
+```
+
+PostgreSQL connection URL used when `--run-store-type=postgres`. Atlantis verifies the connection and applies forward-only run history schema migrations before it reports startup success.
+
+::: warning SECURITY WARNING
+The URL normally contains a database password. Supply it through the `ATLANTIS_RUN_STORE_POSTGRES_URL` environment variable or a protected configuration file instead of a command-line argument.
+:::
+
+### `--run-store-retention-days`
+
+```bash
+atlantis server --run-store-retention-days=730
+# or
+ATLANTIS_RUN_STORE_RETENTION_DAYS=730
+```
+
+Delete terminal run metadata and its project summaries older than this many days. Pending and running records are never removed by retention. The default `0` retains run metadata indefinitely. Deleting a run also deletes any output that remains attached to it; audit events remain and have their run reference cleared.
+
+### `--run-store-type`
+
+```bash
+atlantis server --run-store-type=postgres
+# or
+ATLANTIS_RUN_STORE_TYPE=postgres
+```
+
+Selects the durable run history store. Valid values are `noop` and `postgres`; the default is `noop`, which preserves the existing Atlantis execution and storage behavior. The PostgreSQL store holds run metadata, project results, audit records, and chunked command output. It does not replace Redis coordination or the external plan artifact store.
+
 ### `--silence-allowlist-errors` <Badge text="v0.28.0+" type="info"/>
 
 ```bash

@@ -94,6 +94,11 @@ func (s *Store) Ping(ctx context.Context) error {
 	return s.db.PingContext(opCtx)
 }
 
+// Database returns the connection pool owned by the Store. It is exposed for
+// server composition so other PostgreSQL adapters can share the configured
+// pool; callers must not close it independently.
+func (s *Store) Database() *sql.DB { return s.db }
+
 // Close releases the PostgreSQL connection pool.
 func (s *Store) Close() error { return s.db.Close() }
 

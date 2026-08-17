@@ -37,6 +37,13 @@ type Storage interface {
 	GetAll() (map[string][]models.ProjectDrift, error)
 }
 
+// ObservedDeleter removes a record only if it still has the version observed
+// by a reconciliation read. Shared stores implement this to prevent one
+// replica from deleting a result refreshed concurrently by another replica.
+type ObservedDeleter interface {
+	DeleteObserved(repository string, observed models.ProjectDrift) error
+}
+
 // GetOptions defines optional filters for retrieving drift results.
 type GetOptions struct {
 	// ProjectName filters by project name (exact match).
@@ -110,6 +117,17 @@ func (s *InMemoryStorage) Store(repository string, drift models.ProjectDrift) er
 	}
 
 	key := driftKey(drift)
+	if existing, ok := s.data[repository][key]; ok && existing.LastChecked.After(drift.LastChecked) {
+		return nil
+	}
+	if drift.Error == "" {
+		checked := drift.LastChecked
+		drift.LastSuccessfulChecked = &checked
+	} else if drift.LastSuccessfulChecked == nil {
+		if previous, ok := s.data[repository][key]; ok {
+			drift.LastSuccessfulChecked = previous.LastSuccessfulChecked
+		}
+	}
 	s.data[repository][key] = drift
 	return nil
 }
@@ -207,6 +225,29 @@ func (s *InMemoryStorage) DeleteMatching(repository string, opts GetOptions) err
 	}
 
 	return nil
+}
+
+// DeleteObserved removes one exact identity only when its detection version
+// has not changed since the caller read it.
+func (s *InMemoryStorage) DeleteObserved(repository string, observed models.ProjectDrift) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	repoData, ok := s.data[repository]
+	if !ok {
+		return nil
+	}
+	for key, current := range repoData {
+		if sameProjectIdentity(current, observed) &&
+			current.LastChecked.Equal(observed.LastChecked) && current.DetectionID == observed.DetectionID {
+			delete(repoData, key)
+		}
+	}
+	return nil
+}
+
+func sameProjectIdentity(left, right models.ProjectDrift) bool {
+	return left.ProjectName == right.ProjectName && left.Path == right.Path &&
+		left.Workspace == right.Workspace && left.Ref == right.Ref && left.BaseBranch == right.BaseBranch
 }
 
 func matchesDeleteOptions(drift models.ProjectDrift, opts GetOptions, now time.Time) bool {

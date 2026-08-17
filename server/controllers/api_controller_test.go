@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	. "github.com/petergtz/pegomock/v4"
 	"github.com/runatlantis/atlantis/server/controllers"
@@ -46,6 +47,60 @@ const atlantisToken = "token"
 type recordingDriftSender struct {
 	calls   int
 	results []webhooks.DriftResult
+}
+
+type recordingDetectionHistory struct {
+	records          []drift.DetectionRecord
+	contextErrors    []error
+	contextDeadlines []bool
+	err              error
+}
+
+type recordingAPIHistoryWriter struct {
+	runsCreated   []runs.Run
+	runsCompleted []runs.RunCompletion
+}
+
+func (w *recordingAPIHistoryWriter) CreateRun(_ context.Context, run runs.Run) error {
+	w.runsCreated = append(w.runsCreated, run)
+	return nil
+}
+
+func (w *recordingAPIHistoryWriter) StartRun(context.Context, runs.ID, time.Time) error {
+	return nil
+}
+
+func (w *recordingAPIHistoryWriter) CompleteRun(_ context.Context, completion runs.RunCompletion) error {
+	w.runsCompleted = append(w.runsCompleted, completion)
+	return nil
+}
+
+func (*recordingAPIHistoryWriter) CreateProjectRun(context.Context, runs.ProjectRun) error {
+	return nil
+}
+
+func (*recordingAPIHistoryWriter) StartProjectRun(context.Context, runs.ID, time.Time) error {
+	return nil
+}
+
+func (*recordingAPIHistoryWriter) CompleteProjectRun(context.Context, runs.ProjectRunCompletion) error {
+	return nil
+}
+
+func (*recordingAPIHistoryWriter) AppendOutput(context.Context, []runs.OutputChunk) error {
+	return nil
+}
+
+func (*recordingAPIHistoryWriter) AppendAuditEvent(context.Context, runs.AuditEvent) error {
+	return nil
+}
+
+func (r *recordingDetectionHistory) RecordDetection(ctx context.Context, record drift.DetectionRecord) error {
+	r.records = append(r.records, record)
+	r.contextErrors = append(r.contextErrors, ctx.Err())
+	_, hasDeadline := ctx.Deadline()
+	r.contextDeadlines = append(r.contextDeadlines, hasDeadline)
+	return r.err
 }
 
 func (r *recordingDriftSender) Send(_ logging.SimpleLogging, result webhooks.DriftResult) error {
@@ -704,6 +759,10 @@ func TestAPIController_PlanSetupErrorRedactsCredentials(t *testing.T) {
 
 func TestAPIController_DetectDriftSetupErrorRedactsCredentials(t *testing.T) {
 	ac, _, _ := setup(t)
+	history := &recordingDetectionHistory{}
+	runWriter := &recordingAPIHistoryWriter{}
+	ac.DriftHistory = history
+	ac.RunHistory = events.NewRunHistory(runWriter, logging.NewNoopLogger(t))
 	workingDir := ac.WorkingDir.(*MockWorkingDir)
 	When(workingDir.Clone(Any[logging.SimpleLogging](), Any[models.Repo](), Any[models.PullRequest](), Any[string]())).
 		ThenReturn("", errors.New("fatal: Authentication failed for 'https://user:super-secret@example.com/Repo.git'"))
@@ -718,6 +777,9 @@ func TestAPIController_DetectDriftSetupErrorRedactsCredentials(t *testing.T) {
 	})
 	req, _ := http.NewRequest("POST", "/api/drift/detect", bytes.NewBuffer(body))
 	req.Header.Set(atlantisTokenHeader, atlantisToken)
+	requestCtx, cancelRequest := context.WithCancel(req.Context())
+	cancelRequest()
+	req = req.WithContext(requestCtx)
 	w := httptest.NewRecorder()
 	ac.DetectDrift(w, req)
 
@@ -725,6 +787,15 @@ func TestAPIController_DetectDriftSetupErrorRedactsCredentials(t *testing.T) {
 	responseBody := w.Body.String()
 	Assert(t, !strings.Contains(responseBody, "super-secret"), "response leaked token: %s", responseBody)
 	Assert(t, !strings.Contains(responseBody, "user:super-secret"), "response leaked credentials: %s", responseBody)
+	Equals(t, 1, len(runWriter.runsCreated))
+	Equals(t, 1, len(runWriter.runsCompleted))
+	Equals(t, runs.StatusFailed, runWriter.runsCompleted[0].Status)
+	Equals(t, 1, len(history.records))
+	Equals(t, 1, len(history.contextErrors))
+	Equals(t, nil, history.contextErrors[0])
+	Equals(t, true, history.contextDeadlines[0])
+	Equals(t, drift.DetectionStatusFailed, history.records[0].Run.Status)
+	Equals(t, string(runWriter.runsCreated[0].ID), history.records[0].Run.ID)
 }
 
 func TestAPIController_LegacyPlanApplyErrorsReturnLegacyShape(t *testing.T) {
@@ -2914,6 +2985,7 @@ func TestAPIController_Remediate(t *testing.T) {
 	parser := NewMockEventParsing()
 	vcsClient := NewMockClient()
 	repoAllowlistChecker, _ := events.NewRepoAllowlistChecker("*")
+	runWriter := &recordingAPIHistoryWriter{}
 
 	remediationService := driftmocks.NewMockRemediationService()
 	mockResult := &models.RemediationResult{
@@ -2933,10 +3005,11 @@ func TestAPIController_Remediate(t *testing.T) {
 		},
 	}
 	var capturedRequest models.RemediationRequest
+	var remediationErr error
 	When(remediationService.Remediate(Any[models.RemediationRequest](), Any[drift.RemediationExecutor]())).
 		Then(func(args []Param) ReturnValues {
 			capturedRequest = args[0].(models.RemediationRequest)
-			return ReturnValues{mockResult, nil}
+			return ReturnValues{mockResult, remediationErr}
 		})
 
 	When(vcsClient.GetCloneURL(Any[logging.SimpleLogging](), Any[models.VCSHostType](), Eq("owner/repo"))).ThenReturn("https://github.com/owner/repo.git", nil)
@@ -2953,6 +3026,7 @@ func TestAPIController_Remediate(t *testing.T) {
 		VCSClient:            vcsClient,
 		RepoAllowlistChecker: repoAllowlistChecker,
 		RemediationService:   remediationService,
+		RunHistory:           events.NewRunHistory(runWriter, logger),
 	}
 
 	body, _ := json.Marshal(models.RemediationRequest{
@@ -2980,6 +3054,25 @@ func TestAPIController_Remediate(t *testing.T) {
 	Equals(t, "refs/heads/main", capturedRequest.ExecutionRef)
 	Equals(t, "main", capturedRequest.BaseBranch)
 	Equals(t, "github.com/owner/repo", capturedRequest.StorageRepository)
+	Assert(t, capturedRequest.RunID != "", "expected preallocated remediation Run ID")
+	Equals(t, 1, len(runWriter.runsCreated))
+	Equals(t, capturedRequest.RunID, string(runWriter.runsCreated[0].ID))
+	Equals(t, runs.CommandDriftRemediation, runWriter.runsCreated[0].Command)
+	Equals(t, 1, len(runWriter.runsCompleted))
+
+	remediationErr = &drift.RemediationResultPersistenceError{Err: errors.New("history unavailable")}
+	retryReq, _ := http.NewRequest("POST", "", bytes.NewBuffer(body))
+	retryReq.Header.Set(atlantisTokenHeader, atlantisToken)
+	retryWriter := httptest.NewRecorder()
+	ac.Remediate(retryWriter, retryReq)
+
+	Equals(t, http.StatusOK, retryWriter.Code)
+	retryResponse, _ := io.ReadAll(retryWriter.Result().Body)
+	var retryResult controllers.RemediationResultAPI
+	parseAPIResponse(t, retryResponse, &retryResult)
+	Assert(t, strings.Contains(retryResult.PersistenceWarning, "do not retry automatically"), "expected a non-retryable persistence warning, got %q", retryResult.PersistenceWarning)
+	Equals(t, 2, len(runWriter.runsCompleted))
+	Equals(t, runs.StatusSucceeded, runWriter.runsCompleted[1].Status)
 }
 
 func TestAPIController_Remediate_ProjectFailuresReturnNon2xx(t *testing.T) {
@@ -3516,7 +3609,7 @@ func TestAPIController_GetRemediationResult_NotFound(t *testing.T) {
 	ac, _, _ := setup(t)
 
 	remediationService := driftmocks.NewMockRemediationService()
-	When(remediationService.GetResult(Eq("nonexistent-id"))).ThenReturn(nil, fmt.Errorf("remediation result not found: nonexistent-id"))
+	When(remediationService.GetResult(Eq("nonexistent-id"))).ThenReturn(nil, fmt.Errorf("%w: nonexistent-id", drift.ErrRemediationResultNotFound))
 	ac.RemediationService = remediationService
 
 	req, _ := http.NewRequest("GET", "/api/drift/remediate/nonexistent-id?repository=owner/repo&type=Github", nil)
@@ -3530,6 +3623,25 @@ func TestAPIController_GetRemediationResult_NotFound(t *testing.T) {
 	response, _ := io.ReadAll(w.Result().Body)
 	apiErr := parseAPIError(t, response)
 	Equals(t, controllers.ErrCodeNotFound, apiErr.Code)
+}
+
+func TestAPIController_GetRemediationResult_StoreFailure(t *testing.T) {
+	ac, _, _ := setup(t)
+
+	remediationService := driftmocks.NewMockRemediationService()
+	When(remediationService.GetResult(Eq("test-id"))).ThenReturn(nil, errors.New("store unavailable"))
+	ac.RemediationService = remediationService
+
+	req, _ := http.NewRequest("GET", "/api/drift/remediate/test-id?repository=owner/repo&type=Github", nil)
+	req = mux.SetURLVars(req, map[string]string{"id": "test-id"})
+	req.Header.Set(atlantisTokenHeader, atlantisToken)
+	w := httptest.NewRecorder()
+	ac.GetRemediationResult(w, req)
+
+	Equals(t, http.StatusInternalServerError, w.Code)
+	response, _ := io.ReadAll(w.Result().Body)
+	apiErr := parseAPIError(t, response)
+	Equals(t, controllers.ErrCodeInternal, apiErr.Code)
 }
 
 func TestAPIController_GetRemediationResult_RequiresRepositoryScope(t *testing.T) {
@@ -4660,6 +4772,7 @@ func TestAPIController_DetectDrift_PolicyCheckFailureIsVisibleAndSuppressesWebho
 		Store(Eq("gitlab.com/Repo"), Any[models.ProjectDrift]()).
 		GetCapturedArguments()
 	Assert(t, strings.Contains(stored.Error, "policy_check failed: policy denied"), "expected policy error in stored drift, got %q", stored.Error)
+	Assert(t, stored.LastSuccessfulChecked == nil, "failed policy check must not advance successful freshness")
 	Equals(t, 0, sender.calls)
 }
 
@@ -4831,6 +4944,10 @@ func TestAPIController_DetectDrift_NonFatalPreHookFailureSkipsStaleReconciliatio
 
 func TestAPIController_DetectDrift_CommandBuildFailureSkipsStaleReconciliation(t *testing.T) {
 	ac, projectCommandBuilder, _ := setup(t)
+	history := &recordingDetectionHistory{}
+	ac.DriftHistory = history
+	runWriter := &recordingAPIHistoryWriter{}
+	ac.RunHistory = events.NewRunHistory(runWriter, logging.NewNoopLogger(t))
 	storage := drift.NewInMemoryStorage()
 	ac.DriftStorage = storage
 	repositoryKey := "gitlab.com/Repo"
@@ -4861,6 +4978,11 @@ func TestAPIController_DetectDrift_CommandBuildFailureSkipsStaleReconciliation(t
 	Ok(t, err)
 	Equals(t, 1, len(records))
 	Equals(t, "cached", records[0].ProjectName)
+	Equals(t, 1, len(history.records))
+	Equals(t, drift.DetectionStatusFailed, history.records[0].Run.Status)
+	Equals(t, history.records[0].Run.ID, history.records[0].Run.RunID)
+	Equals(t, 1, len(runWriter.runsCompleted))
+	Equals(t, runs.StatusFailed, runWriter.runsCompleted[0].Status)
 }
 
 func TestAPIController_DetectDrift_ZeroProjectFullDetectionReconcilesStaleRecords(t *testing.T) {
@@ -5194,6 +5316,7 @@ func TestAPIController_DetectDrift_SkipsPolicyCheckResults(t *testing.T) {
 	Equals(t, events.DefaultWorkspace, storedDrift.Workspace)
 	Equals(t, true, storedDrift.Drift.HasDrift)
 	Equals(t, 1, storedDrift.Drift.ToAdd)
+	Assert(t, storedDrift.LastSuccessfulChecked != nil, "successful policy merge must advance successful freshness")
 
 	response, _ := io.ReadAll(w.Result().Body)
 	var result controllers.DriftDetectionResultAPI
@@ -5338,6 +5461,10 @@ func TestAPIController_DetectDrift_ReturnsDetectionID(t *testing.T) {
 	driftStorage := driftmocks.NewMockStorage()
 	When(driftStorage.Store(Any[string](), Any[models.ProjectDrift]())).ThenReturn(nil)
 	ac.DriftStorage = driftStorage
+	history := &recordingDetectionHistory{}
+	ac.DriftHistory = history
+	runWriter := &recordingAPIHistoryWriter{}
+	ac.RunHistory = events.NewRunHistory(runWriter, logging.NewNoopLogger(t))
 
 	body, _ := json.Marshal(models.DriftDetectionRequest{
 		Repository: "Repo",
@@ -5359,6 +5486,16 @@ func TestAPIController_DetectDrift_ReturnsDetectionID(t *testing.T) {
 
 	// Detection result must have a non-empty UUID
 	Assert(t, result.ID != "", "expected non-empty detection ID")
+	parsedID, err := uuid.Parse(result.ID)
+	Ok(t, err)
+	Equals(t, uuid.Version(7), parsedID.Version())
+	Equals(t, 1, len(history.records))
+	Equals(t, result.ID, history.records[0].Run.ID)
+	Equals(t, result.ID, history.records[0].Run.RunID)
+	Equals(t, 1, len(runWriter.runsCreated))
+	Equals(t, result.ID, string(runWriter.runsCreated[0].ID))
+	Equals(t, runs.CommandDriftDetection, runWriter.runsCreated[0].Command)
+	Equals(t, 1, len(runWriter.runsCompleted))
 
 	// Each project's DetectionID must match the result ID
 	for _, p := range result.Projects {

@@ -57,6 +57,27 @@ type staticRemediationStorage struct {
 	drifts []models.ProjectDrift
 }
 
+type finalWriteFailingRemediationStore struct {
+	inner *drift.InMemoryRemediationResultStore
+	puts  int
+}
+
+func (s *finalWriteFailingRemediationStore) Put(result *models.RemediationResult) error {
+	s.puts++
+	if s.puts > 1 {
+		return errors.New("history unavailable")
+	}
+	return s.inner.Put(result)
+}
+
+func (s *finalWriteFailingRemediationStore) GetResult(id string) (*models.RemediationResult, error) {
+	return s.inner.GetResult(id)
+}
+
+func (s *finalWriteFailingRemediationStore) ListResults(repository string, limit int) ([]*models.RemediationResult, error) {
+	return s.inner.ListResults(repository, limit)
+}
+
 func (s staticRemediationStorage) Store(string, models.ProjectDrift) error {
 	return nil
 }
@@ -307,6 +328,32 @@ func TestInMemoryRemediationService_AutoApplyExecutorErrorWithoutResultsFailsTar
 		Equals(t, models.RemediationStatusFailed, project.Status)
 		Assert(t, strings.Contains(project.Error, "apply locked"), "expected executor error, got %q", project.Error)
 	}
+}
+
+func TestInMemoryRemediationService_AutoApplyReturnsCompletedResultWhenFinalPersistenceFails(t *testing.T) {
+	storage := staticRemediationStorage{drifts: []models.ProjectDrift{{
+		ProjectName: "app", Path: "app", Workspace: "default",
+		Ref: "main", BaseBranch: "main", ResolvedCommit: "commit-a",
+		Drift: models.DriftSummary{HasDrift: true, ToChange: 1}, LastChecked: time.Now(),
+	}}}
+	resultStore := &finalWriteFailingRemediationStore{inner: drift.NewInMemoryRemediationResultStore()}
+	service := drift.NewRemediationService(storage, resultStore)
+	executor := &recordingRemediationExecutor{}
+
+	result, err := service.Remediate(models.RemediationRequest{
+		Repository: "owner/repo",
+		Ref:        "main",
+		Type:       "Github",
+		Action:     models.RemediationAutoApply,
+		DriftOnly:  true,
+	}, executor)
+
+	var persistenceErr *drift.RemediationResultPersistenceError
+	Assert(t, errors.As(err, &persistenceErr), "expected final persistence error, got %v", err)
+	Assert(t, result != nil, "expected completed remediation result")
+	Equals(t, models.RemediationStatusSuccess, result.Status)
+	Equals(t, 1, len(executor.applyProjectCalls))
+	Assert(t, result.CompletedAt != nil, "expected completed timestamp")
 }
 
 func TestInMemoryRemediationService_AutoApplyRequiresCachedDriftBeforeExecutor(t *testing.T) {

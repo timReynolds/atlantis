@@ -70,6 +70,9 @@ type RemediationRequest struct {
 	// StorageRepository is the internal VCS-host-qualified repository key used
 	// for cached drift lookups. It is populated by the API controller.
 	StorageRepository string `json:"-"`
+	// RunID is the durable Run identity allocated by the API controller. It is
+	// populated internally and is never accepted from callers.
+	RunID string `json:"-"`
 	// Ref is the git reference (branch/tag/commit) to remediate. Required.
 	Ref string `json:"ref"`
 	// ExecutionRef is the original git reference used for checkout/fetch. It is
@@ -204,8 +207,14 @@ type RemediationResult struct {
 	// StorageRepository is the internal VCS-host-qualified repository key used
 	// to index remediation history. It is omitted from API responses.
 	StorageRepository string `json:"-"`
+	// RunID links this result to the generic durable Run. It is omitted from API
+	// responses because ID is the public correlation identifier.
+	RunID string `json:"-"`
 	// Ref is the git reference that was remediated.
 	Ref string `json:"ref"`
+	// BaseBranch is retained internally so durable history can distinguish the
+	// same ref evaluated under different repo-config branch contexts.
+	BaseBranch string `json:"-"`
 	// Action is the remediation action performed.
 	Action RemediationAction `json:"action"`
 	// Status is the overall remediation status.

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -25,7 +26,8 @@ const (
 
 // RunOutputFinalizer flushes and releases buffered output for a logical Run.
 type RunOutputFinalizer interface {
-	FinishRun(runID runs.ID)
+	FinishRun(runID runs.ID) bool
+	RunOutputComplete(runID runs.ID) bool
 }
 
 // RunHistory records command and project lifecycles without owning execution.
@@ -47,6 +49,32 @@ func NewRunHistory(writer runs.Writer, logger logging.SimpleLogging) *RunHistory
 // SetOutputFinalizer connects the output batching decorator to Run completion.
 func (h *RunHistory) SetOutputFinalizer(finalizer RunOutputFinalizer) {
 	h.outputFinalizer = finalizer
+}
+
+// IsRunHistoryComplete reports whether all persistence attempted so far for a
+// Run succeeded. Callers use it to retain full VCS output when history is incomplete.
+func (h *RunHistory) IsRunHistoryComplete(runID runs.ID) bool {
+	if h == nil || runID == "" {
+		return false
+	}
+	value, ok := h.sessions.Load(runID)
+	if !ok || value.(*runSession).persistenceIncomplete.Load() {
+		return false
+	}
+	return h.outputFinalizer == nil || h.outputFinalizer.RunOutputComplete(runID)
+}
+
+// DeferRunComment registers a comment decision that runs only after every
+// final durable write for the logical Run has been attempted.
+func (h *RunHistory) DeferRunComment(runID runs.ID, callback func(complete bool)) bool {
+	if h == nil || runID == "" || callback == nil {
+		return false
+	}
+	value, ok := h.sessions.Load(runID)
+	if !ok {
+		return false
+	}
+	return value.(*runSession).deferComment(callback)
 }
 
 // Begin creates a running logical Run and returns its completion scope.
@@ -149,8 +177,9 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 		return
 	}
 	session := value.(*runSession)
-	if h.outputFinalizer != nil {
-		h.outputFinalizer.FinishRun(lifecycle.runID)
+	defer func() { session.finalizeComments(!session.persistenceIncomplete.Load()) }()
+	if h.outputFinalizer != nil && !h.outputFinalizer.FinishRun(lifecycle.runID) {
+		session.persistenceIncomplete.Store(true)
 	}
 	now := h.now().UTC()
 	succeeded, failed := 0, 0
@@ -175,7 +204,8 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 		if err := writeRunHistory(func(writeCtx context.Context) error {
 			return h.writer.CompleteProjectRun(writeCtx, completion)
 		}); err != nil {
-			h.logError(lifecycle.ctx.Log, "completing project run history", err)
+			h.markPersistenceFailed(lifecycle.ctx.Log, session, "completing project run history", err)
+			return false
 		}
 		if status == runs.StatusFailed || status == runs.StatusPartial || status == runs.StatusCancelled {
 			failed++
@@ -184,6 +214,12 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 		}
 		return true
 	})
+	if session.persistenceIncomplete.Load() {
+		if lifecycle.ctx.Log != nil {
+			lifecycle.ctx.Log.Err("leaving run history incomplete after persistence error")
+		}
+		return
+	}
 
 	status := lifecycle.terminalStatus(succeeded, failed)
 	if err := writeRunHistory(func(writeCtx context.Context) error {
@@ -191,7 +227,8 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 			ID: lifecycle.runID, Status: status, CompletedAt: now,
 		})
 	}); err != nil {
-		h.logError(lifecycle.ctx.Log, "completing run history", err)
+		h.markPersistenceFailed(lifecycle.ctx.Log, session, "completing run history", err)
+		return
 	}
 	h.appendAudit(lifecycle.ctx.Log, session, string(session.run.Command)+".completed", map[string]any{
 		"status": status, "projects_succeeded": succeeded, "projects_failed": failed,
@@ -209,7 +246,7 @@ func (l *RunLifecycle) terminalStatus(succeeded, failed int) runs.Status {
 		if l.ctx.CommandCancelled {
 			return runs.StatusCancelled
 		}
-		if l.ctx.CommandSkipped {
+		if l.ctx.CommandSkipped || l.ctx.CommandOutcomeSkipped {
 			return runs.StatusSkipped
 		}
 		if l.ctx.CommandHasErrors {
@@ -229,9 +266,36 @@ func (l *RunLifecycle) terminalStatus(succeeded, failed int) runs.Status {
 }
 
 type runSession struct {
-	run      runs.Run
-	projects sync.Map
+	run                   runs.Run
+	projects              sync.Map
+	persistenceIncomplete atomic.Bool
+	commentMu             sync.Mutex
+	comments              []func(bool)
+	commentsFinalized     bool
 }
+
+func (s *runSession) deferComment(callback func(bool)) bool {
+	s.commentMu.Lock()
+	defer s.commentMu.Unlock()
+	if s.commentsFinalized {
+		return false
+	}
+	s.comments = append(s.comments, callback)
+	return true
+}
+
+func (s *runSession) finalizeComments(complete bool) {
+	s.commentMu.Lock()
+	s.commentsFinalized = true
+	callbacks := append([]func(bool){}, s.comments...)
+	s.comments = nil
+	s.commentMu.Unlock()
+	for _, callback := range callbacks {
+		callback(complete)
+	}
+}
+
+var _ RunHistoryCommentFinalizer = (*RunHistory)(nil)
 
 type projectIdentity struct {
 	name, directory, workspace string
@@ -264,7 +328,7 @@ func (h *RunHistory) beginProject(ctx command.ProjectContext) command.ProjectCon
 	identity := projectIdentity{name: ctx.ProjectName, directory: ctx.RepoRelDir, workspace: ctx.Workspace}
 	candidateID, err := h.newID()
 	if err != nil {
-		h.logError(ctx.Log, "generating project run history ID", err)
+		h.markPersistenceFailed(ctx.Log, session, "generating project run history ID", err)
 		return ctx
 	}
 	candidate := &projectObservation{
@@ -285,7 +349,7 @@ func (h *RunHistory) beginProject(ctx command.ProjectContext) command.ProjectCon
 			Status: runs.StatusRunning, StartedAt: &now,
 		})
 	}); err != nil {
-		h.logError(ctx.Log, "creating project run history", err)
+		h.markPersistenceFailed(ctx.Log, session, "creating project run history", err)
 	}
 	return ctx
 }
@@ -392,7 +456,7 @@ func (p *projectObservation) metadata() runs.Metadata {
 func (h *RunHistory) appendAudit(log logging.SimpleLogging, session *runSession, eventType string, metadata map[string]any, createdAt time.Time) {
 	id, err := h.newID()
 	if err != nil {
-		h.logError(log, "generating audit history ID", err)
+		h.markPersistenceFailed(log, session, "generating audit history ID", err)
 		return
 	}
 	runID := session.run.ID
@@ -404,8 +468,13 @@ func (h *RunHistory) appendAudit(log logging.SimpleLogging, session *runSession,
 	if err := writeRunHistory(func(writeCtx context.Context) error {
 		return h.writer.AppendAuditEvent(writeCtx, event)
 	}); err != nil {
-		h.logError(log, "appending run audit history", err)
+		h.markPersistenceFailed(log, session, "appending run audit history", err)
 	}
+}
+
+func (h *RunHistory) markPersistenceFailed(log logging.SimpleLogging, session *runSession, action string, err error) {
+	session.persistenceIncomplete.Store(true)
+	h.logError(log, action, err)
 }
 
 func (h *RunHistory) logError(log logging.SimpleLogging, action string, err error) {
@@ -413,7 +482,7 @@ func (h *RunHistory) logError(log logging.SimpleLogging, action string, err erro
 		log = h.logger
 	}
 	if log != nil {
-		log.Err("%s: %v", action, err)
+		log.Err("%s %v", action, err)
 	}
 }
 
@@ -427,6 +496,7 @@ func positivePullNumber(number int) *int {
 func runMetadata(ctx *command.Context) runs.Metadata {
 	return marshalMetadata(map[string]any{
 		"api": ctx.API, "pull_url": ctx.Pull.URL, "vcs": ctx.Pull.BaseRepo.VCSHost.Type.String(),
+		"vcs_delivery_id": ctx.Pull.VCSDeliveryID,
 	})
 }
 

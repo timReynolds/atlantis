@@ -6,21 +6,39 @@ package events
 import (
 	"slices"
 
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/vcs"
 )
 
+// RunHistoryURLGenerator constructs the authenticated detail URL for a Run.
+type RunHistoryURLGenerator interface {
+	GenerateRunHistoryURL(runID runs.ID) (string, error)
+}
+
+// RunHistoryCommentFinalizer defers a VCS comment until durable Run completion.
+// The callback receives false when any final output, project, Run, or audit
+// persistence needed by the history page was incomplete.
+type RunHistoryCommentFinalizer interface {
+	DeferRunComment(runID runs.ID, callback func(complete bool)) bool
+}
+
 type PullUpdater struct {
-	HidePrevPlanComments bool
-	VCSClient            vcs.Client
-	MarkdownRenderer     *MarkdownRenderer
+	HidePrevPlanComments     bool
+	VCSClient                vcs.Client
+	MarkdownRenderer         *MarkdownRenderer
+	RunHistoryURLGenerator   RunHistoryURLGenerator
+	RunHistoryFinalizer      RunHistoryCommentFinalizer
+	LargeRunSummaryThreshold int
 }
 
 func (c *PullUpdater) updatePull(ctx *command.Context, cmd PullCommand, res command.Result) {
 	// Log if we got any errors or failures.
 	if res.Error != nil {
+		ctx.CommandHasErrors = true
 		ctx.Log.Err("%s", res.Error.Error())
 	} else if res.Failure != "" {
+		ctx.CommandHasErrors = true
 		ctx.Log.Warn("%s", res.Failure)
 	}
 
@@ -51,8 +69,44 @@ func (c *PullUpdater) updatePull(ctx *command.Context, cmd PullCommand, res comm
 		res.ProjectResults = commentOnProjects
 	}
 
-	comment := c.MarkdownRenderer.Render(ctx, res, cmd)
+	if c.shouldUseLargeRunSummary(ctx, res, cmd) {
+		historyURL, err := c.RunHistoryURLGenerator.GenerateRunHistoryURL(ctx.RunID)
+		if err != nil {
+			ctx.Log.Err("generating run history URL %v", err)
+		} else {
+			fullComment := c.MarkdownRenderer.Render(ctx, res, cmd)
+			summaryComment := c.MarkdownRenderer.RenderRunSummary(ctx, res, cmd, historyURL)
+			if c.RunHistoryFinalizer.DeferRunComment(ctx.RunID, func(complete bool) {
+				comment := fullComment
+				if complete {
+					comment = summaryComment
+				}
+				c.createComment(ctx, cmd, comment)
+			}) {
+				return
+			}
+		}
+	}
+	c.createComment(ctx, cmd, c.MarkdownRenderer.Render(ctx, res, cmd))
+}
+
+func (c *PullUpdater) createComment(ctx *command.Context, cmd PullCommand, comment string) {
 	if err := c.VCSClient.CreateComment(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull.Num, comment, cmd.CommandName().String()); err != nil {
 		ctx.Log.Err("unable to comment: %s", err)
 	}
+}
+
+func (c *PullUpdater) shouldUseLargeRunSummary(ctx *command.Context, result command.Result, cmd PullCommand) bool {
+	for _, project := range result.ProjectResults {
+		if project.StateRmSuccess != nil || project.ImportSuccess != nil {
+			return false
+		}
+	}
+	return c.LargeRunSummaryThreshold > 0 &&
+		c.RunHistoryURLGenerator != nil &&
+		c.RunHistoryFinalizer != nil &&
+		ctx.RunID != "" &&
+		result.Error == nil && result.Failure == "" &&
+		len(result.ProjectResults) >= c.LargeRunSummaryThreshold &&
+		!cmd.IsVerbose()
 }

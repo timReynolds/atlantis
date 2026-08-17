@@ -25,6 +25,10 @@ func TestRunHistoryAggregatesPlanAndPolicyIntoOneProjectRun(t *testing.T) {
 	ctx := testRunContext(t)
 	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
 	require.NotEmpty(t, ctx.RunID)
+	commentFinalized := false
+	require.True(t, history.DeferRunComment(ctx.RunID, func(complete bool) {
+		commentFinalized = complete
+	}))
 
 	projectCtx := history.beginProject(command.ProjectContext{
 		RunID: ctx.RunID, ProjectName: "network", RepoRelDir: "terraform/network",
@@ -76,6 +80,30 @@ func TestRunHistoryAggregatesPlanAndPolicyIntoOneProjectRun(t *testing.T) {
 	require.False(t, metadata.PolicySets[0].Passed)
 	require.Equal(t, runs.StatusFailed, writer.runsCompleted[0].Status)
 	require.Equal(t, []string{"plan.requested", "plan.completed"}, writer.auditTypes())
+	require.True(t, commentFinalized)
+}
+
+func TestRunHistoryReportsIncompleteProjectPersistence(t *testing.T) {
+	writer := &recordingRunWriter{createProjectErr: errors.New("store unavailable")}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+	commentFinalized := false
+	commentComplete := true
+	require.True(t, history.DeferRunComment(ctx.RunID, func(complete bool) {
+		commentFinalized = true
+		commentComplete = complete
+	}))
+	require.True(t, history.IsRunHistoryComplete(ctx.RunID))
+
+	history.beginProject(command.ProjectContext{
+		RunID: ctx.RunID, ProjectName: "network", RepoRelDir: "terraform/network",
+		Workspace: "production", Log: ctx.Log,
+	})
+	require.False(t, history.IsRunHistoryComplete(ctx.RunID))
+	lifecycle.Finish()
+	require.True(t, commentFinalized)
+	require.False(t, commentComplete)
 }
 
 func TestRunHistoryRepresentsHundredsOfProjectsInOneRun(t *testing.T) {
@@ -162,6 +190,75 @@ func TestRunHistoryRecordsProjectsCancelledBeforeExecution(t *testing.T) {
 	require.Equal(t, runs.StatusCancelled, writer.runsCompleted[0].Status)
 }
 
+func TestRunHistoryRecordsSkippedOutcomeWithoutSuppressingHooks(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerComment)
+	ctx.CommandOutcomeSkipped = true
+	lifecycle.Finish()
+
+	require.False(t, ctx.CommandSkipped)
+	require.Equal(t, runs.StatusSkipped, writer.runsCompleted[0].Status)
+}
+
+func TestRunHistoryRetainsVCSDeliveryID(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	ctx.Pull.VCSDeliveryID = "delivery-123"
+
+	history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+
+	var metadata map[string]any
+	require.NoError(t, json.Unmarshal(writer.runsCreated[0].Metadata, &metadata))
+	require.Equal(t, "delivery-123", metadata["vcs_delivery_id"])
+}
+
+func TestRunHistoryLeavesRunIncompleteWhenProjectCompletionCannotPersist(t *testing.T) {
+	writer := &recordingRunWriter{completeProjectErr: errors.New("store unavailable")}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+	projectCtx := history.beginProject(command.ProjectContext{
+		RunID: ctx.RunID, ProjectName: "network", RepoRelDir: "network", Workspace: "default", Log: ctx.Log,
+	})
+	history.recordProject(projectCtx, command.Plan, command.ProjectCommandOutput{PlanSuccess: &models.PlanSuccess{}})
+	secondProject := history.beginProject(command.ProjectContext{
+		RunID: ctx.RunID, ProjectName: "database", RepoRelDir: "database", Workspace: "default", Log: ctx.Log,
+	})
+	history.recordProject(secondProject, command.Plan, command.ProjectCommandOutput{PlanSuccess: &models.PlanSuccess{}})
+
+	lifecycle.Finish()
+
+	require.Empty(t, writer.runsCompleted, "the running record must remain visibly incomplete")
+	require.Equal(t, 1, writer.completeProjectCalls, "one store outage must stop later completion writes")
+}
+
+func TestRunHistoryLeavesRunIncompleteWhenFinalOutputCannotPersist(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	history.SetOutputFinalizer(incompleteOutputFinalizer{})
+	ctx := testRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+
+	lifecycle.Finish()
+
+	require.Empty(t, writer.runsCompleted, "the running record must remain visibly incomplete")
+}
+
+func TestRunHistoryDoesNotAuditCompletionWhenRunCompletionCannotPersist(t *testing.T) {
+	writer := &recordingRunWriter{completeRunErr: errors.New("store unavailable")}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+
+	lifecycle.Finish()
+
+	require.Empty(t, writer.runsCompleted, "the running record must remain visibly incomplete")
+	require.Equal(t, []string{"plan.requested"}, writer.auditTypes())
+}
+
 func TestRunLifecycleFinishRecoveringMarksPanicFailed(t *testing.T) {
 	writer := &recordingRunWriter{}
 	history := newTestRunHistory(t, writer)
@@ -204,13 +301,17 @@ func testRunContext(t *testing.T) *command.Context {
 }
 
 type recordingRunWriter struct {
-	mu                sync.Mutex
-	runsCreated       []runs.Run
-	runsCompleted     []runs.RunCompletion
-	projectsCreated   []runs.ProjectRun
-	projectsCompleted []runs.ProjectRunCompletion
-	output            []runs.OutputChunk
-	audit             []runs.AuditEvent
+	mu                   sync.Mutex
+	runsCreated          []runs.Run
+	runsCompleted        []runs.RunCompletion
+	projectsCreated      []runs.ProjectRun
+	projectsCompleted    []runs.ProjectRunCompletion
+	output               []runs.OutputChunk
+	audit                []runs.AuditEvent
+	completeRunErr       error
+	createProjectErr     error
+	completeProjectErr   error
+	completeProjectCalls int
 }
 
 func (w *recordingRunWriter) CreateRun(_ context.Context, run runs.Run) error {
@@ -223,6 +324,9 @@ func (w *recordingRunWriter) CreateRun(_ context.Context, run runs.Run) error {
 func (w *recordingRunWriter) StartRun(context.Context, runs.ID, time.Time) error { return nil }
 
 func (w *recordingRunWriter) CompleteRun(_ context.Context, completion runs.RunCompletion) error {
+	if w.completeRunErr != nil {
+		return w.completeRunErr
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.runsCompleted = append(w.runsCompleted, completion)
@@ -232,6 +336,9 @@ func (w *recordingRunWriter) CompleteRun(_ context.Context, completion runs.RunC
 func (w *recordingRunWriter) CreateProjectRun(_ context.Context, project runs.ProjectRun) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.createProjectErr != nil {
+		return w.createProjectErr
+	}
 	w.projectsCreated = append(w.projectsCreated, project)
 	return nil
 }
@@ -240,10 +347,23 @@ func (w *recordingRunWriter) StartProjectRun(context.Context, runs.ID, time.Time
 
 func (w *recordingRunWriter) CompleteProjectRun(_ context.Context, completion runs.ProjectRunCompletion) error {
 	w.mu.Lock()
+	w.completeProjectCalls++
+	w.mu.Unlock()
+	if w.completeProjectErr != nil {
+		return w.completeProjectErr
+	}
+	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.projectsCompleted = append(w.projectsCompleted, completion)
 	return nil
 }
+
+type incompleteOutputFinalizer struct{}
+
+func (incompleteOutputFinalizer) FinishRun(runs.ID) bool         { return false }
+func (incompleteOutputFinalizer) RunOutputComplete(runs.ID) bool { return false }
+
+var _ RunOutputFinalizer = incompleteOutputFinalizer{}
 
 func (w *recordingRunWriter) AppendOutput(_ context.Context, chunks []runs.OutputChunk) error {
 	w.mu.Lock()

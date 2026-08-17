@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Audit timeline · atlantis</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/normalize.css">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/skeleton.css">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/custom.css">
+  <link rel="icon" type="image/png" href="{{ .CleanedBasePath }}/static/images/atlantis-icon.png">
+</head>
+<body>
+<div class="container history-page">
+  <nav class="history-nav"><a href="{{ .CleanedBasePath }}/">Atlantis</a><a href="{{ .CleanedBasePath }}/runs">Runs</a><a class="active" href="{{ .CleanedBasePath }}/audit">Audit</a></nav>
+  <header class="history-header"><p class="history-eyebrow">Operational timeline</p><h2>Audit history</h2><p>Durable command, apply, unlock, drift, and remediation events.</p></header>
+  <form class="history-filter history-filter-audit" method="get">
+    <label>Repository<input name="repository" placeholder="owner/repository" value="{{ .Filter.Repository }}"></label>
+    <label>Pull request<input name="pull" inputmode="numeric" value="{{ .Filter.PullNumber }}"></label>
+    <label>Actor<input name="actor" value="{{ .Filter.Actor }}"></label>
+    <label>Event<input name="event" placeholder="apply.completed" value="{{ .Filter.EventType }}"></label>
+    <label>From<input name="from" placeholder="YYYY-MM-DD" value="{{ .Filter.CreatedFrom }}"></label>
+    <label>To<input name="to" placeholder="YYYY-MM-DD" value="{{ .Filter.CreatedTo }}"></label>
+    <div class="history-filter-actions"><button class="button-primary" type="submit">Filter</button><a href="{{ .CleanedBasePath }}/audit">Clear</a></div>
+  </form>
+  {{ if .Events }}<div class="history-table-wrap"><table class="u-full-width history-table"><thead><tr><th>Time</th><th>Event</th><th>Repository / PR</th><th>Actor</th><th>Run</th><th>Metadata</th></tr></thead><tbody>
+    {{ $basePath := .CleanedBasePath }}{{ range .Events }}<tr><td class="history-nowrap">{{ .CreatedAt }}</td><td><code>{{ .EventType }}</code></td><td>{{ .Repository }}{{ if .PullNumber }} #{{ .PullNumber }}{{ end }}</td><td>{{ if .Actor }}{{ .Actor }}{{ else }}system{{ end }}</td><td>{{ if .RunPath }}<a class="history-id" href="{{ $basePath }}{{ .RunPath }}">{{ .RunID }}</a>{{ else }}—{{ end }}</td><td>{{ if .Metadata }}<details><summary>View</summary><pre class="history-metadata history-metadata-inline">{{ .Metadata }}</pre></details>{{ else }}—{{ end }}</td></tr>{{ end }}
+  </tbody></table></div>{{ else }}<div class="history-empty">No audit events match these filters.</div>{{ end }}
+  {{ if .NextPath }}<a class="button history-next" href="{{ .CleanedBasePath }}{{ .NextPath }}">Next 100 events</a>{{ end }}
+</div>
+<footer>{{ .AtlantisVersion }}</footer>
+</body>
+</html>

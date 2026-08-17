@@ -215,8 +215,8 @@ const (
 	DefaultTFEHostname                  = "app.terraform.io"
 	DefaultVCSStatusName                = "atlantis"
 	DefaultWebBasicAuth                 = false
-	DefaultWebUsername                  = "atlantis"
-	DefaultWebPassword                  = "atlantis"
+	DefaultWebUsername                  = server.DefaultWebUsername
+	DefaultWebPassword                  = server.DefaultWebPassword
 )
 
 var stringFlags = map[string]stringFlag{

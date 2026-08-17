@@ -5,6 +5,7 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -25,7 +26,7 @@ func TestPersistentProjectCommandOutputHandlerPreservesStreamsAndOrdering(t *tes
 	handler.SendStream(ctx, "first", runs.OutputStdout, false)
 	handler.SendStream(ctx, "warning", runs.OutputStderr, false)
 	handler.Send(ctx, "summary", false)
-	handler.FinishRun(ctx.RunID)
+	require.True(t, handler.FinishRun(ctx.RunID))
 
 	require.Equal(t, []runs.OutputChunk{
 		{ProjectRunID: ctx.ProjectRunID, Sequence: 0, Stream: runs.OutputStdout, Content: "first\n", CreatedAt: handler.now()},
@@ -91,6 +92,24 @@ func TestPersistentProjectCommandOutputHandlerDoesNotBlockOnStore(t *testing.T) 
 	handler.FinishRun(ctx.RunID)
 }
 
+func TestPersistentProjectCommandOutputHandlerStopsWritingAfterStoreFailure(t *testing.T) {
+	writer := &failingOutputWriter{err: errors.New("store unavailable")}
+	handler := NewPersistentProjectCommandOutputHandler(&NoopProjectOutputHandler{}, writer, logging.NewNoopLogger(t))
+	first := outputProjectContext(t)
+	second := outputProjectContext(t)
+	second.RunID = first.RunID
+
+	handler.SendStream(first, "buffered", runs.OutputStdout, false)
+	handler.SendStream(first, "stream transition", runs.OutputStderr, false)
+	require.False(t, handler.RunOutputComplete(first.RunID))
+	handler.SendStream(first, strings.Repeat("x", persistentOutputChunkBytes), runs.OutputStderr, false)
+	handler.SendStream(second, strings.Repeat("y", persistentOutputChunkBytes), runs.OutputStdout, false)
+	require.False(t, handler.FinishRun(first.RunID))
+
+	require.Equal(t, 1, writer.calls)
+	require.True(t, handler.RunOutputComplete(first.RunID))
+}
+
 func outputProjectContext(t *testing.T) command.ProjectContext {
 	t.Helper()
 	runID, err := runs.NewID()
@@ -149,3 +168,34 @@ func (w *blockingOutputWriter) AppendOutput(ctx context.Context, _ []runs.Output
 		return ctx.Err()
 	}
 }
+
+type failingOutputWriter struct {
+	calls int
+	err   error
+}
+
+func (w *failingOutputWriter) CreateRun(context.Context, runs.Run) error { return nil }
+func (w *failingOutputWriter) StartRun(context.Context, runs.ID, time.Time) error {
+	return nil
+}
+func (w *failingOutputWriter) CompleteRun(context.Context, runs.RunCompletion) error {
+	return nil
+}
+func (w *failingOutputWriter) CreateProjectRun(context.Context, runs.ProjectRun) error {
+	return nil
+}
+func (w *failingOutputWriter) StartProjectRun(context.Context, runs.ID, time.Time) error {
+	return nil
+}
+func (w *failingOutputWriter) CompleteProjectRun(context.Context, runs.ProjectRunCompletion) error {
+	return nil
+}
+func (w *failingOutputWriter) AppendOutput(context.Context, []runs.OutputChunk) error {
+	w.calls++
+	return w.err
+}
+func (w *failingOutputWriter) AppendAuditEvent(context.Context, runs.AuditEvent) error {
+	return nil
+}
+
+var _ runs.Writer = (*failingOutputWriter)(nil)

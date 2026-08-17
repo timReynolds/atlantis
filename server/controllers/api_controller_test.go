@@ -5,6 +5,7 @@ package controllers_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +27,7 @@ import (
 	"github.com/runatlantis/atlantis/server/core/drift"
 	driftmocks "github.com/runatlantis/atlantis/server/core/drift/mocks"
 	. "github.com/runatlantis/atlantis/server/core/locking/mocks"
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/command"
 	. "github.com/runatlantis/atlantis/server/events/mocks"
@@ -152,6 +154,40 @@ func TestAPIController_Plan(t *testing.T) {
 
 	projectCommandBuilder.VerifyWasCalled(Times(expectedCalls)).BuildPlanCommands(Any[*command.Context](), Any[*events.CommentCommand]())
 	projectCommandRunner.VerifyWasCalled(Times(expectedCalls)).Plan(Any[command.ProjectContext]())
+}
+
+func TestAPIController_PlanRecordsResolvedHeadCommit(t *testing.T) {
+	ac, _, _ := setup(t)
+	repoDir, headCommit := initAPIControllerGitRepo(t)
+	workingDir := ac.WorkingDir.(*MockWorkingDir)
+	When(workingDir.Clone(Any[logging.SimpleLogging](), Any[models.Repo](), Any[models.PullRequest](), Any[string]())).
+		ThenReturn(repoDir, nil)
+	writer := &recordingAPIRunWriter{}
+	ac.RunHistory = events.NewRunHistory(writer, ac.Logger)
+
+	body, _ := json.Marshal(controllers.APIRequest{
+		Repository: "Repo", Ref: "main", Type: "Gitlab", Projects: []string{"default"},
+	})
+	req, _ := http.NewRequest("POST", "", bytes.NewBuffer(body))
+	req.Header.Set(atlantisTokenHeader, atlantisToken)
+	w := httptest.NewRecorder()
+
+	ac.Plan(w, req)
+
+	ResponseContains(t, w, http.StatusOK, "")
+	Equals(t, 1, len(writer.created))
+	Equals(t, headCommit, writer.created[0].HeadSHA)
+	Equals(t, "main", writer.created[0].HeadRef)
+}
+
+type recordingAPIRunWriter struct {
+	runs.NoopStore
+	created []runs.Run
+}
+
+func (w *recordingAPIRunWriter) CreateRun(_ context.Context, run runs.Run) error {
+	w.created = append(w.created, run)
+	return nil
 }
 
 func TestAPIController_PlanSortsByExecutionOrder(t *testing.T) {

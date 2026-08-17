@@ -8,6 +8,7 @@ import (
 	"net/url"
 
 	"github.com/gorilla/mux"
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events/command"
 )
 
@@ -22,12 +23,23 @@ type Router struct {
 	LockViewRouteName string
 	// ProjectJobsViewRouteName is the named route for the projects active jobs
 	ProjectJobsViewRouteName string
+	// RunHistoryViewRouteName is the named route for durable run details.
+	RunHistoryViewRouteName string
 	// LockViewRouteIDQueryParam is the query parameter needed to construct the
 	// lock view: underlying.Get(LockViewRouteName).URL(LockViewRouteIDQueryParam, "my id").
 	LockViewRouteIDQueryParam string
 	// AtlantisURL is the fully qualified URL that Atlantis is
 	// accessible from externally.
 	AtlantisURL *url.URL
+}
+
+// GenerateRunHistoryURL returns the authenticated durable detail URL for a Run.
+func (r *Router) GenerateRunHistoryURL(runID runs.ID) (string, error) {
+	runURL, err := r.Underlying.Get(r.RunHistoryViewRouteName).URL("run-id", string(runID))
+	if err != nil {
+		return "", fmt.Errorf("creating run history URL for %s: %w", runID, err)
+	}
+	return r.AtlantisURL.String() + runURL.String(), nil
 }
 
 // GenerateLockURL returns a fully qualified URL to view the lock at lockID.

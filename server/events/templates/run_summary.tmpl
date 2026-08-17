@@ -1,0 +1,24 @@
+{{ define "runSummary" -}}
+### Atlantis {{ .Command }} summary
+
+Ran {{ .Command }} for {{ .Total }} projects.
+
+| Outcome | Projects |
+| --- | ---: |
+| Succeeded | {{ .Succeeded }} |
+| Unchanged | {{ .Unchanged }} |
+| Failed | {{ .Failed }} |
+
+[View full project results and command output in Atlantis]({{ .HistoryURL }})
+{{ if and (eq .CommandName "plan") (not .PlansDeleted) (ne .DisableApplyAll true) }}
+
+* :fast_forward: To **apply** all unapplied plans from this {{ .VcsRequestType }}, comment:
+  ```shell
+  {{ .ExecutableName }} apply
+  ```
+* :put_litter_in_its_place: To **delete** all plans and locks from this {{ .VcsRequestType }}, comment:
+  ```shell
+  {{ .ExecutableName }} unlock
+  ```
+{{ end -}}
+{{ end -}}

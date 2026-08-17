@@ -122,5 +122,6 @@ func (p ProjectResult) PlanHashAfterMerge(existing string) string {
 
 // IsSuccessful returns true if this project result had no errors.
 func (p ProjectResult) IsSuccessful() bool {
-	return p.PlanSuccess != nil || (p.PolicyCheckResults != nil && p.Error == nil && p.Failure == "") || p.ApplySuccess != ""
+	return p.PlanSuccess != nil || (p.PolicyCheckResults != nil && p.Error == nil && p.Failure == "") ||
+		p.ApplySuccess != "" || p.ImportSuccess != nil || p.StateRmSuccess != nil
 }

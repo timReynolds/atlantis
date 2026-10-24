@@ -101,8 +101,8 @@ func (h *RunHistory) BeginDrain() {
 // so a replacement attempt can reuse it. Once a mutation marker exists, the
 // only safe terminal state is unknown.
 // ctx bounds the entire classification pass, shared across every session's
-// heartbeat teardown and durable writes, so a slow or unavailable database
-// cannot turn "graceful shutdown" into an unbounded wait.
+// heartbeat teardown and durable writes. Optional output drains and VCS
+// comments are abandoned so they cannot consume the classification budget.
 func (h *RunHistory) InterruptActive(ctx context.Context, reason string) int {
 	if h == nil {
 		return 0
@@ -349,6 +349,8 @@ type RunLifecycle struct {
 	attemptCancel         context.CancelFunc
 	attemptDone           chan struct{}
 	budgetCtx             context.Context
+	finalizeCtx           context.Context
+	finalizeCancel        context.CancelFunc
 	sideEffectMarker      *attemptSideEffectMarker
 	attemptUnknownReason  string
 	attemptTerminalStatus runs.AttemptStatus
@@ -402,7 +404,16 @@ func (l *RunLifecycle) Finish() {
 	if l == nil || l.history == nil || l.runID == "" {
 		return
 	}
-	l.once.Do(func() { l.history.finish(l) })
+	var session *runSession
+	l.once.Do(func() {
+		defer l.cancelFinalization()
+		session = l.history.finish(l)
+	})
+	if session != nil {
+		// Comment delivery has no cancellation API. Durable completion and
+		// session removal must finish before a callback can block on the VCS.
+		session.finalizeComments(!session.persistenceIncomplete.Load(), l.interrupted())
+	}
 }
 
 // FinishRecovering records a panic as failure and re-panics for the existing
@@ -425,7 +436,7 @@ func (l *RunLifecycle) FinishRecovering() {
 // budget (if any) as the write's parent context so a bounded interrupt pass
 // cannot be exceeded one write at a time.
 func (l *RunLifecycle) writeHistory(operation func(context.Context) error) error {
-	parent := context.Context(context.Background())
+	parent := l.finalizationContext()
 	if l != nil {
 		l.mu.Lock()
 		if l.budgetCtx != nil {
@@ -436,12 +447,47 @@ func (l *RunLifecycle) writeHistory(operation func(context.Context) error) error
 	return writeRunHistoryWithParent(parent, operation)
 }
 
+// finalizationContext cancels optional output work and any normal completion
+// write already in flight when interruption takes over. Subsequent durable
+// writes use budgetCtx instead, retaining time for authoritative classification.
+func (l *RunLifecycle) finalizationContext() context.Context {
+	if l == nil {
+		return context.Background()
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.finalizeCtx == nil {
+		l.finalizeCtx, l.finalizeCancel = context.WithCancel(context.Background())
+		if l.budgetCtx != nil {
+			l.finalizeCancel()
+		}
+	}
+	return l.finalizeCtx
+}
+
+func (l *RunLifecycle) cancelFinalization() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.finalizeCancel != nil {
+		l.finalizeCancel()
+	}
+}
+
+func (l *RunLifecycle) interrupted() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.budgetCtx != nil
+}
+
 func (l *RunLifecycle) interrupt(ctx context.Context, reason string, retryablePlan bool) {
 	if l == nil {
 		return
 	}
 	l.mu.Lock()
 	l.budgetCtx = ctx
+	if l.finalizeCancel != nil {
+		l.finalizeCancel()
+	}
 	if l.sideEffectMarker != nil && l.sideEffectMarker.Marked() {
 		l.attemptUnknownReason = reason + "; infrastructure side effect may have completed"
 		l.attemptTerminalStatus = runs.AttemptUnknown
@@ -458,16 +504,15 @@ func (l *RunLifecycle) interrupt(ctx context.Context, reason string, retryablePl
 	l.Finish()
 }
 
-func (h *RunHistory) finish(lifecycle *RunLifecycle) {
+func (h *RunHistory) finish(lifecycle *RunLifecycle) (session *runSession) {
 	lifecycle.stopAttemptHeartbeat()
 	value, ok := h.sessions.Load(lifecycle.runID)
 	if !ok {
 		return
 	}
-	session := value.(*runSession)
+	session = value.(*runSession)
 	defer h.sessions.Delete(lifecycle.runID)
-	defer func() { session.finalizeComments(!session.persistenceIncomplete.Load()) }()
-	if h.outputFinalizer != nil && !h.outputFinalizer.FinishRun(lifecycle.runID) {
+	if !h.finishOutput(lifecycle) {
 		session.persistenceIncomplete.Store(true)
 		session.completionBlocked.Store(true)
 	}
@@ -509,7 +554,18 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 		return true
 	})
 	status := lifecycle.terminalStatus(succeeded, failed)
-	attemptComplete := h.completeAttempt(lifecycle, session, status, now)
+	attemptStatus, attemptComplete := h.completeAttempt(lifecycle, session, status, now)
+	// Use the acknowledged attempt outcome if interruption arrived during a
+	// normal completion write. A committed success must remain successful,
+	// while a retry that classified unknown must also make the Run unknown.
+	switch attemptStatus {
+	case runs.AttemptUnknown:
+		status = runs.StatusUnknown
+	case runs.AttemptInterrupted:
+		status = runs.StatusFailed
+	case "":
+		status = lifecycle.terminalStatus(succeeded, failed)
+	}
 	if session.persistenceIncomplete.Load() || session.completionBlocked.Load() || !attemptComplete {
 		if lifecycle.ctx.Log != nil {
 			lifecycle.ctx.Log.Err("leaving run history incomplete after persistence error")
@@ -517,7 +573,7 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 		return
 	}
 
-	preserveRunForRetry := lifecycle.shouldPreserveRunForRetry()
+	preserveRunForRetry := attemptStatus == runs.AttemptInterrupted && lifecycle.shouldPreserveRunForRetry()
 	if !preserveRunForRetry {
 		if err := lifecycle.writeHistory(func(writeCtx context.Context) error {
 			return h.writer.CompleteRun(writeCtx, runs.RunCompletion{
@@ -535,6 +591,26 @@ func (h *RunHistory) finish(lifecycle *RunLifecycle) {
 	h.appendAudit(lifecycle.ctx.Log, session, eventType, map[string]any{
 		"status": status, "projects_succeeded": succeeded, "projects_failed": failed,
 	}, now)
+	return session
+}
+
+// finishOutput keeps the existing finalizer interface compatible, while using
+// the contextual extension for the persistent output handler. Interruption
+// cancels that context immediately: authoritative attempt classification must
+// not wait behind a best-effort output queue shared by all active Runs.
+func (h *RunHistory) finishOutput(lifecycle *RunLifecycle) bool {
+	if h.outputFinalizer == nil {
+		return true
+	}
+	if finalizer, ok := h.outputFinalizer.(interface {
+		FinishRunContext(context.Context, runs.ID) bool
+	}); ok {
+		return finalizer.FinishRunContext(lifecycle.finalizationContext(), lifecycle.runID)
+	}
+	if lifecycle.interrupted() {
+		return false
+	}
+	return h.outputFinalizer.FinishRun(lifecycle.runID)
 }
 
 func (l *RunLifecycle) unknownMutationPhase(runCommand runs.Command) string {
@@ -644,33 +720,51 @@ func (h *RunHistory) beginAttempt(lifecycle *RunLifecycle, session *runSession, 
 	}, now)
 }
 
-func (h *RunHistory) completeAttempt(lifecycle *RunLifecycle, session *runSession, runStatus runs.Status, completedAt time.Time) bool {
+func (h *RunHistory) completeAttempt(lifecycle *RunLifecycle, session *runSession, runStatus runs.Status, completedAt time.Time) (runs.AttemptStatus, bool) {
 	if lifecycle.attemptID == "" || h.executionWriter == nil {
-		return true
+		return "", true
 	}
-	status, reason, unknownReason := lifecycle.attemptCompletion()
-	if status == "" {
-		status = runs.AttemptSucceeded
+	var completedStatus runs.AttemptStatus
+	complete := func() error {
+		status, reason, unknownReason := lifecycle.attemptCompletion()
+		if status == "" {
+			status = runs.AttemptSucceeded
+		}
+		if unknownReason != "" {
+			status = runs.AttemptUnknown
+			reason = unknownReason
+		} else if runStatus != runs.StatusSucceeded && runStatus != runs.StatusSkipped {
+			if status != runs.AttemptInterrupted {
+				status = runs.AttemptFailed
+				reason = "logical run completed with status " + string(runStatus)
+			}
+		}
+		completedStatus = status
+		return lifecycle.writeHistory(func(writeCtx context.Context) error {
+			return h.executionWriter.CompleteAttempt(writeCtx, runs.AttemptCompletion{
+				ID: lifecycle.attemptID, Status: status, CompletedAt: completedAt,
+				FailureReason: reason,
+			})
+		})
 	}
-	if unknownReason != "" {
-		status = runs.AttemptUnknown
-		reason = unknownReason
-	} else if runStatus != runs.StatusSucceeded && runStatus != runs.StatusSkipped {
-		if status != runs.AttemptInterrupted {
-			status = runs.AttemptFailed
-			reason = "logical run completed with status " + string(runStatus)
+	err := complete()
+	if errors.Is(err, context.Canceled) {
+		lifecycle.mu.Lock()
+		retry := lifecycle.budgetCtx != nil && lifecycle.budgetCtx.Err() == nil
+		lifecycle.mu.Unlock()
+		if retry {
+			// Interruption may have cancelled a normal completion already in
+			// flight. Recompute its outcome and retry once within the shared
+			// budget. The store's terminal-state guard preserves any outcome
+			// that committed before the cancellation became observable.
+			err = complete()
 		}
 	}
-	if err := lifecycle.writeHistory(func(writeCtx context.Context) error {
-		return h.executionWriter.CompleteAttempt(writeCtx, runs.AttemptCompletion{
-			ID: lifecycle.attemptID, Status: status, CompletedAt: completedAt,
-			FailureReason: reason,
-		})
-	}); err != nil {
+	if err != nil {
 		h.blockRunCompletion(lifecycle.ctx.Log, session, "completing execution attempt", err)
-		return false
+		return "", false
 	}
-	return true
+	return completedStatus, true
 }
 
 func (l *RunLifecycle) startAttemptHeartbeat() {
@@ -818,12 +912,15 @@ func (s *runSession) deferComment(callback func(bool)) bool {
 	return true
 }
 
-func (s *runSession) finalizeComments(complete bool) {
+func (s *runSession) finalizeComments(complete, interrupted bool) {
 	s.commentMu.Lock()
 	s.commentsFinalized = true
 	callbacks := append([]func(bool){}, s.comments...)
 	s.comments = nil
 	s.commentMu.Unlock()
+	if interrupted {
+		return
+	}
 	for _, callback := range callbacks {
 		callback(complete)
 	}
@@ -1119,7 +1216,7 @@ func (h *RunHistory) appendAudit(log logging.SimpleLogging, session *runSession,
 		RunID: &runID, Actor: session.run.Actor, EventType: eventType,
 		CreatedAt: createdAt, Metadata: marshalMetadata(metadata),
 	}
-	if err := writeRunHistory(func(writeCtx context.Context) error {
+	if err := session.lifecycle.writeHistory(func(writeCtx context.Context) error {
 		return h.writer.AppendAuditEvent(writeCtx, event)
 	}); err != nil {
 		h.markPersistenceFailed(log, session, "appending run audit history", err)

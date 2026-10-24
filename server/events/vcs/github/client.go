@@ -1116,6 +1116,7 @@ func (g *Client) MergePull(logger logging.SimpleLogging, pull models.PullRequest
 	// Now we're ready to make our API call to merge the pull request.
 	options := &github.PullRequestOptions{
 		MergeMethod: method,
+		SHA:         pullOptions.ExpectedHeadSHA,
 	}
 	logger.Debug("PUT /repos/%v/%v/pulls/%d/merge", repo.Owner, repo.Name, pull.Num)
 	mergeResult, resp, err := g.client.PullRequests.Merge(

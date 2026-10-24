@@ -259,6 +259,9 @@ type PullRequest struct {
 
 // PullRequestOptions is used to set optional paralmeters for PullRequest
 type PullRequestOptions struct {
+	// ExpectedHeadSHA makes GitHub reject a merge if the pull's revision changed.
+	// Empty preserves the ordinary automerge behavior.
+	ExpectedHeadSHA string
 	// When DeleteSourceBranchOnMerge flag is set to true VCS deletes the source branch after the PR is merged
 	// Applied by GitLab & AzureDevops
 	DeleteSourceBranchOnMerge bool

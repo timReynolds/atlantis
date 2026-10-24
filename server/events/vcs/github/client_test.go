@@ -2422,3 +2422,37 @@ func TestClient_SecondaryRateLimitHandling_CreateComment(t *testing.T) {
 	Assert(t, calls > maxCalls, "Expected more than %d calls due to rate limiting, but got %d", maxCalls, calls)
 
 }
+
+func TestClient_MergePullExpectedHead(t *testing.T) {
+	for _, changed := range []bool{false, true} {
+		t.Run(fmt.Sprint(changed), func(t *testing.T) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					_, _ = w.Write([]byte(`{"allow_merge_commit":true}`))
+					return
+				}
+				var payload map[string]string
+				Ok(t, json.NewDecoder(r.Body).Decode(&payload))
+				Equals(t, "reviewed-head", payload["sha"])
+				if changed {
+					w.WriteHeader(http.StatusConflict)
+					_, _ = w.Write([]byte(`{"message":"head changed"}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"merged":true}`))
+			}))
+			defer server.Close()
+			u, err := url.Parse(server.URL)
+			Ok(t, err)
+			client, err := github.New(u.Host, &github.UserCredentials{User: "user", Token: "pass"}, github.Config{}, 0, logging.NewNoopLogger(t))
+			Ok(t, err)
+			defer disableSSLVerification()()
+			err = client.MergePull(logging.NewNoopLogger(t), models.PullRequest{Num: 1, BaseRepo: models.Repo{Owner: "owner", Name: "repo"}}, models.PullRequestOptions{ExpectedHeadSHA: "reviewed-head"})
+			if changed {
+				ErrContains(t, "head changed", err)
+			} else {
+				Ok(t, err)
+			}
+		})
+	}
+}

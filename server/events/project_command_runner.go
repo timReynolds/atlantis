@@ -1325,7 +1325,7 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 		}
 		var out string
 		var err error
-		if step.StepName == "run" && stepMayMutateInfrastructure(ctx.CommandName, step.StepName) {
+		if stepRunsCustomCommand(step) {
 			if err := markInfrastructureSideEffect(ctx); err != nil {
 				return outputs, err
 			}
@@ -1402,20 +1402,16 @@ func markCommandSideEffect(marker command.SideEffectMarker) error {
 	return nil
 }
 
-func stepMayMutateInfrastructure(commandName command.Name, stepName string) bool {
+func stepRunsCustomCommand(step valid.Step) bool {
 	// Arbitrary workflow commands can mutate infrastructure even in a plan or
-	// policy stage. Conservatively cross the durable side-effect boundary before
-	// every run step.
-	if stepName == "run" {
+	// policy stage, including commands used to compute environment variables.
+	// Fence them conservatively; literal env values and built-in plan/init steps
+	// remain available for read-only reconciliation of an unknown mutation.
+	switch step.StepName {
+	case "run", "multienv":
 		return true
-	}
-	switch commandName {
-	case command.Apply:
-		return stepName == "apply"
-	case command.Import:
-		return stepName == "import"
-	case command.State:
-		return stepName == "state_rm"
+	case "env":
+		return step.EnvVarValue == ""
 	default:
 		return false
 	}

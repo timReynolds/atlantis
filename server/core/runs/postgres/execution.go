@@ -371,7 +371,8 @@ func (s *Store) HeartbeatAttempt(ctx context.Context, id runs.ID, heartbeatAt ti
 
 // MarkAttemptSideEffectStarted is the fail-closed boundary immediately before
 // Terraform apply or another infrastructure mutation. A process must not start
-// the side effect if this durable write fails.
+// the side effect if this durable write fails. Plans may be admitted to inspect
+// an unknown outcome, but their custom commands and hooks must pass this fence.
 func (s *Store) MarkAttemptSideEffectStarted(ctx context.Context, id runs.ID, startedAt time.Time) error {
 	if err := validateExecutionTimestamp(id, startedAt, "attempt side effect start"); err != nil {
 		return err
@@ -380,7 +381,36 @@ func (s *Store) MarkAttemptSideEffectStarted(ctx context.Context, id runs.ID, st
 	opCtx, cancel := s.operationContext(ctx)
 	defer cancel()
 
-	result, err := s.db.ExecContext(opCtx, `UPDATE run_attempts
+	tx, err := s.db.BeginTx(opCtx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning run attempt side effect: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Read the immutable scope without locking the row: admission and takeover
+	// acquire the scope lock before any attempt row locks, so use that order too.
+	var deploymentID, concurrencyKey string
+	if err := tx.QueryRowContext(opCtx, `SELECT deployment_id, concurrency_key
+		FROM run_attempts WHERE id = $1`, id).Scan(&deploymentID, &concurrencyKey); err != nil {
+		return mapLookupError("reading run attempt side effect scope", err)
+	}
+	if err := lockAttemptAdmission(opCtx, tx, deploymentID, concurrencyKey); err != nil {
+		return err
+	}
+	var unknownID runs.ID
+	err = tx.QueryRowContext(opCtx, `SELECT id FROM run_attempts
+		WHERE deployment_id = $1 AND concurrency_key = $2
+		  AND status = $3 AND reconciled_at IS NULL
+		ORDER BY completed_at DESC, id DESC LIMIT 1 FOR UPDATE`,
+		deploymentID, concurrencyKey, runs.AttemptUnknown,
+	).Scan(&unknownID)
+	if err == nil {
+		return fmt.Errorf("starting infrastructure mutation behind unknown attempt %s: %w", unknownID, runs.ErrConflict)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("checking unknown attempt side effect fence: %w", err)
+	}
+
+	result, err := tx.ExecContext(opCtx, `UPDATE run_attempts
         SET side_effect_started_at = $2, heartbeat_at = GREATEST(heartbeat_at, $2)
         WHERE id = $1 AND status = $3 AND side_effect_started_at IS NULL`,
 		id, startedAt, runs.AttemptRunning)
@@ -392,13 +422,20 @@ func (s *Store) MarkAttemptSideEffectStarted(ctx context.Context, id runs.ID, st
 		return fmt.Errorf("checking run attempt side effect: %w", err)
 	}
 	if updated == 1 {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("committing run attempt side effect: %w", err)
+		}
 		return nil
 	}
-	existing, err := s.getAttempt(opCtx, id)
+	existing, err := scanRunAttempt(tx.QueryRowContext(opCtx,
+		"SELECT "+runAttemptColumns+" FROM run_attempts WHERE id = $1", id))
 	if err != nil {
 		return err
 	}
 	if existing.Status == runs.AttemptRunning && existing.SideEffectStartedAt != nil && existing.SideEffectStartedAt.Equal(startedAt) {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("committing replayed run attempt side effect: %w", err)
+		}
 		return nil
 	}
 	return fmt.Errorf("marking run attempt %s side effect in status %q: %w", id, existing.Status, runs.ErrConflict)

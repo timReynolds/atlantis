@@ -48,8 +48,8 @@ func TestLoadMigrations(t *testing.T) {
 	require.Equal(t, int64(7), migrations[6].version)
 	require.Contains(t, migrations[6].sql, "DROP INDEX run_attempts_one_active_concurrency_key_idx")
 	require.Contains(t, migrations[6].sql, "WHERE status IN ('claimed', 'running')")
-	require.Equal(t, int64(8), migrations[len(migrations)-1].version)
-	require.Contains(t, migrations[len(migrations)-1].sql, "plan_workflow_checksum")
+	require.Equal(t, int64(8), migrations[7].version)
+	require.Contains(t, migrations[7].sql, "plan_workflow_checksum")
 }
 
 func TestRegisterExecutionInstance(t *testing.T) {

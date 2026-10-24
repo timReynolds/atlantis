@@ -694,6 +694,14 @@ func (d *QueueDriver) Merge(ctx context.Context, e queue.Entry) (queue.MergeResu
 		if err = d.Validate(ctx, e); err != nil {
 			return queue.MergeResult{}, err
 		}
+		if !queueApplyComplete(e) {
+			return queue.MergeResult{}, errors.New("queue merge requires every project to be applied")
+		}
+		// A required queue check must succeed before GitHub can merge. The
+		// durable entry remains MERGING, and reservations remain held.
+		if err = d.updateQueueStatus(c.Pull.BaseRepo, e, models.SuccessCommitStatus); err != nil {
+			return queue.MergeResult{}, err
+		}
 		// GitHub guards the PR head. A concurrent base update is detected by the
 		// resulting tree and retains all state fences for operator reconciliation.
 		mergeErr := d.VCS.MergePull(c.Log, c.Pull, models.PullRequestOptions{MergeMethod: "merge", ExpectedHeadSHA: e.HeadSHA})
@@ -726,9 +734,12 @@ func (d *QueueDriver) Merge(ctx context.Context, e queue.Entry) (queue.MergeResu
 func (d *QueueDriver) Report(ctx context.Context, e queue.Entry) {
 	d.reportMu.Lock()
 	defer d.reportMu.Unlock()
-	if latest, err := d.Store.Get(ctx, e.ID); err == nil {
-		e = latest
+	latest, err := d.Store.Get(ctx, e.ID)
+	if err != nil {
+		d.Log.Warn("reading queue report %v", err)
+		return
 	}
+	e = latest
 	var ref RepoRef
 	if json.Unmarshal(e.Source, &ref) != nil {
 		return
@@ -749,24 +760,51 @@ func (d *QueueDriver) Report(ctx context.Context, e queue.Entry) {
 		body += fmt.Sprintf("\n\nReview the plan runs, then use `atlantis queue approve %d`.", e.Generation)
 	}
 	marker := "<!-- atlantis-queue:" + string(e.ID) + " -->"
+	reported := true
 	id, err := d.Github.QueueComment(ctx, repo, e.PullNumber, e.CommentID, marker, body)
 	if err != nil {
+		reported = false
 		d.Log.Warn("updating queue comment %v", err)
 	} else if id != e.CommentID {
 		if err = d.Store.SetComment(ctx, e.ID, id); err != nil {
+			reported = false
 			d.Log.Warn("recording queue comment %v", err)
 		}
 	}
-	status := models.PendingCommitStatus
-	if e.State == queue.Completed || e.State == queue.Cancelled {
-		status = models.SuccessCommitStatus
-	} else if e.State == queue.Blocked || e.State.Recoverable() {
-		status = models.FailedCommitStatus
+	// An old lifecycle's delayed final report must not overwrite the newer
+	// entry's shared commit status for the same pull request.
+	current, err := d.Store.Find(ctx, e.Repository, e.PullNumber)
+	if err != nil {
+		reported = false
+	} else if current.ID == e.ID {
+		if err = d.updateQueueStatus(repo, e, queueCommitStatus(e)); err != nil {
+			reported = false
+			d.Log.Warn("updating queue status %v", err)
+		}
 	}
-	if err = d.VCS.UpdateStatus(d.Log, repo, models.PullRequest{Num: e.PullNumber, BaseRepo: repo, HeadCommit: e.HeadSHA}, status, truncateContext(d.StatusName+"/queue"), "Apply queue: "+string(e.State), url); err != nil {
-		d.Log.Warn("updating queue status %v", err)
+	if reported {
+		if err = d.Store.MarkReported(ctx, e.ID, e.Version); err != nil {
+			d.Log.Warn("recording queue report %v", err)
+		}
 	}
 	d.Scope.Counter("reports").Inc(1)
+}
+
+func queueApplyComplete(e queue.Entry) bool {
+	return e.ApplyStarted && len(e.Plans) > 0 && !slices.ContainsFunc(e.Plans, func(plan queue.Plan) bool { return !plan.Applied })
+}
+func queueCommitStatus(e queue.Entry) models.CommitStatus {
+	if e.State == queue.Completed || e.State == queue.Cancelled || (e.State == queue.Merging && queueApplyComplete(e)) {
+		return models.SuccessCommitStatus
+	}
+	if e.State == queue.Blocked || e.State.Recoverable() {
+		return models.FailedCommitStatus
+	}
+	return models.PendingCommitStatus
+}
+func (d *QueueDriver) updateQueueStatus(repo models.Repo, e queue.Entry, status models.CommitStatus) error {
+	url := strings.TrimRight(d.URL, "/") + "/queue/" + string(e.ID)
+	return d.VCS.UpdateStatus(d.Log, repo, models.PullRequest{Num: e.PullNumber, BaseRepo: repo, HeadCommit: e.HeadSHA}, status, truncateContext(d.StatusName+"/queue"), "Apply queue: "+string(e.State), url)
 }
 
 var _ queue.Driver = (*QueueDriver)(nil)

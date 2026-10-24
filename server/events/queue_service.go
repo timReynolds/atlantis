@@ -217,6 +217,14 @@ func (d *QueueDriver) MutationGuard(p command.ProjectContext, path string) (func
 }
 
 func (s *QueueService) refresh(ctx context.Context) error {
+	pending, err := s.Driver.Store.PendingReports(ctx, 200)
+	if err != nil {
+		return err
+	}
+	for _, entry := range pending {
+		s.Driver.Report(ctx, entry)
+	}
+
 	entries, err := s.Driver.Store.List(ctx, 200)
 	if err != nil {
 		return err

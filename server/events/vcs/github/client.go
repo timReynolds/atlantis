@@ -888,6 +888,10 @@ func (g *Client) ExpectedWorkflowPassed(expectedWorkflow WorkflowFileReference, 
 
 // IsMergeableMinusApply checks review decision (which takes into account CODEOWNERS) and required checks for PR (excluding the atlantis apply check).
 func (g *Client) IsMergeableMinusApply(logger logging.SimpleLogging, repo models.Repo, pull *github.PullRequest, vcsstatusname string, ignoreVCSStatusNames []string) (bool, error) {
+	return g.isMergeableMinusApply(logger, repo, pull, vcsstatusname, ignoreVCSStatusNames, nil)
+}
+
+func (g *Client) isMergeableMinusApply(logger logging.SimpleLogging, repo models.Repo, pull *github.PullRequest, vcsstatusname string, ignoreVCSStatusNames, ignoreContexts []string) (bool, error) {
 	if pull.Number == nil {
 		return false, errors.New("pull request number is nil")
 	}
@@ -914,12 +918,18 @@ func (g *Client) IsMergeableMinusApply(logger logging.SimpleLogging, repo models
 	// For example, if a check was made required after the pull request was opened, it would be missing
 	// Go through all checks and workflows required by branch protection or rulesets
 	// Make sure that they can all be found in the statusCheckRollup and that they all pass
+	applyContext := fmt.Sprintf("%s/%s", vcsstatusname, command.Apply.String())
 	for _, requiredCheck := range requiredChecks {
-		if strings.HasPrefix(string(requiredCheck), fmt.Sprintf("%s/%s", vcsstatusname, command.Apply.String())) {
-			// Ignore atlantis apply check(s)
+		deferredApply := strings.HasPrefix(string(requiredCheck), applyContext)
+		if len(ignoreContexts) > 0 {
+			// Queue admission defers only Atlantis's aggregate and project apply
+			// contexts. Preserve the legacy prefix behavior for ordinary applies.
+			deferredApply = string(requiredCheck) == applyContext || strings.HasPrefix(string(requiredCheck), applyContext+": ")
+		}
+		if deferredApply {
 			continue
 		}
-		if !slices.Contains(ignoreVCSStatusNames, GetVCSStatusNameFromRequiredCheck(requiredCheck)) && !ExpectedCheckPassed(requiredCheck, checkRuns, statusContexts, vcsstatusname) {
+		if !slices.Contains(ignoreContexts, string(requiredCheck)) && !slices.Contains(ignoreVCSStatusNames, GetVCSStatusNameFromRequiredCheck(requiredCheck)) && !ExpectedCheckPassed(requiredCheck, checkRuns, statusContexts, vcsstatusname) {
 			logger.Debug("%s: Expected Required Check: %s VCS Status Name: %s Ignore VCS Status Names: %s", notMergeablePrefix, requiredCheck, vcsstatusname, ignoreVCSStatusNames)
 			return false, nil
 		}
@@ -944,6 +954,20 @@ func GetVCSStatusNameFromRequiredCheck(requiredCheck githubv4.String) string {
 
 // PullIsMergeable returns true if the pull request is mergeable.
 func (g *Client) PullIsMergeable(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest, vcsstatusname string, ignoreVCSStatusNames []string) (models.MergeableStatus, error) {
+	return g.pullIsMergeable(logger, repo, pull, vcsstatusname, ignoreVCSStatusNames, nil, g.config.AllowMergeableBypassApply)
+}
+
+// QueuePullIsMergeable checks the requirements that can be satisfied before a
+// queued apply. Its own pending queue check and deferred apply checks must not
+// prevent the queue from executing; all other required checks and reviews hold.
+func (g *Client) QueuePullIsMergeable(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest, vcsstatusname, queueContext string) (models.MergeableStatus, error) {
+	if queueContext == "" {
+		return models.MergeableStatus{}, errors.New("queue status context is required")
+	}
+	return g.pullIsMergeable(logger, repo, pull, vcsstatusname, nil, []string{queueContext}, true)
+}
+
+func (g *Client) pullIsMergeable(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest, vcsstatusname string, ignoreVCSStatusNames, ignoreContexts []string, allowDeferredChecks bool) (models.MergeableStatus, error) {
 	logger.Debug("Checking if GitHub pull request %d is mergeable", pull.Num)
 	githubPR, err := g.GetPullRequest(logger, repo, pull.Num)
 	if err != nil {
@@ -975,9 +999,9 @@ func (g *Client) PullIsMergeable(logger logging.SimpleLogging, repo models.Repo,
 			IsMergeable: true,
 		}, nil
 	case "blocked":
-		if g.config.AllowMergeableBypassApply {
-			logger.Debug("AllowMergeableBypassApply feature flag is enabled - attempting to bypass apply from mergeable requirements")
-			isMergeableMinusApply, err := g.IsMergeableMinusApply(logger, repo, githubPR, vcsstatusname, ignoreVCSStatusNames)
+		if allowDeferredChecks {
+			logger.Debug("checking merge requirements excluding deferred Atlantis checks")
+			isMergeableMinusApply, err := g.isMergeableMinusApply(logger, repo, githubPR, vcsstatusname, ignoreVCSStatusNames, ignoreContexts)
 			if err != nil {
 				return models.MergeableStatus{}, fmt.Errorf("getting pull request status: %w", err)
 			}

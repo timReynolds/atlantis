@@ -246,6 +246,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	var supportedVCSHosts []models.VCSHostType
 	var githubClient github.IGithubClient
 	var queueGithub events.QueueGithub
+	var queueMergeability events.QueueMergeabilityClient
 	var githubAppEnabled bool
 	var githubConfig github.Config
 	var githubCredentials github.Credentials
@@ -362,6 +363,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 
 		githubClient = github.NewInstrumentedGithubClient(rawGithubClient, statsScope, logger)
 		queueGithub = rawGithubClient
+		queueMergeability = rawGithubClient
 	}
 	if userConfig.GitlabUser != "" {
 		supportedVCSHosts = append(supportedVCSHosts, models.Gitlab)
@@ -1236,7 +1238,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 			return nil, errors.New("apply queue requires GitHub configuration")
 		}
 		queueStore := runspostgres.NewQueueStore(runStore.(*runspostgres.Store))
-		driver := &events.QueueDriver{TeamAllowlistChecker: teamAllowlistChecker, PlanStore: planStore, Store: queueStore, Github: queueGithub, VCS: vcsClient, Parser: eventParser, Builder: projectCommandBuilder, Runner: instrumentedProjectCmdRunner, History: runHistory, WorkingDir: workingDir, Init: projectCommandRunner.InitStepRunner, Terraform: terraformClient, Distribution: defaultTfDistribution, Version: defaultTfVersion, DB: dbUpdater, Status: vcs.NewPullReqStatusFetcher(vcsClient, userConfig.VCSStatusName, append(strings.Split(userConfig.IgnoreVCSStatusNames, ","), userConfig.VCSStatusName+"/queue")), Global: globalCfg, Log: logger, Scope: statsScope.SubScope("queue"), Instance: executionInstanceID, Deployment: executionDeploymentID, URL: parsedURL.String(), StatusName: userConfig.VCSStatusName}
+		driver := &events.QueueDriver{TeamAllowlistChecker: teamAllowlistChecker, PlanStore: planStore, Store: queueStore, Github: queueGithub, VCS: vcsClient, Parser: eventParser, Builder: projectCommandBuilder, Runner: instrumentedProjectCmdRunner, History: runHistory, WorkingDir: workingDir, Init: projectCommandRunner.InitStepRunner, Terraform: terraformClient, Distribution: defaultTfDistribution, Version: defaultTfVersion, DB: dbUpdater, Status: events.NewQueuePullReqStatusFetcher(vcsClient, queueMergeability, userConfig.VCSStatusName), Global: globalCfg, Log: logger, Scope: statsScope.SubScope("queue"), Instance: executionInstanceID, Deployment: executionDeploymentID, URL: parsedURL.String(), StatusName: userConfig.VCSStatusName}
 		driver.Authorize = commandRunner.QueueAuthorize
 		driver.ApplyAllowed = func() error {
 			locked, err := applyCommandRunner.IsLocked()

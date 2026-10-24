@@ -32,6 +32,8 @@ func TestStoreDoesNotPersistPlanOutput(t *testing.T) {
 		},
 		PlanOutput: "sensitive plan text", LastChecked: checkedAt, Error: "partial failure",
 	}
+	mock.ExpectBegin()
+	expectDriftScopeLock(mock)
 	mock.ExpectQuery(regexp.QuoteMeta("WITH stored AS (")).
 		WithArgs(
 			driftIdentityDigest("example/infrastructure", projectDrift),
@@ -42,6 +44,7 @@ func TestStoreDoesNotPersistPlanOutput(t *testing.T) {
 		).
 		WillReturnRows(sqlmock.NewRows([]string{"stored"}).AddRow(true))
 
+	mock.ExpectCommit()
 	store := New(db, time.Second)
 	require.NoError(t, store.Store("example/infrastructure", projectDrift))
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -52,11 +55,14 @@ func TestStoreRejectsIdentityDigestCollision(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 	projectDrift := models.ProjectDrift{ProjectName: "network", Ref: "main", LastChecked: time.Now()}
+	mock.ExpectBegin()
+	expectDriftScopeLock(mock)
 	mock.ExpectQuery(regexp.QuoteMeta("WITH stored AS (")).
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectQuery("SELECT EXISTS").
 		WillReturnRows(sqlmock.NewRows([]string{"identity_matches"}).AddRow(false))
 
+	mock.ExpectRollback()
 	err = New(db, time.Second).Store("example/infrastructure", projectDrift)
 	require.EqualError(t, err, "storing PostgreSQL drift status: identity digest collision")
 }
@@ -66,11 +72,14 @@ func TestStoreIgnoresOlderResultForSameIdentity(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 	projectDrift := models.ProjectDrift{ProjectName: "network", Ref: "main", LastChecked: time.Now()}
+	mock.ExpectBegin()
+	expectDriftScopeLock(mock)
 	mock.ExpectQuery(regexp.QuoteMeta("WITH stored AS (")).
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectQuery("SELECT EXISTS").
 		WillReturnRows(sqlmock.NewRows([]string{"identity_matches"}).AddRow(true))
 
+	mock.ExpectCommit()
 	require.NoError(t, New(db, time.Second).Store("example/infrastructure", projectDrift))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -86,6 +95,8 @@ func TestRecordDetectionWithLatestRollsBackLatestStateWhenHistoryFails(t *testin
 		Ref: "main", BaseBranch: "main", DetectionID: "detection-1", LastChecked: checkedAt,
 	}
 	mock.ExpectBegin()
+	expectDriftScopeLock(mock)
+	expectDriftScopeLock(mock)
 	mock.ExpectQuery(regexp.QuoteMeta("WITH stored AS (")).
 		WillReturnRows(sqlmock.NewRows([]string{"stored"}).AddRow(true))
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO drift_detection_runs")).
@@ -148,4 +159,9 @@ func TestDeleteObservedIncludesDetectionVersion(t *testing.T) {
 
 	require.NoError(t, New(db, time.Second).DeleteObserved("example/infrastructure", observed))
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func expectDriftScopeLock(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery("INSERT INTO drift_status_scopes").
+		WillReturnRows(sqlmock.NewRows([]string{"last_reconciled_at"}).AddRow(nil))
 }

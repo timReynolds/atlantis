@@ -63,26 +63,47 @@ func (s *HistoryStore) RecordDetectionWithLatest(ctx context.Context, repository
 	}
 	defer tx.Rollback() // nolint: errcheck
 
-	for _, project := range record.Projects {
-		projectDrift := project.Project
-		projectDrift.PlanOutput = ""
-		if err := storeDriftStatus(ctx, tx, repository, projectDrift); err != nil {
-			return err
+	reconciledAt, err := lockDriftScope(ctx, tx, repository, record.Run.Ref, record.Run.BaseBranch)
+	if err != nil {
+		return err
+	}
+	startedAt := normalizeTime(record.Run.StartedAt)
+	stale := reconciledAt.Valid && startedAt.Before(reconciledAt.Time)
+	if !stale {
+		for _, project := range record.Projects {
+			projectDrift := project.Project
+			projectDrift.PlanOutput = ""
+			if err := storeDriftStatus(ctx, tx, repository, projectDrift); err != nil {
+				return err
+			}
 		}
 	}
-	if reconcile {
+	// Stale detections still contribute their complete immutable history.
+	if err := insertDetection(ctx, tx, record); err != nil {
+		return err
+	}
+	if reconcile && !stale && record.Run.Status == drift.DetectionStatusSucceeded {
 		if _, err := tx.ExecContext(ctx, `
-DELETE FROM drift_status
-WHERE repository_hash = $1 AND repository = $2 AND ref = $3
-  AND base_branch = $4 AND last_checked <= $5`,
+DELETE FROM drift_status AS status
+WHERE status.repository_hash = $1 AND status.repository = $2 AND status.ref = $3
+  AND status.base_branch = $4 AND status.last_checked <= $5
+  AND NOT EXISTS (
+    SELECT 1 FROM drift_detection_results AS result
+    WHERE result.detection_id = $6 AND result.project_name = status.project_name
+      AND result.directory = status.directory AND result.workspace = status.workspace
+      AND result.ref = status.ref AND result.base_branch = status.base_branch
+  )`,
 			digestValues(repository), repository, record.Run.Ref, record.Run.BaseBranch,
-			normalizeTime(record.Run.StartedAt),
+			startedAt, record.Run.ID,
 		); err != nil {
 			return fmt.Errorf("reconciling PostgreSQL drift status: %w", err)
 		}
-	}
-	if err := insertDetection(ctx, tx, record); err != nil {
-		return err
+		if _, err := tx.ExecContext(ctx, `
+UPDATE drift_status_scopes SET last_reconciled_at = $2 WHERE scope_hash = $1`,
+			digestValues(repository, record.Run.Ref, record.Run.BaseBranch), startedAt,
+		); err != nil {
+			return fmt.Errorf("recording PostgreSQL drift reconciliation: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing PostgreSQL drift status and history: %w", err)

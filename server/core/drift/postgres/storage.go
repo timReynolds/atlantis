@@ -41,16 +41,54 @@ func New(db *sql.DB, operationTimeout time.Duration) *Storage {
 func (s *Storage) Store(repository string, projectDrift models.ProjectDrift) error {
 	ctx, cancel := s.operationContext()
 	defer cancel()
-	return storeDriftStatus(ctx, s.db, repository, projectDrift)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("starting PostgreSQL drift status transaction: %w", err)
+	}
+	defer tx.Rollback() // nolint: errcheck
+	if err := storeDriftStatus(ctx, tx, repository, projectDrift); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing PostgreSQL drift status: %w", err)
+	}
+	return nil
 }
 
-type driftStatusQuerier interface {
-	QueryRowContext(context.Context, string, ...any) *sql.Row
+// lockDriftScope serializes latest-state writes with full reconciliation across
+// replicas. The retained row fences stale inserts even after every project in
+// the scope has been removed. The lock is held until the caller's transaction
+// commits, so a writer cannot check the generation before a concurrent removal
+// and then insert after it.
+func lockDriftScope(ctx context.Context, tx *sql.Tx, repository, ref, baseBranch string) (sql.NullTime, error) {
+	var reconciledAt sql.NullTime
+	err := tx.QueryRowContext(ctx, `
+INSERT INTO drift_status_scopes (scope_hash, repository, ref, base_branch)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (scope_hash) DO UPDATE SET scope_hash = EXCLUDED.scope_hash
+WHERE drift_status_scopes.repository = EXCLUDED.repository
+  AND drift_status_scopes.ref = EXCLUDED.ref
+  AND drift_status_scopes.base_branch = EXCLUDED.base_branch
+RETURNING last_reconciled_at`, digestValues(repository, ref, baseBranch), repository, ref, baseBranch).Scan(&reconciledAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return sql.NullTime{}, fmt.Errorf("locking PostgreSQL drift scope: identity digest collision")
+	}
+	if err != nil {
+		return sql.NullTime{}, fmt.Errorf("locking PostgreSQL drift scope: %w", err)
+	}
+	return reconciledAt, nil
 }
 
-func storeDriftStatus(ctx context.Context, querier driftStatusQuerier, repository string, projectDrift models.ProjectDrift) error {
+func storeDriftStatus(ctx context.Context, tx *sql.Tx, repository string, projectDrift models.ProjectDrift) error {
+	reconciledAt, err := lockDriftScope(ctx, tx, repository, projectDrift.Ref, projectDrift.BaseBranch)
+	if err != nil {
+		return err
+	}
+	if reconciledAt.Valid && normalizeTime(projectDrift.LastChecked).Before(reconciledAt.Time) {
+		return nil
+	}
 	var stored bool
-	err := querier.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, `
 WITH stored AS (
   INSERT INTO drift_status (
     identity_hash, repository_hash,
@@ -116,7 +154,7 @@ SELECT TRUE FROM stored`,
 		return nil
 	}
 	var identityMatches bool
-	err = querier.QueryRowContext(ctx, `SELECT EXISTS (
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS (
     SELECT 1 FROM drift_status
     WHERE identity_hash = $1
       AND repository = $2

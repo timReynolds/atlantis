@@ -1318,6 +1318,11 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 
 	envs := make(map[string]string)
 	for _, step := range steps {
+		// A preceding step can outlive the ownership lease. Re-admit before
+		// starting another subprocess, including custom and environment steps.
+		if err := p.admitExecution(ctx); err != nil {
+			return outputs, err
+		}
 		var out string
 		var err error
 		switch step.StepName {

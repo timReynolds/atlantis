@@ -48,7 +48,8 @@ final guard against clients outside Atlantis. See
 [Terraform's S3 locking documentation](https://developer.hashicorp.com/terraform/language/backend/s3#state-locking).
 
 The initial implementation blocks unsupported backends, workflow hooks, custom
-shell/environment steps, apply workflows that re-plan, scoped plans, missing
+shell/environment steps, shell-expanded arguments, state migration during init,
+apply workflows that re-plan, scoped plans, missing
 project dependencies, and multiple affected projects sharing one state. These
 cases require configuration changes before entering the queue. It also rejects
 implicit `TF_CLI_ARGS`, stage-specific CLI arguments, `TF_DATA_DIR`, and
@@ -67,7 +68,8 @@ implicit `TF_CLI_ARGS`, stage-specific CLI arguments, `TF_DATA_DIR`, and
 
 Queue commands accept no project selectors or Terraform arguments. Approval
 requires an explicit generation number so a delayed comment cannot approve a
-newer plan. Webhook delivery IDs deduplicate enqueue and control commands.
+newer plan. Generations continue increasing when a PR is dequeued and queued
+again. Webhook delivery IDs deduplicate enqueue and control commands.
 
 An approved PR's existing checksum-verified plans establish the approval
 baseline when available. The queue refreshes those plans against the current
@@ -87,7 +89,9 @@ state reservation set can be acquired.
 Before planning, Atlantis creates the integration checkout and records its head,
 base, tree, resolved workflow identities, and project manifest. It reserves both
 resolved backend locations and Terraform state lineages, independent of project
-names and directories. Multi-state acquisition is atomic, so opposite project
+names and directories. New backends are reserved by location until their first
+apply creates a state lineage. State reads and restored applies use the project's
+recorded workspace. Multi-state acquisition is atomic, so opposite project
 orders cannot deadlock or acquire partial sets.
 
 Before each apply, Atlantis rechecks the current head, target branch, base,
@@ -185,6 +189,11 @@ mutation reservations before disabling the queue; startup refuses to bypass
 unresolved reservations.
 
 The queue publishes a dedicated commit status and updates its own PR comment.
+Failed publications retry from persisted revisions, including completed entries
+after a restart. The queue status becomes successful once every apply is recorded,
+so repositories can require it for merging. The entry remains `MERGING` and keeps
+its reservations until the resulting merge and states are verified; a failed
+merge or verification changes the status to failure and requires recovery.
 The queue page shows the phase, generation, affected projects, reservation
 identities, reason, retry count, checkpoint, and linked runs. Metrics include
 queue depth, depth by phase, oldest-entry age, wait/planning/apply/merge duration,
@@ -196,7 +205,8 @@ Unit and PostgreSQL tests cover generation checks, webhook deduplication,
 concurrent claims, atomic reservations, stale workers, partial applies, merge
 failure, and prevention of reapply during recovery. The opt-in real Terraform
 gate additionally checks S3 conditional writes, retained saved-plan restoration,
-backend aliases, native state locking, and stale-plan rejection:
+empty backends, named workspaces after checkout loss, backend aliases, native
+state locking, and stale-plan rejection:
 
 ```sh
 ATLANTIS_POSTGRES_TEST_URL=postgres://... \

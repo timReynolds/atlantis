@@ -109,6 +109,8 @@ func preWorkflowHooksConfigured(runner PreWorkflowHooksCommandRunner, ctx *comma
 
 // DefaultCommandRunner is the first step when processing a comment command.
 type DefaultCommandRunner struct {
+	QueueService *QueueService
+
 	VCSClient                vcs.Client `validate:"required"`
 	GithubPullGetter         GithubPullGetter
 	AzureDevopsPullGetter    AzureDevopsPullGetter
@@ -611,6 +613,17 @@ func (c *DefaultCommandRunner) runCommentCommand(baseRepo models.Repo, maybeHead
 		return
 	}
 
+	if cmd.Name == command.Queue || cmd.Name == command.Dequeue {
+		if c.QueueService == nil {
+			_ = c.VCSClient.CreateComment(ctx.Log, baseRepo, pullNum, "Apply queue is disabled.", "")
+			return
+		}
+		if !c.validateCommentCommand(ctx, baseRepo, pullNum, user, cmd, true) {
+			return
+		}
+		c.QueueService.RunCommand(ctx, cmd)
+		return
+	}
 	cmdRunner := buildCommentCommandRunner(c, cmd.CommandName())
 	if !admitRoutedCommand(ctx.Log, routing.Lease, "selecting projects") {
 		return
@@ -875,3 +888,13 @@ func (c *DefaultCommandRunner) logPanics(baseRepo models.Repo, pullNum int, logg
 }
 
 var automergeComment = `Automatically merging because all plans have been successfully applied.`
+
+// QueueAuthorize refreshes user teams for asynchronous queue execution.
+func (c *DefaultCommandRunner) QueueAuthorize(repo models.Repo, user *models.User, name string) (bool, error) {
+	if c.TeamAllowlistChecker != nil && c.TeamAllowlistChecker.HasRules() {
+		if err := c.fetchUserTeams(c.Logger, repo, user); err != nil {
+			return false, err
+		}
+	}
+	return c.checkUserPermissions(repo, user, name)
+}

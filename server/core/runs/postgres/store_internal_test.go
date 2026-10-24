@@ -49,6 +49,10 @@ func TestLoadMigrations(t *testing.T) {
 	require.Contains(t, migrations[6].sql, "DROP INDEX run_attempts_one_active_concurrency_key_idx")
 	require.Contains(t, migrations[6].sql, "WHERE status IN ('claimed', 'running')")
 	require.Equal(t, int64(8), migrations[7].version)
+	require.Equal(t, int64(9), migrations[8].version)
+	require.Equal(t, "0009_drift_reconciliation.sql", migrations[8].name)
+	require.Equal(t, int64(10), migrations[9].version)
+	require.Equal(t, "0010_apply_queue.sql", migrations[9].name)
 	require.Contains(t, migrations[7].sql, "plan_workflow_checksum")
 }
 

@@ -22,6 +22,7 @@ func (s *Store) ApplyRetention(ctx context.Context, policy runs.RetentionPolicy)
 		deleted, err := s.deleteBeforeInBatches(ctx, `WITH retained_output AS (
             SELECT id FROM run_output_chunks
             WHERE created_at < $1
+            AND NOT EXISTS (SELECT 1 FROM apply_queue_runs qr JOIN apply_queue_entries qe ON qe.id=qr.entry_id JOIN project_runs qp ON qp.run_id=qr.run_id WHERE qp.id=run_output_chunks.project_run_id AND qe.state NOT IN ('COMPLETED','CANCELLED'))
             ORDER BY created_at, id
             LIMIT $2
         )
@@ -39,6 +40,8 @@ func (s *Store) ApplyRetention(ctx context.Context, policy runs.RetentionPolicy)
 		deleted, err := s.deleteBeforeInBatches(ctx, `WITH retained_events AS (
             SELECT id FROM audit_events
             WHERE created_at < $1
+            AND NOT EXISTS (SELECT 1 FROM apply_queue_entries qe WHERE qe.id::text=audit_events.metadata->>'queue_entry_id' AND qe.state NOT IN ('COMPLETED','CANCELLED'))
+            AND NOT EXISTS (SELECT 1 FROM apply_queue_runs qr JOIN apply_queue_entries qe ON qe.id=qr.entry_id WHERE qr.run_id=audit_events.run_id AND qe.state NOT IN ('COMPLETED','CANCELLED'))
             ORDER BY created_at, id
             LIMIT $2
         )
@@ -113,6 +116,7 @@ func (s *Store) deleteRunMetadataInBatches(ctx context.Context, cutoff time.Time
             JOIN project_runs project ON project.id = output.project_run_id
             JOIN runs run ON run.id = project.run_id
             WHERE run.completed_at < $1
+              AND NOT EXISTS (SELECT 1 FROM apply_queue_runs qr JOIN apply_queue_entries qe ON qe.id=qr.entry_id WHERE qr.run_id=run.id AND qe.state NOT IN ('COMPLETED','CANCELLED'))
               AND run.status IN ($2, $3, $4, $5, $6, $7)
               AND NOT EXISTS (
                   SELECT 1 FROM run_attempts attempt
@@ -136,6 +140,7 @@ func (s *Store) deleteRunMetadataInBatches(ctx context.Context, cutoff time.Time
             FROM project_runs project
             JOIN runs run ON run.id = project.run_id
             WHERE run.completed_at < $1
+              AND NOT EXISTS (SELECT 1 FROM apply_queue_runs qr JOIN apply_queue_entries qe ON qe.id=qr.entry_id WHERE qr.run_id=run.id AND qe.state NOT IN ('COMPLETED','CANCELLED'))
               AND run.status IN ($2, $3, $4, $5, $6, $7)
               AND NOT EXISTS (
                   SELECT 1 FROM run_attempts attempt
@@ -163,6 +168,7 @@ func (s *Store) deleteRunMetadataInBatches(ctx context.Context, cutoff time.Time
             FROM audit_events event
             JOIN runs run ON run.id = event.run_id
             WHERE run.completed_at < $1
+              AND NOT EXISTS (SELECT 1 FROM apply_queue_runs qr JOIN apply_queue_entries qe ON qe.id=qr.entry_id WHERE qr.run_id=run.id AND qe.state NOT IN ('COMPLETED','CANCELLED'))
               AND run.status IN ($2, $3, $4, $5, $6, $7)
               AND NOT EXISTS (
                   SELECT 1 FROM run_attempts attempt
@@ -185,6 +191,7 @@ func (s *Store) deleteRunMetadataInBatches(ctx context.Context, cutoff time.Time
             SELECT run.id
             FROM runs run
             WHERE run.completed_at < $1
+              AND NOT EXISTS (SELECT 1 FROM apply_queue_runs qr JOIN apply_queue_entries qe ON qe.id=qr.entry_id WHERE qr.run_id=run.id AND qe.state NOT IN ('COMPLETED','CANCELLED'))
               AND run.status IN ($2, $3, $4, $5, $6, $7)
               AND NOT EXISTS (
                   SELECT 1 FROM run_attempts attempt

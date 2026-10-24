@@ -30,8 +30,11 @@ type ProjectContext struct {
 	AttemptID    runs.ID
 	// PlanGeneration selects an immutable external artifact namespace. Queued
 	// execution retains these artifacts until its apply-and-merge is reconciled.
-	PlanGeneration runs.ID
-	RetainPlan     bool
+	QueueEntryID    runs.ID
+	QueueClaim      runs.ID
+	QueueGeneration int64
+	PlanGeneration  runs.ID
+	RetainPlan      bool
 	// ExpectedPlanArtifact pins apply to the exact durable planning record,
 	// instead of selecting the latest plan for the project.
 	ExpectedPlanArtifact *runs.PlanArtifactExpectation

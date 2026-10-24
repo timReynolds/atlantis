@@ -502,6 +502,12 @@ func (c *DefaultCommandRunner) checkVarFilesInCommandAllowlisted(cmd *CommentCom
 }
 
 func (c *DefaultCommandRunner) validateCommentCommand(ctx *command.Context, baseRepo models.Repo, pullNum int, user models.User, cmd *CommentCommand, shouldComment bool) bool {
+	// Queue control authorizes deferred applies, including approval of refreshed
+	// plans. Use the existing apply permission for every queue control command.
+	authorizationCommand := cmd.Name
+	if cmd.Name == command.Queue || cmd.Name == command.Dequeue {
+		authorizationCommand = command.Apply
+	}
 	// Check if the user who commented has the permissions to execute the 'plan' or 'apply' commands
 	if c.TeamAllowlistChecker != nil && c.TeamAllowlistChecker.HasRules() {
 		err := c.fetchUserTeams(ctx.Log, baseRepo, &user)
@@ -511,7 +517,7 @@ func (c *DefaultCommandRunner) validateCommentCommand(ctx *command.Context, base
 		}
 		directUserTeams := append([]string(nil), user.Teams...)
 
-		ok, err := c.checkUserPermissions(baseRepo, &user, cmd.Name.String())
+		ok, err := c.checkUserPermissions(baseRepo, &user, authorizationCommand.String())
 		if err != nil {
 			c.Logger.Err("Unable to check user permissions: %s", err)
 			return false
@@ -896,5 +902,16 @@ func (c *DefaultCommandRunner) QueueAuthorize(repo models.Repo, user *models.Use
 			return false, err
 		}
 	}
-	return c.checkUserPermissions(repo, user, name)
+	directUserTeams := append([]string(nil), user.Teams...)
+	allowed, err := c.checkUserPermissions(repo, user, name)
+	if err != nil || !allowed {
+		return allowed, err
+	}
+	// Queued execution builds plan and policy contexts as well as applies.
+	// Expand each permission from the freshly fetched direct memberships so
+	// later per-project filtering honors GitHub child teams without inventing
+	// membership through an already inferred parent.
+	c.addHierarchyTeamsForCommandForTeams(repo, user, command.Plan.String(), directUserTeams)
+	c.addPolicyCheckHierarchyTeamsForPlan(repo, user, command.Plan, directUserTeams)
+	return true, nil
 }

@@ -44,26 +44,27 @@ var (
 // Entry contains scheduling state, not Terraform credentials or raw plan JSON.
 // Plans contain digests and summaries; potentially sensitive values stay in S3.
 type Entry struct {
-	Position     int       `json:"position,omitempty"`
-	ID           runs.ID   `json:"id"`
-	Repository   string    `json:"repository"`
-	PullNumber   int       `json:"pull_number"`
-	TargetBranch string    `json:"target_branch"`
-	HeadSHA      string    `json:"head_sha"`
-	Actor        string    `json:"actor"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
-	State        State     `json:"state"`
-	Generation   int64     `json:"generation"`
-	Version      int64     `json:"version"`
-	Worker       string    `json:"worker,omitempty"`
-	Claim        runs.ID   `json:"claim,omitempty"`
-	HeartbeatAt  time.Time `json:"heartbeat_at,omitempty"`
-	RetryAt      time.Time `json:"retry_at,omitempty"`
-	RetryCount   int       `json:"retry_count"`
-	Reason       string    `json:"reason,omitempty"`
-	Checkpoint   string    `json:"checkpoint,omitempty"`
-	CommentID    int64     `json:"comment_id,omitempty"`
+	ReportedVersion int64     `json:"reported_version,omitempty"`
+	Position        int       `json:"position,omitempty"`
+	ID              runs.ID   `json:"id"`
+	Repository      string    `json:"repository"`
+	PullNumber      int       `json:"pull_number"`
+	TargetBranch    string    `json:"target_branch"`
+	HeadSHA         string    `json:"head_sha"`
+	Actor           string    `json:"actor"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	State           State     `json:"state"`
+	Generation      int64     `json:"generation"`
+	Version         int64     `json:"version"`
+	Worker          string    `json:"worker,omitempty"`
+	Claim           runs.ID   `json:"claim,omitempty"`
+	HeartbeatAt     time.Time `json:"heartbeat_at,omitempty"`
+	RetryAt         time.Time `json:"retry_at,omitempty"`
+	RetryCount      int       `json:"retry_count"`
+	Reason          string    `json:"reason,omitempty"`
+	Checkpoint      string    `json:"checkpoint,omitempty"`
+	CommentID       int64     `json:"comment_id,omitempty"`
 	// Source is the credential-free repository reference needed to hydrate a restart.
 	Source             json.RawMessage `json:"source"`
 	Prepared           PreparedPlan    `json:"prepared"`
@@ -166,6 +167,8 @@ type Store interface {
 	Reserve(context.Context, Entry, []string) error
 	Action(context.Context, runs.ID, int64, string, string, string, string) (Entry, error)
 	SetComment(context.Context, runs.ID, int64) error
+	PendingReports(context.Context, int) ([]Entry, error)
+	MarkReported(context.Context, runs.ID, int64) error
 	LinkRun(context.Context, Entry, runs.ID, runs.ID) error
 }
 

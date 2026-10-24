@@ -102,6 +102,50 @@ func (s *QueueStore) List(ctx context.Context, limit int) ([]queue.Entry, error)
 	}
 	return entries, rows.Err()
 }
+
+// PendingReports includes terminal entries until their latest durable revision
+// has been published, so a transient forge failure is recoverable after restart.
+func (s *QueueStore) PendingReports(ctx context.Context, limit int) ([]queue.Entry, error) {
+	ctx, cancel := s.store.operationContext(ctx)
+	defer cancel()
+	if limit <= 0 || limit > 200 {
+		limit = 200
+	}
+	rows, err := s.store.db.QueryContext(ctx, queueSelect+`WHERE COALESCE((payload->>'reported_version')::bigint,0)<version ORDER BY updated_at,id LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var entries []queue.Entry
+	for rows.Next() {
+		e, err := scanQueue(rows)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+// MarkReported acknowledges only the revision that was actually published. It
+// cannot hide an intervening state transition, or itself create another report.
+func (s *QueueStore) MarkReported(ctx context.Context, id runs.ID, version int64) error {
+	ctx, cancel := s.store.operationContext(ctx)
+	defer cancel()
+	result, err := s.store.db.ExecContext(ctx, `UPDATE apply_queue_entries SET payload=jsonb_set(payload,'{reported_version}',to_jsonb($2::bigint)) WHERE id=$1 AND version=$2`, id, version)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return queue.ErrConflict
+	}
+	return nil
+}
+
 func (s *QueueStore) Events(ctx context.Context, id runs.ID, limit int) ([]queue.Event, error) {
 	ctx, cancel := s.store.operationContext(ctx)
 	defer cancel()
@@ -132,11 +176,19 @@ func (s *QueueStore) Events(ctx context.Context, id runs.ID, limit int) ([]queue
 	return events, rows.Err()
 }
 func queueAudit(ctx context.Context, tx *sql.Tx, e queue.Entry, event, actor string) error {
+	return queueAuditMetadata(ctx, tx, e, event, actor, nil)
+}
+
+func queueAuditMetadata(ctx context.Context, tx *sql.Tx, e queue.Entry, event, actor string, additional map[string]any) error {
 	id, err := runs.NewID()
 	if err != nil {
 		return err
 	}
-	payload, err := json.Marshal(map[string]any{"queue_entry_id": e.ID, "generation": e.Generation, "attempt_id": e.Claim, "state": e.State, "reason": e.Reason, "checkpoint": e.Checkpoint, "plans": e.Plans, "merge": e.Merge})
+	metadata := map[string]any{"queue_entry_id": e.ID, "generation": e.Generation, "attempt_id": e.Claim, "state": e.State, "reason": e.Reason, "checkpoint": e.Checkpoint, "head_sha": e.HeadSHA, "target_branch": e.TargetBranch, "prepared": e.Prepared, "plans": e.Plans, "merge": e.Merge}
+	for key, value := range additional {
+		metadata[key] = value
+	}
+	payload, err := json.Marshal(metadata)
 	if err != nil {
 		return err
 	}
@@ -243,13 +295,21 @@ func (s *QueueStore) Enqueue(ctx context.Context, r queue.Request) (e queue.Entr
 		if err != nil {
 			return err
 		}
+		// Comment approvals carry a generation, so it must identify a plan across
+		// every lifecycle of this pull, including dequeue followed by re-enqueue.
+		// The scheduling transaction serializes this allocation with enqueue and
+		// all generation updates; concurrent requests cannot reuse a generation.
+		var generation int64
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(max(generation),0)+1 FROM apply_queue_entries WHERE repository=$1 AND pull_number=$2`, r.Repository, r.PullNumber).Scan(&generation); err != nil {
+			return err
+		}
 		now := time.Now().UTC()
-		e = queue.Entry{ID: id, Repository: r.Repository, PullNumber: r.PullNumber, TargetBranch: r.TargetBranch, HeadSHA: r.HeadSHA, Actor: r.Actor, CreatedAt: now, UpdatedAt: now, HeartbeatAt: now, RetryAt: now, State: queue.Queued, Generation: 1, Version: 1, Source: r.Source, ApprovedDigest: r.ApprovedDigest, ApprovedBy: r.ApprovedBy}
+		e = queue.Entry{ID: id, Repository: r.Repository, PullNumber: r.PullNumber, TargetBranch: r.TargetBranch, HeadSHA: r.HeadSHA, Actor: r.Actor, CreatedAt: now, UpdatedAt: now, HeartbeatAt: now, RetryAt: now, State: queue.Queued, Generation: generation, Version: 1, Source: r.Source, ApprovedDigest: r.ApprovedDigest, ApprovedBy: r.ApprovedBy}
 		payload, err := json.Marshal(e)
 		if err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO apply_queue_entries(id,repository,pull_number,target_branch,state,generation,version,worker,claim,heartbeat_at,retry_at,created_at,updated_at,payload) VALUES($1,$2,$3,$4,$5,1,1,'','',$6,$6,$6,$6,$7)`, e.ID, e.Repository, e.PullNumber, e.TargetBranch, e.State, now, payload)
+		_, err = tx.ExecContext(ctx, `INSERT INTO apply_queue_entries(id,repository,pull_number,target_branch,state,generation,version,worker,claim,heartbeat_at,retry_at,created_at,updated_at,payload) VALUES($1,$2,$3,$4,$5,$8,1,'','',$6,$6,$6,$6,$7)`, e.ID, e.Repository, e.PullNumber, e.TargetBranch, e.State, now, payload, generation)
 		if err != nil {
 			return err
 		}
@@ -359,6 +419,7 @@ func (s *QueueStore) Save(ctx context.Context, old, next queue.Entry, event stri
 		}
 		next.HeartbeatAt = current.HeartbeatAt
 		next.CommentID = current.CommentID
+		next.ReportedVersion = current.ReportedVersion
 		if next.State == queue.AwaitingApproval || next.State == queue.Blocked || next.State == queue.Replanning || next.State.Terminal() || next.State.Recoverable() {
 			next.Worker = ""
 			next.Claim = ""
@@ -395,7 +456,7 @@ func (s *QueueStore) Reserve(ctx context.Context, e queue.Entry, states []string
 				return err
 			}
 		}
-		return queueAudit(ctx, tx, e, "states_reserved", e.Worker)
+		return queueAuditMetadata(ctx, tx, e, "states_reserved", e.Worker, map[string]any{"states": states})
 	})
 }
 func (s *QueueStore) RecoverStale(ctx context.Context, ttl time.Duration) ([]queue.Entry, error) {

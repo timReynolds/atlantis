@@ -74,11 +74,20 @@ func (s *RunHistoryPlanStore) Load(ctx command.ProjectContext, planPath string) 
 	if s.history.planArtifacts == nil {
 		return reject(errors.New("restoring an external plan requires durable artifact history"))
 	}
-	expected, err := s.history.planArtifacts.FindPlanArtifact(context.Background(), runs.PlanArtifactLookup{
-		Repository: ctx.BaseRepo.ID(), PullNumber: ctx.Pull.Num, HeadSHA: ctx.Pull.HeadCommit,
-		ProjectName: ctx.ProjectName, Directory: ctx.RepoRelDir, Workspace: ctx.Workspace,
-		ProjectRunID: ctx.ProjectRunID,
-	})
+	var expected runs.PlanArtifactExpectation
+	var err error
+	if ctx.ExpectedPlanArtifact != nil {
+		if ctx.PlanGeneration == "" {
+			return reject(errors.New("pinned plan requires an immutable generation"))
+		}
+		expected = *ctx.ExpectedPlanArtifact
+	} else {
+		expected, err = s.history.planArtifacts.FindPlanArtifact(context.Background(), runs.PlanArtifactLookup{
+			Repository: ctx.BaseRepo.ID(), PullNumber: ctx.Pull.Num, HeadSHA: ctx.Pull.HeadCommit,
+			ProjectName: ctx.ProjectName, Directory: ctx.RepoRelDir, Workspace: ctx.Workspace,
+			ProjectRunID: ctx.ProjectRunID,
+		})
+	}
 	if err != nil {
 		return reject(fmt.Errorf("finding durable plan artifact expectation: %w", err))
 	}

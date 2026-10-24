@@ -473,3 +473,30 @@ func TestDeleteForPull_DeleteError(t *testing.T) {
 	err := store.DeleteForPull("acme", "infra", 42)
 	assert.NoError(t, err)
 }
+
+func TestImmutableGenerationPlan(t *testing.T) {
+	client := &mockS3Client{}
+	store := planstore.NewS3PlanStoreWithClient(client, "plans", "prefix", logging.NewNoopLogger(t))
+	ctx := testProjectContext()
+	ctx.PlanGeneration = "01922000-0000-7000-8000-000000000001"
+	ctx.RetainPlan = true
+	ctx.RepoRelDir = "."
+	path := filepath.Join(t.TempDir(), "default.tfplan")
+	require.NoError(t, os.WriteFile(path, []byte("saved plan"), 0o600))
+	require.NoError(t, store.Save(ctx, path))
+	firstKey := aws.ToString(client.putInput.Key)
+	require.NotContains(t, firstKey, "/./")
+	require.Contains(t, firstKey, "/generations/01922000-0000-7000-8000-000000000001/")
+	require.Equal(t, "*", aws.ToString(client.putInput.IfNoneMatch))
+	ctx.PlanGeneration = "01922000-0000-7000-8000-000000000002"
+	require.NoError(t, store.Save(ctx, path))
+	require.NotEqual(t, firstKey, aws.ToString(client.putInput.Key))
+	require.NoError(t, store.Remove(ctx, path))
+	require.Empty(t, client.deletedKeys)
+	require.FileExists(t, path)
+	ctx.RetainPlan = false
+	require.NoError(t, store.Remove(ctx, path))
+	require.Len(t, client.deletedKeys, 1)
+	ctx.PlanGeneration = "../../bad"
+	require.ErrorContains(t, store.Save(ctx, path), "validating plan generation")
+}

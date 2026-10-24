@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -21,6 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/logging"
 	"github.com/runatlantis/atlantis/server/utils"
@@ -126,6 +128,11 @@ func NewS3PlanStoreWithClient(client S3Client, bucket, prefix string, logger log
 
 // Save uploads the plan file at planPath to S3.
 func (s *S3PlanStore) Save(ctx command.ProjectContext, planPath string) error {
+	if ctx.PlanGeneration != "" {
+		if _, err := runs.ParseID(string(ctx.PlanGeneration)); err != nil {
+			return fmt.Errorf("validating plan generation: %w", err)
+		}
+	}
 	key := s.s3Key(ctx, planPath)
 
 	f, err := os.Open(planPath)
@@ -151,12 +158,16 @@ func (s *S3PlanStore) Save(ctx command.ProjectContext, planPath string) error {
 
 	opCtx, opCancel := s3Ctx()
 	defer opCancel()
-	_, err = s.client.PutObject(opCtx, &s3.PutObjectInput{
+	input := &s3.PutObjectInput{
 		Bucket:   aws.String(s.bucket),
 		Key:      aws.String(key),
 		Body:     f,
 		Metadata: metadata,
-	})
+	}
+	if ctx.PlanGeneration != "" {
+		input.IfNoneMatch = aws.String("*")
+	}
+	_, err = s.client.PutObject(opCtx, input)
 	if err != nil {
 		return fmt.Errorf("uploading plan to S3 (key=%s): %w", key, err)
 	}
@@ -277,6 +288,9 @@ func validPlanChecksum(checksum string) bool {
 
 // Remove deletes the plan file from S3 and locally.
 func (s *S3PlanStore) Remove(ctx command.ProjectContext, planPath string) error {
+	if ctx.RetainPlan {
+		return nil
+	}
 	key := s.s3Key(ctx, planPath)
 
 	opCtx, opCancel := s3Ctx()
@@ -502,6 +516,10 @@ func (s *S3PlanStore) s3Key(ctx command.ProjectContext, planPath string) string 
 	if s.prefix != "" {
 		parts = append(parts, s.prefix)
 	}
+	if ctx.PlanGeneration != "" {
+		// Keep generations outside the ordinary pull inventory and cleanup prefix.
+		parts = append(parts, "generations", string(ctx.PlanGeneration))
+	}
 	parts = append(parts,
 		ctx.BaseRepo.Owner,
 		ctx.BaseRepo.Name,
@@ -510,6 +528,9 @@ func (s *S3PlanStore) s3Key(ctx command.ProjectContext, planPath string) string 
 		ctx.RepoRelDir,
 		filepath.Base(planPath),
 	)
+	if ctx.PlanGeneration != "" {
+		return path.Join(parts...)
+	}
 	return strings.Join(parts, "/")
 }
 

@@ -5,6 +5,7 @@ package events
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,12 +16,16 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/hashicorp/go-version"
 	"github.com/runatlantis/atlantis/server/core/planstore"
 	"github.com/runatlantis/atlantis/server/core/queue"
 	"github.com/runatlantis/atlantis/server/core/runs"
 	runpostgres "github.com/runatlantis/atlantis/server/core/runs/postgres"
+	"github.com/runatlantis/atlantis/server/core/runtime"
+	"github.com/runatlantis/atlantis/server/core/terraform"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/logging"
+	. "github.com/runatlantis/atlantis/testing"
 	"github.com/stretchr/testify/require"
 )
 
@@ -39,16 +44,16 @@ func TestQueueTerraformArtifactsAndNativeLock(t *testing.T) {
 	testURL, cleanup := isolatedHAPlanDatabase(t, postgresURL)
 	defer cleanup()
 	store, err := runpostgres.New(ctx, runpostgres.Config{URL: testURL})
-	require.NoError(t, err)
+	Ok(t, err)
 	defer store.Close()
 	id, err := runs.NewID()
-	require.NoError(t, err)
+	Ok(t, err)
 	bucket := "queue-" + string(id)
 	client := s3.New(s3.Options{Region: "us-east-1", BaseEndpoint: aws.String(endpoint), UsePathStyle: true, Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
 		return aws.Credentials{AccessKeyID: os.Getenv("AWS_ACCESS_KEY_ID"), SecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY")}, nil
 	})})
 	_, err = client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
-	require.NoError(t, err)
+	Ok(t, err)
 	defer func() {
 		objects, _ := client.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{Bucket: aws.String(bucket)})
 		if objects != nil {
@@ -85,33 +90,56 @@ resource "terraform_data" "example" {
 		cmd := exec.CommandContext(ctx, binary, args...)
 		cmd.Dir = dir
 		out, err := cmd.CombinedOutput()
-		require.NoError(t, err, string(out))
+		Assert(t, err == nil, "running Terraform: %v %s", err, out)
 		return string(out)
 	}
-	require.NoError(t, os.WriteFile(filepath.Join(root, "main.tf"), []byte(config), 0600))
+	Ok(t, os.WriteFile(filepath.Join(root, "main.tf"), []byte(config), 0600))
 	run(root, "init", "-input=false", "-no-color")
+	driver := &QueueDriver{Terraform: queueRealTerraform{binary: binary, ctx: ctx}}
+	project := command.ProjectContext{Workspace: "default"}
+	empty, err := driver.state(project, root)
+	Ok(t, err)
+	Equals(t, queue.StateVersion{}, empty)
 	run(root, "apply", "-auto-approve", "-input=false", "-no-color")
+	defaultState, err := driver.state(project, root)
+	Ok(t, err)
+	run(root, "workspace", "new", "production")
+	run(root, "apply", "-auto-approve", "-input=false", "-no-color")
+	productionState, err := queue.ParseStateVersion([]byte(run(root, "state", "pull")))
+	Ok(t, err)
+	Assert(t, defaultState.Lineage != productionState.Lineage, "workspaces must have independent states")
+	// Simulate a restored checkout whose selected workspace is missing. State
+	// reads must use the queued project's workspace rather than local selection.
+	Ok(t, os.Remove(filepath.Join(root, ".terraform", "environment")))
+	project.Workspace = "production"
+	observed, err := driver.state(project, root)
+	Ok(t, err)
+	Equals(t, productionState, observed)
+	project.Workspace = "default"
+	observed, err = driver.state(project, root)
+	Ok(t, err)
+	Equals(t, defaultState, observed)
 	config = strings.Replace(config, "triggers_replace = [1]", "triggers_replace = [2]", 1)
-	require.NoError(t, os.WriteFile(filepath.Join(root, "main.tf"), []byte(config), 0600))
-	require.NoError(t, os.WriteFile(filepath.Join(other, "main.tf"), []byte(config), 0600))
+	Ok(t, os.WriteFile(filepath.Join(root, "main.tf"), []byte(config), 0600))
+	Ok(t, os.WriteFile(filepath.Join(other, "main.tf"), []byte(config), 0600))
 	run(other, "init", "-input=false", "-no-color")
-	require.NoError(t, os.Remove(ready))
+	Ok(t, os.Remove(ready))
 	run(root, "plan", "-input=false", "-no-color", "-out=state-default.tfplan")
 	before, err := queue.ParseStateVersion([]byte(run(root, "state", "pull")))
-	require.NoError(t, err)
+	Ok(t, err)
 	rawBackend, err := os.ReadFile(filepath.Join(root, ".terraform", "terraform.tfstate"))
-	require.NoError(t, err)
+	Ok(t, err)
 	backend, err := queue.BackendStateID(rawBackend, "default")
-	require.NoError(t, err)
-	require.NoError(t, queue.ValidateBackendLocking(rawBackend))
+	Ok(t, err)
+	Ok(t, queue.ValidateBackendLocking(rawBackend))
 	fingerprint, _, destructive, err := queue.SemanticPlan([]byte(run(root, "show", "-json", "state-default.tfplan")))
-	require.NoError(t, err)
-	require.NotEmpty(t, fingerprint)
-	require.True(t, destructive)
+	Ok(t, err)
+	Assert(t, fingerprint != "", "plan has a semantic fingerprint")
+	Assert(t, destructive, "replacement is destructive")
 	instance, err := runs.NewID()
-	require.NoError(t, err)
+	Ok(t, err)
 	now := time.Now().UTC()
-	require.NoError(t, store.RegisterInstance(ctx, runs.ExecutionInstance{ID: instance, ReplicaID: "queue-test", DeploymentID: "queue-test", StartedAt: now, HeartbeatAt: now}))
+	Ok(t, store.RegisterInstance(ctx, runs.ExecutionInstance{ID: instance, ReplicaID: "queue-test", DeploymentID: "queue-test", StartedAt: now, HeartbeatAt: now}))
 	history := NewRunHistory(store, logging.NewNoopLogger(t))
 	p := haPlanProjectContext(21, "head")
 	p.ProjectName = "state"
@@ -123,67 +151,86 @@ resource "terraform_data" "example" {
 	c := &command.Context{Pull: p.Pull, User: p.User, Log: p.Log, ExecutionInstanceID: instance, ExecutionDeploymentID: "queue-test", ConcurrencyKey: "queue-test", OwnershipClaimID: string(id)}
 	life := history.Begin(c, runs.CommandPlan, runs.TriggerComment)
 	defer life.Finish()
-	require.True(t, life.CanExecute())
+	Assert(t, life.CanExecute(), "run must admit execution")
 	p.RunID = c.RunID
 	p.AttemptID = c.AttemptID
 	p = history.beginProject(p)
 	s3Store, err := planstore.NewS3PlanStore(planstore.S3PlanStoreConfig{Bucket: bucket, Region: "us-east-1", Endpoint: endpoint, ForcePathStyle: true}, p.Log)
-	require.NoError(t, err)
+	Ok(t, err)
 	wrapped := NewRunHistoryPlanStore(s3Store, history, p.Log)
 	planPath := filepath.Join(root, "state-default.tfplan")
-	require.NoError(t, wrapped.Save(p, planPath))
+	Ok(t, wrapped.Save(p, planPath))
 	expected, err := store.FindPlanArtifact(ctx, runs.PlanArtifactLookup{Repository: p.BaseRepo.ID(), PullNumber: p.Pull.Num, HeadSHA: p.Pull.HeadCommit, ProjectName: p.ProjectName, Directory: p.RepoRelDir, Workspace: p.Workspace})
-	require.NoError(t, err)
+	Ok(t, err)
 	p.ExpectedPlanArtifact = &expected
-	require.Error(t, wrapped.Save(p, planPath), "an immutable generation cannot be overwritten")
-	require.NoError(t, wrapped.Remove(p, planPath))
-	require.NoError(t, os.Remove(planPath))
-	require.NoError(t, wrapped.Load(p, planPath), "retained artifact survives local checkout loss")
+	Assert(t, wrapped.Save(p, planPath) != nil, "an immutable generation cannot be overwritten")
+	Ok(t, wrapped.Remove(p, planPath))
+	Ok(t, os.Remove(planPath))
+	Ok(t, wrapped.Load(p, planPath))
 	// A different project directory has the same backend identity and lineage.
 	otherRaw, err := os.ReadFile(filepath.Join(other, ".terraform", "terraform.tfstate"))
-	require.NoError(t, err)
+	Ok(t, err)
 	otherBackend, err := queue.BackendStateID(otherRaw, "default")
-	require.NoError(t, err)
-	require.Equal(t, backend, otherBackend)
+	Ok(t, err)
+	Equals(t, backend, otherBackend)
 	otherState, err := queue.ParseStateVersion([]byte(run(other, "state", "pull")))
-	require.NoError(t, err)
-	require.Equal(t, before, otherState)
+	Ok(t, err)
+	Equals(t, before, otherState)
 	qs := runpostgres.NewQueueStore(store)
 	entry, err := qs.Enqueue(ctx, queue.Request{Repository: p.BaseRepo.ID(), PullNumber: p.Pull.Num, TargetBranch: "main", HeadSHA: "head", Actor: "operator", Source: []byte(`{}`)})
-	require.NoError(t, err)
+	Ok(t, err)
 	entry, err = qs.ClaimNext(ctx, "worker", time.Minute)
-	require.NoError(t, err)
+	Ok(t, err)
 	lineage := "lineage:" + queueHash(before.Lineage)
-	require.NoError(t, qs.Reserve(ctx, entry, []string{backend, lineage}))
+	Ok(t, qs.Reserve(ctx, entry, []string{backend, lineage}))
 	_, err = qs.AcquireMutation(ctx, []string{otherBackend, lineage}, "", "", 0, "ordinary-apply")
-	require.ErrorIs(t, err, queue.ErrReserved)
+	Assert(t, errors.Is(err, queue.ErrReserved), "ordinary mutation must respect reservations: %v", err)
 	// Terraform's own lock independently rejects an out-of-band concurrent apply.
 	planBytes, err := os.ReadFile(planPath)
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(filepath.Join(other, "state-default.tfplan"), planBytes, 0600))
+	Ok(t, err)
+	Ok(t, os.WriteFile(filepath.Join(other, "state-default.tfplan"), planBytes, 0600))
 	running := exec.CommandContext(ctx, binary, "apply", "-input=false", "-no-color", planPath)
 	running.Dir = root
 	outputFile, err := os.CreateTemp(t.TempDir(), "apply-output")
-	require.NoError(t, err)
+	Ok(t, err)
 	defer outputFile.Close()
 	running.Stdout = outputFile
 	running.Stderr = outputFile
-	require.NoError(t, running.Start())
+	Ok(t, running.Start())
 	defer func() { _ = running.Process.Kill() }()
 	require.Eventually(t, func() bool { _, err := os.Stat(ready); return err == nil }, 10*time.Second, 10*time.Millisecond)
 	competing := exec.CommandContext(ctx, binary, "apply", "-input=false", "-no-color", "-lock-timeout=0s", "state-default.tfplan")
 	competing.Dir = other
 	output, err := competing.CombinedOutput()
-	require.Error(t, err)
-	require.Contains(t, string(output), "Error acquiring the state lock")
-	require.NoError(t, running.Wait())
+	Assert(t, err != nil, "concurrent or stale apply must be rejected")
+	Assert(t, strings.Contains(string(output), "Error acquiring the state lock"), "native lock rejects concurrent apply: %s", output)
+	Ok(t, running.Wait())
 	after, err := queue.ParseStateVersion([]byte(run(root, "state", "pull")))
-	require.NoError(t, err)
-	require.Equal(t, before.Lineage, after.Lineage)
-	require.Greater(t, after.Serial, before.Serial)
+	Ok(t, err)
+	Equals(t, before.Lineage, after.Lineage)
+	Assert(t, after.Serial > before.Serial, "apply must advance state serial")
 	stale := exec.CommandContext(ctx, binary, "apply", "-input=false", "-no-color", "state-default.tfplan")
 	stale.Dir = other
 	output, err = stale.CombinedOutput()
-	require.Error(t, err)
-	require.Contains(t, string(output), "Saved plan is stale")
+	Assert(t, err != nil, "concurrent or stale apply must be rejected")
+	Assert(t, strings.Contains(string(output), "Saved plan is stale"), "state change rejects stale plan: %s", output)
+}
+
+// Execute the production adapter's shell-quoted arguments and environment
+// against real Terraform without downloading a second CLI version.
+type queueRealTerraform struct {
+	runtime.TerraformExec
+	binary string
+	ctx    context.Context
+}
+
+func (f queueRealTerraform) RunCommandWithVersion(_ command.ProjectContext, path string, args []string, envs map[string]string, _ terraform.Distribution, _ *version.Version, _ string) (string, error) {
+	cmd := exec.CommandContext(f.ctx, "/bin/sh", "-c", `exec "$QUEUE_TEST_TERRAFORM" `+strings.Join(args, " "))
+	cmd.Dir = path
+	cmd.Env = append(os.Environ(), "QUEUE_TEST_TERRAFORM="+f.binary)
+	for key, value := range envs {
+		cmd.Env = append(cmd.Env, key+"="+value)
+	}
+	output, err := cmd.CombinedOutput()
+	return string(output), err
 }

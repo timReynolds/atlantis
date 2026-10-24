@@ -20,6 +20,7 @@ import (
 	"time"
 
 	gh "github.com/google/go-github/v88/github"
+	"github.com/google/shlex"
 	"github.com/hashicorp/go-version"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/queue"
@@ -157,6 +158,12 @@ func (l queueExecutionLease) Admit(ctx context.Context) error {
 	return l.store.CheckClaim(ctx, l.entry)
 }
 func (d *QueueDriver) planContexts(c *command.Context) ([]command.ProjectContext, error) {
+	status, err := d.Status.FetchPullStatus(c.Log, c.Pull)
+	if err != nil {
+		return nil, queue.TransientError{Err: err}
+	}
+	c.PullRequestStatus = status
+
 	for _, r := range d.Global.Repos {
 		if r.IDMatches(c.Pull.BaseRepo.ID()) && (len(r.PreWorkflowHooks) > 0 || len(r.PostWorkflowHooks) > 0) {
 			return nil, errors.New("queue cannot safely fingerprint workflow hooks")
@@ -174,6 +181,35 @@ func (d *QueueDriver) planContexts(c *command.Context) ([]command.ProjectContext
 	return projects, nil
 }
 func queueWorkflow(p command.ProjectContext) error {
+	validateArgs := func(raw string) error {
+		// Terraform runners join extra args into sh -c. Only literal arguments
+		// can be checked before init, which runs before state reservations exist.
+		if strings.ContainsAny(raw, "$`;|&<>\n\r#*?[]~()") {
+			return errors.New("queue workflow requires literal arguments without shell expansion")
+		}
+		args, err := shlex.Split(raw)
+		if err != nil {
+			return fmt.Errorf("parsing queue workflow arguments: %w", err)
+		}
+		for _, arg := range args {
+			if !strings.HasPrefix(arg, "-") {
+				continue
+			}
+			name, value, _ := strings.Cut(strings.TrimLeft(arg, "-"), "=")
+			switch name {
+			case "lock", "refresh":
+				if value != "true" {
+					return errors.New("queue workflow requires locking and state refresh")
+				}
+			case "migrate-state", "force-copy", "target", "replace", "destroy", "refresh-only", "out", "state", "state-out", "backup":
+				return fmt.Errorf("queue workflow cannot use %q because it changes state or the saved plan scope", name)
+			}
+		}
+		return nil
+	}
+	if err := validateArgs(strings.Join(p.EscapedCommentArgs, " ")); err != nil {
+		return err
+	}
 	expected := "plan"
 	if p.CommandName == command.Apply {
 		expected = "apply"
@@ -200,9 +236,9 @@ func queueWorkflow(p command.ProjectContext) error {
 		default:
 			return fmt.Errorf("queue requires saved-plan workflows; step %q is not supported", step.StepName)
 		}
-		for _, arg := range step.ExtraArgs {
-			if strings.Contains(arg, "lock=false") || strings.Contains(arg, "-target") || strings.Contains(arg, "-replace") || strings.Contains(arg, "-destroy") || strings.Contains(arg, "-refresh=false") {
-				return errors.New("queue workflow cannot bypass locking or alter the full plan scope")
+		for _, args := range []string{strings.Join(step.ExtraArgs, " "), os.Getenv("TF_CLI_ARGS"), os.Getenv("TF_CLI_ARGS_" + step.StepName)} {
+			if err := validateArgs(args); err != nil {
+				return err
 			}
 		}
 	}
@@ -261,12 +297,17 @@ func (d *QueueDriver) tf(p command.ProjectContext, path string, args ...string) 
 	for i, arg := range args {
 		args[i] = "'" + strings.ReplaceAll(arg, "'", "'\"'\"'") + "'"
 	}
-	return d.Terraform.RunCommandWithVersion(p, path, args, nil, dist, v, p.Workspace)
+	return d.Terraform.RunCommandWithVersion(p, path, args, map[string]string{"TF_WORKSPACE": p.Workspace}, dist, v, p.Workspace)
 }
 func (d *QueueDriver) state(p command.ProjectContext, path string) (queue.StateVersion, error) {
 	out, err := d.tf(p, path, "state", "pull")
 	if err != nil {
 		return queue.StateVersion{}, fmt.Errorf("reading backend state: %w", err)
+	}
+	// Terraform reports a missing state snapshot with a successful empty pull.
+	// Keep backend admission even before a lineage exists.
+	if strings.TrimSpace(out) == "" {
+		return queue.StateVersion{}, nil
 	}
 	return queue.ParseStateVersion([]byte(out))
 }
@@ -279,6 +320,12 @@ func queueStateID(p command.ProjectContext, path string) (string, error) {
 		return "", err
 	}
 	return queue.BackendStateID(data, p.Workspace)
+}
+func queueStateIdentity(backend string, state queue.StateVersion) string {
+	if state.Lineage == "" {
+		return backend
+	}
+	return "lineage:" + queueHash(state.Lineage)
 }
 func queueProject(p command.ProjectContext, state string) queue.Project {
 	return queue.Project{Name: p.ProjectName, Directory: p.RepoRelDir, Workspace: p.Workspace, Workflow: p.WorkflowIdentity, StateID: state, DependsOn: p.DependsOn}
@@ -340,7 +387,7 @@ func (d *QueueDriver) Prepare(ctx context.Context, e queue.Entry) (queue.Prepare
 		if err != nil {
 			return prepared, err
 		}
-		project := queueProject(p, "lineage:"+queueHash(version.Lineage))
+		project := queueProject(p, queueStateIdentity(state, version))
 		project.BackendID = state
 		project.Inputs, err = d.inputFingerprint(p, path)
 		if err != nil {
@@ -434,7 +481,7 @@ func (d *QueueDriver) Plan(ctx context.Context, e queue.Entry) (plans []queue.Pl
 		if idErr != nil {
 			return nil, idErr
 		}
-		project := queueProject(p, "lineage:"+queueHash(before.Lineage))
+		project := queueProject(p, queueStateIdentity(stateID, before))
 		project.BackendID = stateID
 		project.Inputs, err = d.inputFingerprint(p, path)
 		if err != nil {
@@ -511,19 +558,28 @@ func (d *QueueDriver) Validate(ctx context.Context, e queue.Entry) error {
 	if raw.GetBase().GetSHA() != e.Prepared.BaseSHA || e.Prepared.Configuration != queueHash(d.Global) {
 		return queue.ErrReplan
 	}
+	if err = d.validateApplyRequirements(c); err != nil {
+		return err
+	}
+	return d.validateStates(ctx, c, e)
+}
+
+// Fetch requirements at each execution boundary; do not reuse a cached result.
+func (d *QueueDriver) validateApplyRequirements(c *command.Context) error {
 	if d.ApplyAllowed != nil {
-		if err = d.ApplyAllowed(); err != nil {
+		if err := d.ApplyAllowed(); err != nil {
 			return err
 		}
 	}
-	c.PullRequestStatus, err = d.Status.FetchPullStatus(c.Log, c.Pull)
+	status, err := d.Status.FetchPullStatus(c.Log, c.Pull)
 	if err != nil {
 		return err
 	}
-	if !c.PullRequestStatus.ApprovalStatus.IsApproved || !c.PullRequestStatus.MergeableStatus.IsMergeable {
+	c.PullRequestStatus = status
+	if !status.ApprovalStatus.IsApproved || !status.MergeableStatus.IsMergeable {
 		return errors.New("pull request approvals or required checks are not satisfied")
 	}
-	return d.validateStates(ctx, c, e)
+	return nil
 }
 func (d *QueueDriver) validateStates(ctx context.Context, c *command.Context, e queue.Entry) error {
 	for i, plan := range e.Plans {
@@ -773,7 +829,7 @@ func (d *QueueDriver) ApprovedBaseline(c *command.Context) string {
 		if err != nil {
 			return ""
 		}
-		project := queueProject(p, "lineage:"+queueHash(version.Lineage))
+		project := queueProject(p, queueStateIdentity(backend, version))
 		project.BackendID = backend
 		plans = append(plans, queue.Plan{Project: project, SemanticDigest: fingerprint})
 	}
@@ -786,7 +842,7 @@ func (d *QueueDriver) inputFingerprint(p command.ProjectContext, directory strin
 	values := map[string]string{}
 	for _, env := range os.Environ() {
 		name, value, _ := strings.Cut(env, "=")
-		if strings.HasPrefix(name, "TF_VAR_") {
+		if strings.HasPrefix(name, "TF_VAR_") || name == "TF_CLI_ARGS" || strings.HasPrefix(name, "TF_CLI_ARGS_") {
 			values[name] = value
 		}
 	}

@@ -154,7 +154,7 @@ func (d *QueueDriver) MutationGuard(p command.ProjectContext, path string) (func
 	if err != nil {
 		return nil, err
 	}
-	lineageID := "lineage:" + queueHash(state.Lineage)
+	lineageID := queueStateIdentity(stateID, state)
 	if p.QueueEntryID != "" {
 		entry, err := d.Store.Get(ctx, p.QueueEntryID)
 		if err != nil {
@@ -167,17 +167,8 @@ func (d *QueueDriver) MutationGuard(p command.ProjectContext, path string) (func
 		if raw.GetBase().GetSHA() != entry.Prepared.BaseSHA || raw.GetState() != "open" || raw.GetDraft() {
 			return nil, queue.ErrReplan
 		}
-		status, err := d.Status.FetchPullStatus(c.Log, c.Pull)
-		if err != nil {
+		if err = d.validateApplyRequirements(c); err != nil {
 			return nil, err
-		}
-		if !status.ApprovalStatus.IsApproved || !status.MergeableStatus.IsMergeable {
-			return nil, errors.New("pull request approvals or checks changed")
-		}
-		if d.ApplyAllowed != nil {
-			if err = d.ApplyAllowed(); err != nil {
-				return nil, err
-			}
 		}
 		root, _, err := d.path(p)
 		if err != nil {
@@ -214,7 +205,7 @@ func (d *QueueDriver) MutationGuard(p command.ProjectContext, path string) (func
 			return nil, queue.ErrConflict
 		}
 	}
-	token, err := store.AcquireMutation(ctx, []string{stateID, lineageID}, p.QueueEntryID, p.QueueClaim, p.QueueGeneration, p.User.Username)
+	token, err := store.AcquireMutation(ctx, mutationStates(stateID, lineageID), p.QueueEntryID, p.QueueClaim, p.QueueGeneration, p.User.Username)
 	if err != nil {
 		return nil, err
 	}
@@ -273,4 +264,11 @@ func (s *QueueService) refresh(ctx context.Context) error {
 		s.Driver.Scope.Tagged(map[string]string{"phase": string(state)}).Gauge("depth").Update(float64(counts[state]))
 	}
 	return nil
+}
+
+func mutationStates(backend, identity string) []string {
+	if identity == backend {
+		return []string{backend}
+	}
+	return []string{backend, identity}
 }

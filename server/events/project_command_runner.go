@@ -1320,6 +1320,11 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 	}
 
 	envs := make(map[string]string)
+	if ctx.QueueEntryID != "" {
+		// Restarted checkouts may not retain .terraform/environment. The saved
+		// plan and its queue reservation identify the execution workspace.
+		envs["TF_WORKSPACE"] = ctx.Workspace
+	}
 	guarded := false
 	for _, step := range steps {
 		// A preceding step can outlive the ownership lease. Re-admit before

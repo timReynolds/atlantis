@@ -182,13 +182,21 @@ func BackendStateID(data []byte, workspace string) (string, error) {
 
 func ParseStateVersion(data []byte) (StateVersion, error) {
 	var state struct {
-		Lineage string `json:"lineage"`
-		Serial  uint64 `json:"serial"`
+		Version   int                        `json:"version"`
+		Lineage   string                     `json:"lineage"`
+		Serial    uint64                     `json:"serial"`
+		Resources []json.RawMessage          `json:"resources"`
+		Outputs   map[string]json.RawMessage `json:"outputs"`
 	}
 	if err := json.Unmarshal(data, &state); err != nil {
 		return StateVersion{}, fmt.Errorf("reading Terraform state identity: %w", err)
 	}
 	if state.Lineage == "" {
+		// Some backends expose a new, empty state snapshot before the first
+		// apply assigns a lineage. Admission still uses the backend identity.
+		if state.Version == 4 && state.Serial == 0 && len(state.Resources) == 0 && len(state.Outputs) == 0 {
+			return StateVersion{}, nil
+		}
 		return StateVersion{}, errors.New("Terraform state has no lineage")
 	}
 	var normalized any

@@ -92,6 +92,7 @@ func TestHAApplyProcessLossBecomesUnknown(t *testing.T) {
 	defer store.Close()
 	recoveredAt := time.Now().UTC().Add(2 * time.Minute)
 	takeover, err := store.PrepareAttemptTakeover(ctx, runs.AttemptTakeoverRequest{
+		DeploymentID:   "failure-gates",
 		ConcurrencyKey: haApplyConcurrencyKey, OwnershipClaimID: "replacement-apply-owner",
 		HeartbeatBefore: recoveredAt.Add(-time.Minute), RecoveredAt: recoveredAt,
 		Repository: haPlanRepository, PullNumber: &pullNumber, Command: runs.CommandApply,

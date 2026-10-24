@@ -110,6 +110,78 @@ func TestPersistentProjectCommandOutputHandlerStopsWritingAfterStoreFailure(t *t
 	require.True(t, handler.RunOutputComplete(first.RunID))
 }
 
+func TestPersistentProjectCommandOutputHandlerQueueOverflowIsIncomplete(t *testing.T) {
+	writer := &blockingOutputWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	handler := NewPersistentProjectCommandOutputHandler(&NoopProjectOutputHandler{}, writer, logging.NewNoopLogger(t))
+	ctx := outputProjectContext(t)
+	message := strings.Repeat("x", persistentOutputChunkBytes-1)
+	handler.SendStream(ctx, message, runs.OutputStdout, false)
+	<-writer.entered
+
+	produced := make(chan struct{})
+	go func() {
+		for range persistentOutputQueueCapacity + 2 {
+			handler.SendStream(ctx, message, runs.OutputStdout, false)
+		}
+		close(produced)
+	}()
+	select {
+	case <-produced:
+	case <-time.After(time.Second):
+		close(writer.release)
+		t.Fatal("a full output queue blocked the producer")
+	}
+	close(writer.release)
+	require.False(t, handler.RunOutputComplete(ctx.RunID), "dropped output must prevent abbreviated comments")
+	require.False(t, handler.FinishRun(ctx.RunID), "dropped output must prevent complete run history")
+}
+
+func TestPersistentProjectCommandOutputHandlerDrainTimeoutIsIncomplete(t *testing.T) {
+	// A queued output write still has not finished when the drain expires.
+	// Release it explicitly after the assertion so the writer cannot race the
+	// drain timeout with its own timeout and accidentally mask the regression.
+	writer := &heldOutputWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	handler := NewPersistentProjectCommandOutputHandler(&NoopProjectOutputHandler{}, writer, logging.NewNoopLogger(t))
+	ctx := outputProjectContext(t)
+	handler.SendStream(ctx, strings.Repeat("x", persistentOutputChunkBytes-1), runs.OutputStdout, false)
+	<-writer.entered
+	defer close(writer.release)
+
+	require.False(t, handler.FinishRun(ctx.RunID), "unfinished output must not produce complete run history")
+}
+
+func TestPersistentProjectCommandOutputHandlerCancelledDrainReleasesRun(t *testing.T) {
+	writer := &heldOutputWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	handler := NewPersistentProjectCommandOutputHandler(&NoopProjectOutputHandler{}, writer, logging.NewNoopLogger(t))
+	ctx := outputProjectContext(t)
+	handler.SendStream(ctx, strings.Repeat("x", persistentOutputChunkBytes-1), runs.OutputStdout, false)
+	<-writer.entered
+	// This chunk must remain discarded even when the in-flight write fails
+	// after finalization has released the Run's bookkeeping.
+	handler.SendStream(ctx, strings.Repeat("y", persistentOutputChunkBytes-1), runs.OutputStdout, false)
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.False(t, handler.FinishRunContext(cancelled, ctx.RunID))
+	_, retained := handler.runs.Load(ctx.RunID)
+	require.False(t, retained)
+	close(writer.release)
+	require.True(t, handler.waitForWrites(context.Background()))
+	_, retained = handler.runs.Load(ctx.RunID)
+	require.False(t, retained, "late writes must not restore finished Run bookkeeping")
+}
+
+type heldOutputWriter struct {
+	recordingOutputWriter
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (w *heldOutputWriter) AppendOutput(context.Context, []runs.OutputChunk) error {
+	close(w.entered)
+	<-w.release
+	return errors.New("output write failed after finalization")
+}
+
 func outputProjectContext(t *testing.T) command.ProjectContext {
 	t.Helper()
 	runID, err := runs.NewID()

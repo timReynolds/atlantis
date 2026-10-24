@@ -7,6 +7,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/runatlantis/atlantis/server/core/runs"
@@ -35,12 +36,12 @@ type PersistentProjectCommandOutputHandler struct {
 	logger logging.SimpleLogging
 	now    func() time.Time
 	states sync.Map
-	failed sync.Map
+	runs   sync.Map
 	writes chan persistentOutputWrite
 }
 
 type persistentOutputWrite struct {
-	runID   runs.ID
+	run     *persistentOutputRun
 	chunk   *runs.OutputChunk
 	drained chan struct{}
 }
@@ -82,6 +83,19 @@ func (p *PersistentProjectCommandOutputHandler) SendWorkflowHook(ctx models.Work
 // FinishRun flushes and releases every buffered Project Run in a logical Run.
 // It reports whether every attempted output write was persisted.
 func (p *PersistentProjectCommandOutputHandler) FinishRun(runID runs.ID) bool {
+	return p.FinishRunContext(context.Background(), runID)
+}
+
+// FinishRunContext flushes output within the caller's remaining budget. A
+// cancelled or timed-out drain leaves history incomplete, even if queued writes
+// eventually succeed. Queued writes retain their Run's failure state after its
+// buffers are released so late writes cannot revive or leak a finished Run.
+func (p *PersistentProjectCommandOutputHandler) FinishRunContext(ctx context.Context, runID runs.ID) bool {
+	value, ok := p.runs.Load(runID)
+	if !ok {
+		return true
+	}
+	run := value.(*persistentOutputRun)
 	p.states.Range(func(key, value any) bool {
 		state := value.(*persistentOutputState)
 		if state.runID != runID {
@@ -93,18 +107,26 @@ func (p *PersistentProjectCommandOutputHandler) FinishRun(runID runs.ID) bool {
 		p.states.Delete(key)
 		return true
 	})
-	p.waitForWrites()
-	complete := !p.runFailed(runID)
-	p.failed.Delete(runID)
-	return complete
+	if !p.waitForWrites(ctx) {
+		run.failed.Store(true)
+	}
+	p.runs.Delete(runID)
+	return !run.failed.Load()
 }
 
 // RunOutputComplete reports whether every attempted output write for a Run
 // succeeded. It drains queued writes first so a just-enqueued failure is
 // reflected in the result rather than racing the asynchronous writer.
 func (p *PersistentProjectCommandOutputHandler) RunOutputComplete(runID runs.ID) bool {
-	p.waitForWrites()
-	return !p.runFailed(runID)
+	value, ok := p.runs.Load(runID)
+	if !ok {
+		return true
+	}
+	run := value.(*persistentOutputRun)
+	if !p.waitForWrites(context.Background()) {
+		run.failed.Store(true)
+	}
+	return !run.failed.Load()
 }
 
 func (p *PersistentProjectCommandOutputHandler) record(
@@ -116,16 +138,17 @@ func (p *PersistentProjectCommandOutputHandler) record(
 	if ctx.RunID == "" || ctx.ProjectRunID == "" {
 		return
 	}
-	if p.runFailed(ctx.RunID) {
+	run := p.outputRun(ctx.RunID)
+	if run.failed.Load() {
 		return
 	}
 	value, _ := p.states.LoadOrStore(ctx.ProjectRunID, &persistentOutputState{
-		runID: ctx.RunID, projectRunID: ctx.ProjectRunID,
+		runID: ctx.RunID, projectRunID: ctx.ProjectRunID, run: run,
 	})
 	state := value.(*persistentOutputState)
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if p.runFailed(ctx.RunID) {
+	if state.run.failed.Load() {
 		state.buffer = ""
 		return
 	}
@@ -143,19 +166,24 @@ func (p *PersistentProjectCommandOutputHandler) record(
 	}
 	if state.buffer != "" && state.stream != stream {
 		p.flush(state)
-		if p.runFailed(ctx.RunID) {
+		if state.run.failed.Load() {
 			return
 		}
 	}
 	state.stream = stream
 	state.buffer += msg
-	for !p.runFailed(ctx.RunID) && len(state.buffer) >= persistentOutputChunkBytes {
+	for !state.run.failed.Load() && len(state.buffer) >= persistentOutputChunkBytes {
 		cut := utf8SafeCut(state.buffer, persistentOutputChunkBytes)
 		p.flushPrefix(state, cut)
 	}
 }
 
+type persistentOutputRun struct {
+	failed atomic.Bool
+}
+
 type persistentOutputState struct {
+	run          *persistentOutputRun
 	runID        runs.ID
 	projectRunID runs.ID
 	mu           sync.Mutex
@@ -165,7 +193,7 @@ type persistentOutputState struct {
 }
 
 func (p *PersistentProjectCommandOutputHandler) flush(state *persistentOutputState) {
-	if p.runFailed(state.runID) {
+	if state.run.failed.Load() {
 		state.buffer = ""
 		return
 	}
@@ -184,8 +212,9 @@ func (p *PersistentProjectCommandOutputHandler) flushPrefix(state *persistentOut
 	}
 	state.sequence++
 	select {
-	case p.writes <- persistentOutputWrite{runID: state.runID, chunk: &chunk}:
+	case p.writes <- persistentOutputWrite{run: state.run, chunk: &chunk}:
 	default:
+		state.run.failed.Store(true)
 		p.logger.Err("persisting project output: output queue is full")
 	}
 }
@@ -196,7 +225,7 @@ func (p *PersistentProjectCommandOutputHandler) writeOutput() {
 			close(write.drained)
 			continue
 		}
-		if p.runFailed(write.runID) {
+		if write.run.failed.Load() {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), persistentOutputWriteTimeout)
@@ -204,31 +233,36 @@ func (p *PersistentProjectCommandOutputHandler) writeOutput() {
 		cancel()
 		if err != nil {
 			p.logger.Err("persisting project output: %v", err)
-			p.failed.Store(write.runID, struct{}{})
+			write.run.failed.Store(true)
 		}
 	}
 }
 
-func (p *PersistentProjectCommandOutputHandler) waitForWrites() {
+func (p *PersistentProjectCommandOutputHandler) waitForWrites(parent context.Context) bool {
+	ctx, cancel := context.WithTimeout(parent, persistentOutputWriteTimeout)
+	defer cancel()
+	if ctx.Err() != nil {
+		return false
+	}
 	drained := make(chan struct{})
-	timer := time.NewTimer(persistentOutputWriteTimeout)
-	defer timer.Stop()
 	select {
 	case p.writes <- persistentOutputWrite{drained: drained}:
-	case <-timer.C:
+	case <-ctx.Done():
 		p.logger.Err("persisting project output: timed out queueing output drain")
-		return
+		return false
 	}
 	select {
 	case <-drained:
-	case <-timer.C:
+		return true
+	case <-ctx.Done():
 		p.logger.Err("persisting project output: timed out draining output queue")
+		return false
 	}
 }
 
-func (p *PersistentProjectCommandOutputHandler) runFailed(runID runs.ID) bool {
-	_, failed := p.failed.Load(runID)
-	return failed
+func (p *PersistentProjectCommandOutputHandler) outputRun(runID runs.ID) *persistentOutputRun {
+	value, _ := p.runs.LoadOrStore(runID, &persistentOutputRun{})
+	return value.(*persistentOutputRun)
 }
 
 func utf8SafeCut(value string, maximum int) int {

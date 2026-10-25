@@ -225,9 +225,9 @@ type queueRealTerraform struct {
 }
 
 func (f queueRealTerraform) RunCommandWithVersion(_ command.ProjectContext, path string, args []string, envs map[string]string, _ terraform.Distribution, _ *version.Version, _ string) (string, error) {
-	cmd := exec.CommandContext(f.ctx, "/bin/sh", "-c", `exec "$QUEUE_TEST_TERRAFORM" `+strings.Join(args, " "))
+	cmd := exec.CommandContext(f.ctx, f.binary, args...)
 	cmd.Dir = path
-	cmd.Env = append(os.Environ(), "QUEUE_TEST_TERRAFORM="+f.binary)
+	cmd.Env = os.Environ()
 	for key, value := range envs {
 		cmd.Env = append(cmd.Env, key+"="+value)
 	}

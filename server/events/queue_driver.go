@@ -294,9 +294,7 @@ func (d *QueueDriver) tf(p command.ProjectContext, path string, args ...string) 
 		v = p.TerraformVersion
 	}
 	p.SuppressJobOutput = true
-	for i, arg := range args {
-		args[i] = "'" + strings.ReplaceAll(arg, "'", "'\"'\"'") + "'"
-	}
+	// TerraformExec receives an argument vector, not shell source.
 	return d.Terraform.RunCommandWithVersion(p, path, args, map[string]string{"TF_WORKSPACE": p.Workspace}, dist, v, p.Workspace)
 }
 func (d *QueueDriver) state(p command.ProjectContext, path string) (queue.StateVersion, error) {

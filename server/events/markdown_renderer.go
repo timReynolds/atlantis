@@ -110,6 +110,15 @@ type applyResultData struct {
 	NumApplyErrors    int
 }
 
+type runSummaryData struct {
+	Total      int
+	Succeeded  int
+	Unchanged  int
+	Failed     int
+	HistoryURL string
+	commonData
+}
+
 type planSuccessData struct {
 	models.PlanSuccess
 	PlanSummary              string
@@ -198,6 +207,39 @@ func NewMarkdownRenderer(
 // Render formats the data into a markdown string.
 // nolint: interfacer
 func (m *MarkdownRenderer) Render(ctx *command.Context, res command.Result, cmd PullCommand) string {
+	common := m.newCommonData(ctx, res, cmd)
+	templates := m.markdownTemplates
+
+	if res.Error != nil {
+		return m.renderTemplateTrimSpace(templates.Lookup("unwrappedErrWithLog"), newErrData(res.Error, "", common))
+	}
+	if res.Failure != "" {
+		return m.renderTemplateTrimSpace(templates.Lookup("failureWithLog"), failureData{res.Failure, "", common})
+	}
+	return m.renderProjectResults(ctx, res.ProjectResults, common)
+}
+
+// RenderRunSummary renders a bounded notification for a large result set.
+// Full project output remains available through the authenticated history URL.
+func (m *MarkdownRenderer) RenderRunSummary(ctx *command.Context, res command.Result, cmd PullCommand, historyURL string) string {
+	common := m.newCommonData(ctx, res, cmd)
+	data := runSummaryData{Total: len(res.ProjectResults), HistoryURL: historyURL, commonData: common}
+	for _, result := range res.ProjectResults {
+		switch {
+		case result.Error != nil || result.Failure != "":
+			data.Failed++
+		case result.PlanSuccess != nil && result.PlanSuccess.NoChanges():
+			data.Unchanged++
+		case result.IsSuccessful():
+			data.Succeeded++
+		default:
+			data.Failed++
+		}
+	}
+	return m.renderTemplateTrimSpace(m.markdownTemplates.Lookup("runSummary"), data)
+}
+
+func (m *MarkdownRenderer) newCommonData(ctx *command.Context, res command.Result, cmd PullCommand) commonData {
 	commandNameStr := cmd.CommandName().String()
 	commandStr := m.translator.CommandTitle(commandNameStr)
 	var vcsRequestType string
@@ -207,7 +249,7 @@ func (m *MarkdownRenderer) Render(ctx *command.Context, res command.Result, cmd 
 		vcsRequestType = m.translator.PullRequestLabel()
 	}
 
-	common := commonData{
+	return commonData{
 		Command:                   commandStr,
 		CommandName:               commandNameStr,
 		SubCommand:                cmd.SubCommandName(),
@@ -223,16 +265,6 @@ func (m *MarkdownRenderer) Render(ctx *command.Context, res command.Result, cmd 
 		QuietPolicyChecks:         m.quietPolicyChecks,
 		VcsRequestType:            vcsRequestType,
 	}
-
-	templates := m.markdownTemplates
-
-	if res.Error != nil {
-		return m.renderTemplateTrimSpace(templates.Lookup("unwrappedErrWithLog"), newErrData(res.Error, "", common))
-	}
-	if res.Failure != "" {
-		return m.renderTemplateTrimSpace(templates.Lookup("failureWithLog"), failureData{res.Failure, "", common})
-	}
-	return m.renderProjectResults(ctx, res.ProjectResults, common)
 }
 
 func (m *MarkdownRenderer) renderProjectResults(ctx *command.Context, results []command.ProjectResult, common commonData) string {

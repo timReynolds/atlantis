@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/runatlantis/atlantis/server"
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	. "github.com/runatlantis/atlantis/testing"
@@ -112,4 +113,21 @@ func TestGenerateProjectJobURL_ShouldReturnErrorWhenJobIDNotSpecified(t *testing
 	gotURL, err := router.GenerateProjectJobURL(ctx)
 	require.EqualError(t, err, expectedErrString)
 	Equals(t, "", gotURL)
+}
+
+func TestGenerateRunHistoryURL(t *testing.T) {
+	atlantisURL, err := server.ParseAtlantisURL("https://example.test/atlantis")
+	Ok(t, err)
+	underlying := mux.NewRouter()
+	underlying.HandleFunc("/runs/{run-id}", func(http.ResponseWriter, *http.Request) {}).Name("run-history-detail")
+	router := &server.Router{
+		AtlantisURL: atlantisURL, Underlying: underlying,
+		RunHistoryViewRouteName: "run-history-detail",
+	}
+	runID, err := runs.NewID()
+	Ok(t, err)
+
+	actual, err := router.GenerateRunHistoryURL(runID)
+	Ok(t, err)
+	Equals(t, "https://example.test/atlantis/runs/"+string(runID), actual)
 }

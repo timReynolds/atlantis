@@ -42,6 +42,35 @@ func TestValidateRunStoreConfig(t *testing.T) {
 			error:  "run store PostgreSQL URL is required",
 		},
 		{
+			name: "PostgreSQL history rejects default web credentials",
+			config: UserConfig{
+				RunStoreType: RunStorePostgres, RunStorePostgresURL: "postgres://database/atlantis",
+				WebBasicAuth: true, WebUsername: DefaultWebUsername, WebPassword: DefaultWebPassword,
+			},
+			error: "postgres run history requires non-default web basic-auth credentials",
+		},
+		{
+			name: "PostgreSQL history accepts custom web credentials",
+			config: UserConfig{
+				RunStoreType: RunStorePostgres, RunStorePostgresURL: "postgres://database/atlantis",
+				WebBasicAuth: true, WebUsername: "operator", WebPassword: "secret",
+			},
+		},
+		{
+			name: "PostgreSQL history accepts a custom password with the default username",
+			config: UserConfig{
+				RunStoreType: RunStorePostgres, RunStorePostgresURL: "postgres://database/atlantis",
+				WebBasicAuth: true, WebUsername: DefaultWebUsername, WebPassword: "secret",
+			},
+		},
+		{
+			name: "PostgreSQL history accepts a custom username with the default password",
+			config: UserConfig{
+				RunStoreType: RunStorePostgres, RunStorePostgresURL: "postgres://database/atlantis",
+				WebBasicAuth: true, WebUsername: "operator", WebPassword: DefaultWebPassword,
+			},
+		},
+		{
 			name:   "unknown type",
 			config: UserConfig{RunStoreType: "filesystem"},
 			error:  `unknown run store type "filesystem"`,

@@ -5,6 +5,7 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -25,7 +26,7 @@ func TestPersistentProjectCommandOutputHandlerPreservesStreamsAndOrdering(t *tes
 	handler.SendStream(ctx, "first", runs.OutputStdout, false)
 	handler.SendStream(ctx, "warning", runs.OutputStderr, false)
 	handler.Send(ctx, "summary", false)
-	handler.FinishRun(ctx.RunID)
+	require.True(t, handler.FinishRun(ctx.RunID))
 
 	require.Equal(t, []runs.OutputChunk{
 		{ProjectRunID: ctx.ProjectRunID, Sequence: 0, Stream: runs.OutputStdout, Content: "first\n", CreatedAt: handler.now()},
@@ -91,6 +92,96 @@ func TestPersistentProjectCommandOutputHandlerDoesNotBlockOnStore(t *testing.T) 
 	handler.FinishRun(ctx.RunID)
 }
 
+func TestPersistentProjectCommandOutputHandlerStopsWritingAfterStoreFailure(t *testing.T) {
+	writer := &failingOutputWriter{err: errors.New("store unavailable")}
+	handler := NewPersistentProjectCommandOutputHandler(&NoopProjectOutputHandler{}, writer, logging.NewNoopLogger(t))
+	first := outputProjectContext(t)
+	second := outputProjectContext(t)
+	second.RunID = first.RunID
+
+	handler.SendStream(first, "buffered", runs.OutputStdout, false)
+	handler.SendStream(first, "stream transition", runs.OutputStderr, false)
+	require.False(t, handler.RunOutputComplete(first.RunID))
+	handler.SendStream(first, strings.Repeat("x", persistentOutputChunkBytes), runs.OutputStderr, false)
+	handler.SendStream(second, strings.Repeat("y", persistentOutputChunkBytes), runs.OutputStdout, false)
+	require.False(t, handler.FinishRun(first.RunID))
+
+	require.Equal(t, 1, writer.calls)
+	require.True(t, handler.RunOutputComplete(first.RunID))
+}
+
+func TestPersistentProjectCommandOutputHandlerQueueOverflowIsIncomplete(t *testing.T) {
+	writer := &blockingOutputWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	handler := NewPersistentProjectCommandOutputHandler(&NoopProjectOutputHandler{}, writer, logging.NewNoopLogger(t))
+	ctx := outputProjectContext(t)
+	message := strings.Repeat("x", persistentOutputChunkBytes-1)
+	handler.SendStream(ctx, message, runs.OutputStdout, false)
+	<-writer.entered
+
+	produced := make(chan struct{})
+	go func() {
+		for range persistentOutputQueueCapacity + 2 {
+			handler.SendStream(ctx, message, runs.OutputStdout, false)
+		}
+		close(produced)
+	}()
+	select {
+	case <-produced:
+	case <-time.After(time.Second):
+		close(writer.release)
+		t.Fatal("a full output queue blocked the producer")
+	}
+	close(writer.release)
+	require.False(t, handler.RunOutputComplete(ctx.RunID), "dropped output must prevent abbreviated comments")
+	require.False(t, handler.FinishRun(ctx.RunID), "dropped output must prevent complete run history")
+}
+
+func TestPersistentProjectCommandOutputHandlerDrainTimeoutIsIncomplete(t *testing.T) {
+	// A queued output write still has not finished when the drain expires.
+	// Release it explicitly after the assertion so the writer cannot race the
+	// drain timeout with its own timeout and accidentally mask the regression.
+	writer := &heldOutputWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	handler := NewPersistentProjectCommandOutputHandler(&NoopProjectOutputHandler{}, writer, logging.NewNoopLogger(t))
+	ctx := outputProjectContext(t)
+	handler.SendStream(ctx, strings.Repeat("x", persistentOutputChunkBytes-1), runs.OutputStdout, false)
+	<-writer.entered
+	defer close(writer.release)
+
+	require.False(t, handler.FinishRun(ctx.RunID), "unfinished output must not produce complete run history")
+}
+
+func TestPersistentProjectCommandOutputHandlerCancelledDrainReleasesRun(t *testing.T) {
+	writer := &heldOutputWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	handler := NewPersistentProjectCommandOutputHandler(&NoopProjectOutputHandler{}, writer, logging.NewNoopLogger(t))
+	ctx := outputProjectContext(t)
+	handler.SendStream(ctx, strings.Repeat("x", persistentOutputChunkBytes-1), runs.OutputStdout, false)
+	<-writer.entered
+	// This chunk must remain discarded even when the in-flight write fails
+	// after finalization has released the Run's bookkeeping.
+	handler.SendStream(ctx, strings.Repeat("y", persistentOutputChunkBytes-1), runs.OutputStdout, false)
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.False(t, handler.FinishRunContext(cancelled, ctx.RunID))
+	_, retained := handler.runs.Load(ctx.RunID)
+	require.False(t, retained)
+	close(writer.release)
+	require.True(t, handler.waitForWrites(context.Background()))
+	_, retained = handler.runs.Load(ctx.RunID)
+	require.False(t, retained, "late writes must not restore finished Run bookkeeping")
+}
+
+type heldOutputWriter struct {
+	recordingOutputWriter
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (w *heldOutputWriter) AppendOutput(context.Context, []runs.OutputChunk) error {
+	close(w.entered)
+	<-w.release
+	return errors.New("output write failed after finalization")
+}
+
 func outputProjectContext(t *testing.T) command.ProjectContext {
 	t.Helper()
 	runID, err := runs.NewID()
@@ -149,3 +240,34 @@ func (w *blockingOutputWriter) AppendOutput(ctx context.Context, _ []runs.Output
 		return ctx.Err()
 	}
 }
+
+type failingOutputWriter struct {
+	calls int
+	err   error
+}
+
+func (w *failingOutputWriter) CreateRun(context.Context, runs.Run) error { return nil }
+func (w *failingOutputWriter) StartRun(context.Context, runs.ID, time.Time) error {
+	return nil
+}
+func (w *failingOutputWriter) CompleteRun(context.Context, runs.RunCompletion) error {
+	return nil
+}
+func (w *failingOutputWriter) CreateProjectRun(context.Context, runs.ProjectRun) error {
+	return nil
+}
+func (w *failingOutputWriter) StartProjectRun(context.Context, runs.ID, time.Time) error {
+	return nil
+}
+func (w *failingOutputWriter) CompleteProjectRun(context.Context, runs.ProjectRunCompletion) error {
+	return nil
+}
+func (w *failingOutputWriter) AppendOutput(context.Context, []runs.OutputChunk) error {
+	w.calls++
+	return w.err
+}
+func (w *failingOutputWriter) AppendAuditEvent(context.Context, runs.AuditEvent) error {
+	return nil
+}
+
+var _ runs.Writer = (*failingOutputWriter)(nil)

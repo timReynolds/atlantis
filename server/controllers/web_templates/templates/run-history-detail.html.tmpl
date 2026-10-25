@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Run {{ .Run.ID }} · atlantis</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/normalize.css">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/skeleton.css">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/custom.css">
+  <link rel="icon" type="image/png" href="{{ .CleanedBasePath }}/static/images/atlantis-icon.png">
+</head>
+<body>
+<div class="container history-page">
+  <nav class="history-nav"><a href="{{ .CleanedBasePath }}/">Atlantis</a><a class="active" href="{{ .CleanedBasePath }}/runs">Runs</a><a href="{{ .CleanedBasePath }}/audit">Audit</a></nav>
+  <header class="history-header">
+    <p class="history-eyebrow">{{ .Run.Repository }}{{ if .Run.PullNumber }} · pull request #{{ .Run.PullNumber }}{{ end }}</p>
+    <h2><code>{{ .Run.Command }}</code> run</h2>
+    <p class="history-id-full">{{ .Run.ID }}</p>
+    <span class="history-status history-status-{{ .Run.Status }}">{{ .Run.Status }}</span>
+  </header>
+
+  <section class="history-summary-grid">
+    <div><strong>{{ .Summary.Total }}</strong><span>Projects</span></div>
+    <div><strong>{{ .Summary.Succeeded }}</strong><span>Succeeded</span></div>
+    <div><strong>{{ .Summary.Unchanged }}</strong><span>Unchanged</span></div>
+    <div><strong>{{ .Summary.Failed }}</strong><span>Failed</span></div>
+    <div><strong>{{ .Summary.Partial }}</strong><span>Partial</span></div>
+    <div><strong>{{ add .Summary.Pending .Summary.Running }}</strong><span>Waiting / running</span></div>
+  </section>
+
+  <section class="history-facts">
+    <div><span>Actor</span><strong>{{ if .Run.Actor }}{{ .Run.Actor }}{{ else }}system{{ end }}</strong></div>
+    <div><span>Trigger</span><strong>{{ .Run.Trigger }}</strong></div>
+    <div><span>Base → head</span><strong>{{ .Run.BaseRef }} → {{ .Run.HeadRef }}</strong></div>
+    <div><span>Commit</span><strong><code>{{ .Run.HeadSHA }}</code></strong></div>
+    <div><span>Created</span><strong>{{ .Run.CreatedAt }}</strong></div>
+    <div><span>Completed</span><strong>{{ if .Run.CompletedAt }}{{ .Run.CompletedAt }}{{ else }}—{{ end }}</strong></div>
+  </section>
+  {{ if .Run.PullURL }}<p><a class="button" href="{{ .Run.PullURL }}" rel="noreferrer">Open originating pull request</a></p>{{ end }}
+  {{ if .Run.RawMetadata }}<details><summary>Run metadata</summary><pre class="history-metadata">{{ .Run.RawMetadata }}</pre></details>{{ end }}
+
+  <section class="history-section">
+    <div class="history-section-title"><h4>Projects</h4><span>{{ .Summary.Total }} total</span></div>
+    <form class="history-filter history-filter-project" method="get">
+      <label>Project<input name="project" value="{{ .Filter.ProjectName }}"></label>
+      <label>Directory<input name="directory" value="{{ .Filter.Directory }}"></label>
+      <label>Workspace<input name="workspace" value="{{ .Filter.Workspace }}"></label>
+      <label>Status<input name="status" placeholder="failed,unchanged" value="{{ .Filter.Status }}"></label>
+      <div class="history-filter-actions"><button class="button-primary" type="submit">Filter</button><a href="{{ .CleanedBasePath }}{{ .Run.DetailPath }}">Clear</a></div>
+    </form>
+    {{ if .Projects }}
+    <div class="history-table-wrap"><table class="u-full-width history-table">
+      <thead><tr><th>Project</th><th>Directory</th><th>Workspace</th><th>Changes</th><th>Status</th><th>Completed</th></tr></thead>
+      <tbody>{{ $basePath := .CleanedBasePath }}{{ range .Projects }}
+        <tr>
+          <td><a href="{{ $basePath }}{{ .DetailPath }}">{{ if .ProjectName }}{{ .ProjectName }}{{ else }}unnamed{{ end }}</a>{{ if .ErrorSummary }}<br><span class="history-error">{{ .ErrorSummary }}</span>{{ end }}</td>
+          <td><code>{{ .Directory }}</code></td><td><code>{{ .Workspace }}</code></td>
+          <td><span class="history-change-add">+{{ .Additions }}</span> <span class="history-change-update">~{{ .Changes }}</span> <span class="history-change-destroy">-{{ .Destructions }}</span>{{ if .Imports }} <span>↳{{ .Imports }}</span>{{ end }}{{ if .Forgets }} <span>forget {{ .Forgets }}</span>{{ end }}</td>
+          <td><span class="history-status history-status-{{ .Status }}">{{ .Status }}</span></td><td class="history-nowrap">{{ .CompletedAt }}</td>
+        </tr>
+      {{ end }}</tbody>
+    </table></div>
+    {{ else }}<div class="history-empty">No projects match these filters.</div>{{ end }}
+    {{ if .NextPath }}<a class="button history-next" href="{{ .CleanedBasePath }}{{ .NextPath }}">Next 100 projects</a>{{ end }}
+  </section>
+
+  {{ if .RelatedRuns }}
+  <section class="history-section"><h4>Previous runs on this pull request</h4><ul class="history-related">{{ $basePath := .CleanedBasePath }}{{ range .RelatedRuns }}<li><a href="{{ $basePath }}{{ .DetailPath }}"><code>{{ .Command }}</code> · {{ .Status }} · {{ .CreatedAt }}</a></li>{{ end }}</ul></section>
+  {{ end }}
+</div>
+<footer>{{ .AtlantisVersion }}</footer>
+</body>
+</html>

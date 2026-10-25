@@ -219,6 +219,54 @@ func (s *Store) ListProjectRuns(ctx context.Context, runID runs.ID, filter runs.
 	return result, nil
 }
 
+func (s *Store) SummarizeProjectRuns(ctx context.Context, runID runs.ID) (runs.ProjectRunSummary, error) {
+	if _, err := runs.ParseID(string(runID)); err != nil {
+		return runs.ProjectRunSummary{}, fmt.Errorf("validating run ID: %w", err)
+	}
+	opCtx, cancel := s.operationContext(ctx)
+	defer cancel()
+	rows, err := s.db.QueryContext(opCtx, `SELECT status, COUNT(*)
+        FROM project_runs WHERE run_id = $1 GROUP BY status`, runID)
+	if err != nil {
+		return runs.ProjectRunSummary{}, fmt.Errorf("summarizing project runs: %w", err)
+	}
+	defer rows.Close()
+
+	var summary runs.ProjectRunSummary
+	for rows.Next() {
+		var status runs.Status
+		var count int
+		if err := rows.Scan(&status, &count); err != nil {
+			return runs.ProjectRunSummary{}, fmt.Errorf("scanning project run summary: %w", err)
+		}
+		summary.Total += count
+		switch status {
+		case runs.StatusPending:
+			summary.Pending += count
+		case runs.StatusRunning:
+			summary.Running += count
+		case runs.StatusSucceeded:
+			summary.Succeeded += count
+		case runs.StatusUnchanged:
+			summary.Unchanged += count
+		case runs.StatusFailed:
+			summary.Failed += count
+		case runs.StatusPartial:
+			summary.Partial += count
+		case runs.StatusCancelled:
+			summary.Cancelled += count
+		case runs.StatusSkipped:
+			summary.Skipped += count
+		default:
+			return runs.ProjectRunSummary{}, fmt.Errorf("summarizing project runs: unknown status %q", status)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return runs.ProjectRunSummary{}, fmt.Errorf("iterating project run summary: %w", err)
+	}
+	return summary, nil
+}
+
 func (s *Store) GetOutput(ctx context.Context, projectRunID runs.ID, afterSequence int64, limit int) (runs.OutputPage, error) {
 	if _, err := runs.ParseID(string(projectRunID)); err != nil {
 		return runs.OutputPage{}, fmt.Errorf("validating project run ID: %w", err)

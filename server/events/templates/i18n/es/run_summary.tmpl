@@ -1,0 +1,24 @@
+{{ define "runSummary" -}}
+### Resumen de {{ .Command }} de Atlantis
+
+Se ejecutó {{ .Command }} para {{ .Total }} proyectos.
+
+| Resultado | Proyectos |
+| --- | ---: |
+| Exitosos | {{ .Succeeded }} |
+| Sin cambios | {{ .Unchanged }} |
+| Fallidos | {{ .Failed }} |
+
+[Ver los resultados completos y la salida de los comandos en Atlantis]({{ .HistoryURL }})
+{{ if and (eq .CommandName "plan") (not .PlansDeleted) (ne .DisableApplyAll true) }}
+
+* :fast_forward: Para **aplicar** todos los planes no aplicados de este {{ .VcsRequestType }}, comente:
+  ```shell
+  {{ .ExecutableName }} apply
+  ```
+* :put_litter_in_its_place: Para **eliminar** todos los planes y bloqueos de este {{ .VcsRequestType }}, comente:
+  ```shell
+  {{ .ExecutableName }} unlock
+  ```
+{{ end -}}
+{{ end -}}

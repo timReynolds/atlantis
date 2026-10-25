@@ -5,6 +5,7 @@
 package events_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -2988,4 +2989,64 @@ func TestRunCommentCommand_VarFileOutsideAllowlistRejectedForEveryCommand(t *tes
 				Eq("```\nvar file path /etc/passwd is not allowed by the current allowlist: []\n```"), Eq(""))
 		})
 	}
+}
+
+func TestRunRoutedAutoplanCommandRejectsLostOwnershipBeforeProjectSelection(t *testing.T) {
+	setup(t)
+	pull := models.PullRequest{
+		Num: testdata.Pull.Num, BaseRepo: testdata.GithubRepo,
+		BaseBranch: "main", State: models.OpenPullState,
+	}
+	admitCalls := 0
+	lease := executionLeaseFunc(func(context.Context) error {
+		admitCalls++
+		if admitCalls == 2 {
+			return events.ErrOwnershipChanged
+		}
+		return nil
+	})
+
+	ch.RunRoutedAutoplanCommand(
+		testdata.GithubRepo, testdata.GithubRepo, pull, testdata.User,
+		command.RoutingContext{Lease: lease},
+	)
+
+	Equals(t, 2, admitCalls)
+	projectCommandBuilder.VerifyWasCalled(Never()).BuildAutoplanCommands(Any[*command.Context]())
+	preWorkflowHooksCommandRunner.(*mocks.MockPreWorkflowHooksCommandRunner).VerifyWasCalled(Never()).RunPreHooks(
+		Any[*command.Context](), Any[*events.CommentCommand]())
+	postWorkflowHooksCommandRunner.(*mocks.MockPostWorkflowHooksCommandRunner).VerifyWasCalled(Never()).RunPostHooks(
+		Any[*command.Context](), Any[*events.CommentCommand]())
+}
+
+func TestRunRoutedAutoplanCommandRejectsLostOwnershipAfterProjectBuild(t *testing.T) {
+	setup(t)
+	pull := models.PullRequest{
+		Num: testdata.Pull.Num, BaseRepo: testdata.GithubRepo,
+		BaseBranch: "main", State: models.OpenPullState,
+	}
+	projectCtx := command.ProjectContext{
+		CommandName: command.Plan, ProjectName: "network", RepoRelDir: "terraform/network",
+		Workspace: events.DefaultWorkspace, BaseRepo: testdata.GithubRepo, Pull: pull,
+	}
+	When(projectCommandBuilder.BuildAutoplanCommands(Any[*command.Context]())).ThenReturn([]command.ProjectContext{projectCtx}, nil)
+	admitCalls := 0
+	lease := executionLeaseFunc(func(context.Context) error {
+		admitCalls++
+		if admitCalls >= 5 {
+			return events.ErrOwnershipChanged
+		}
+		return nil
+	})
+
+	ch.RunRoutedAutoplanCommand(
+		testdata.GithubRepo, testdata.GithubRepo, pull, testdata.User,
+		command.RoutingContext{Lease: lease},
+	)
+
+	Equals(t, 6, admitCalls)
+	projectCommandBuilder.VerifyWasCalledOnce().BuildAutoplanCommands(Any[*command.Context]())
+	projectCommandRunner.VerifyWasCalled(Never()).Plan(Any[command.ProjectContext]())
+	postWorkflowHooksCommandRunner.(*mocks.MockPostWorkflowHooksCommandRunner).VerifyWasCalled(Never()).RunPostHooks(
+		Any[*command.Context](), Any[*events.CommentCommand]())
 }

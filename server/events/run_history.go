@@ -245,7 +245,7 @@ func (l *RunLifecycle) terminalStatus(succeeded, failed int) runs.Status {
 		return forced
 	}
 	if l.ctx != nil {
-		if l.ctx.CommandCancelled {
+		if l.ctx.CommandCancelled || l.ctx.CommandSuperseded {
 			return runs.StatusCancelled
 		}
 		if l.ctx.CommandSkipped || l.ctx.CommandOutcomeSkipped {
@@ -367,6 +367,9 @@ func (h *RunHistory) recordProject(ctx command.ProjectContext, phase command.Nam
 	if output.Cancelled {
 		project.status = runs.StatusCancelled
 		project.errorSummary = errorSummary(output)
+	} else if output.OwnershipLost {
+		project.status = runs.StatusCancelled
+		project.errorSummary = "execution superseded after ownership changed"
 	} else if output.Error != nil || output.Failure != "" {
 		project.status = runs.StatusFailed
 		project.errorSummary = errorSummary(output)

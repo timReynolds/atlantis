@@ -67,6 +67,9 @@ func (p *PolicyCheckCommandRunner) Run(ctx *command.Context, cmds []command.Proj
 	} else {
 		result = runProjectCmds(cmds, p.prjCmdRunner.PolicyCheck)
 	}
+	if commandSuperseded(ctx, result) {
+		return
+	}
 
 	// Quiet policy checks unless there's an error
 	if result.HasErrors() || !p.quietPolicyChecks {

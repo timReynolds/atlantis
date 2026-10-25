@@ -55,6 +55,81 @@ func TestStoreConformance(t *testing.T) {
 	startedAt := createdAt.Add(time.Second)
 	require.NoError(t, store.StartRun(ctx, runID, startedAt))
 	require.NoError(t, store.StartRun(ctx, runID, startedAt), "start replay must be idempotent")
+
+	instanceID := mustID(t)
+	instance := runs.ExecutionInstance{
+		ID: instanceID, ReplicaID: "atlantis-0", DeploymentID: "conformance",
+		AdvertiseURL: "http://atlantis-0.atlantis:4141", StartedAt: createdAt,
+		HeartbeatAt: createdAt, Version: "test", Commit: "deadbeef",
+	}
+	require.NoError(t, store.RegisterInstance(ctx, instance))
+	require.NoError(t, store.RegisterInstance(ctx, instance), "instance replay must be idempotent")
+	require.NoError(t, store.HeartbeatInstance(ctx, instanceID, startedAt))
+	storedInstance, err := store.GetInstance(ctx, instanceID)
+	require.NoError(t, err)
+	require.Equal(t, startedAt, storedInstance.HeartbeatAt)
+
+	attemptID := mustID(t)
+	attempt := runs.RunAttempt{
+		ID: attemptID, RunID: runID, InstanceID: instanceID,
+		DeploymentID:   "conformance",
+		ConcurrencyKey: "sha256:conformance-pull", OwnershipClaimID: "claim-1",
+		Status: runs.AttemptClaimed, ClaimedAt: createdAt, HeartbeatAt: createdAt,
+	}
+	require.NoError(t, store.CreateAttempt(ctx, attempt))
+	require.NoError(t, store.CreateAttempt(ctx, attempt), "attempt replay must be idempotent")
+	otherInstance := instance
+	otherInstance.ID = mustID(t)
+	otherInstance.ReplicaID = "atlantis-other-0"
+	otherInstance.DeploymentID = "other-deployment"
+	require.NoError(t, store.RegisterInstance(ctx, otherInstance))
+	otherAttempt := attempt
+	otherAttempt.ID = mustID(t)
+	otherAttempt.InstanceID = otherInstance.ID
+	otherAttempt.DeploymentID = otherInstance.DeploymentID
+	require.NoError(t, store.CreateAttempt(ctx, otherAttempt), "another deployment may use the same concurrency key")
+	require.NoError(t, store.CompleteAttempt(ctx, runs.AttemptCompletion{
+		ID: otherAttempt.ID, Status: runs.AttemptInterrupted, CompletedAt: startedAt,
+		FailureReason: "conformance cleanup before execution",
+	}))
+	require.NoError(t, store.StartAttempt(ctx, attemptID, startedAt))
+	sideEffectAt := startedAt.Add(250 * time.Millisecond)
+	require.NoError(t, store.MarkAttemptSideEffectStarted(ctx, attemptID, sideEffectAt))
+	require.NoError(t, store.HeartbeatAttempt(ctx, attemptID, sideEffectAt.Add(250*time.Millisecond)))
+	attemptCompletedAt := startedAt.Add(750 * time.Millisecond)
+	require.NoError(t, store.CompleteAttempt(ctx, runs.AttemptCompletion{
+		ID: attemptID, Status: runs.AttemptUnknown, CompletedAt: attemptCompletedAt,
+		FailureReason: "simulated process loss after apply started",
+	}))
+	replacementAttempt := attempt
+	replacementAttempt.ID = mustID(t)
+	replacementAttempt.OwnershipClaimID = "claim-2"
+	require.ErrorIs(t, store.CreateAttempt(ctx, replacementAttempt), runs.ErrConflict,
+		"unreconciled unknown apply must retain the durable admission fence")
+	reconciledAt := startedAt.Add(900 * time.Millisecond)
+	require.NoError(t, store.ReconcileAttempt(ctx, runs.AttemptReconciliation{
+		ID: attemptID, At: reconciledAt, Actor: "operator",
+		Summary: "state inspected; fresh plan required",
+	}))
+	require.NoError(t, store.CreateAttempt(ctx, replacementAttempt),
+		"operator reconciliation must release the durable admission fence")
+	storedAttempt, err := store.GetAttempt(ctx, attemptID)
+	require.NoError(t, err)
+	require.Equal(t, runs.AttemptUnknown, storedAttempt.Status)
+	require.Equal(t, "operator", storedAttempt.ReconciledBy)
+	attemptPage, err := store.ListRunAttempts(ctx, runID, runs.PageRequest{Limit: 1})
+	require.NoError(t, err)
+	require.Len(t, attemptPage.Attempts, 1)
+	replacementStartedAt := startedAt.Add(901 * time.Millisecond)
+	replacementSideEffectAt := startedAt.Add(925 * time.Millisecond)
+	replacementCompletedAt := startedAt.Add(950 * time.Millisecond)
+	require.NoError(t, store.StartAttempt(ctx, replacementAttempt.ID, replacementStartedAt))
+	require.NoError(t, store.MarkAttemptSideEffectStarted(ctx, replacementAttempt.ID, replacementSideEffectAt))
+	require.NoError(t, store.CompleteAttempt(ctx, runs.AttemptCompletion{
+		ID: replacementAttempt.ID, Status: runs.AttemptUnknown, CompletedAt: replacementCompletedAt,
+		FailureReason: "simulated second process loss after apply started",
+	}))
+
 	projectRun := runs.ProjectRun{
 		ID: projectRunID, RunID: runID, ProjectName: "network",
 		Directory: "terraform/network", Workspace: "production",
@@ -133,9 +208,22 @@ func TestStoreConformance(t *testing.T) {
 	}, runs.PageRequest{Limit: 1})
 	require.NoError(t, err)
 	require.Len(t, auditPage.Events, 1)
+	require.NoError(t, store.StopInstance(ctx, instanceID, completedAt))
 
 	retentionCutoff := completedAt.Add(time.Second)
 	retention, err := store.ApplyRetention(ctx, runs.RetentionPolicy{
+		RunMetadataBefore: &retentionCutoff,
+	})
+	require.NoError(t, err)
+	require.Equal(t, runs.RetentionResult{}, retention,
+		"unreconciled unknown attempts must retain their run, project output, and admission fence")
+	_, err = store.GetRun(ctx, runID)
+	require.NoError(t, err)
+	require.NoError(t, store.ReconcileAttempt(ctx, runs.AttemptReconciliation{
+		ID: replacementAttempt.ID, At: completedAt.Add(time.Millisecond), Actor: "operator",
+		Summary: "state inspected after retention protection test",
+	}))
+	retention, err = store.ApplyRetention(ctx, runs.RetentionPolicy{
 		RunMetadataBefore: &retentionCutoff,
 	})
 	require.NoError(t, err)

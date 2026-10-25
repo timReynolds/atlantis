@@ -79,6 +79,9 @@ func (a *ApprovePoliciesCommandRunner) Run(ctx *command.Context, cmd *CommentCom
 	}
 
 	result := runProjectCmds(projectCmds, a.prjCmdRunner.ApprovePolicies)
+	if commandSuperseded(ctx, result) {
+		return
+	}
 
 	a.pullUpdater.updatePull(
 		ctx,

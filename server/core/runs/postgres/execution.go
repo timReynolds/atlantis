@@ -8,7 +8,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"reflect"
 	"time"
 
 	"github.com/runatlantis/atlantis/server/core/runs"
@@ -513,7 +512,7 @@ func instanceRegistrationMatches(existing, registered runs.ExecutionInstance) bo
 		!existing.HeartbeatAt.Before(registered.HeartbeatAt) &&
 		existing.Version == registered.Version &&
 		existing.Commit == registered.Commit &&
-		reflect.DeepEqual(existing.Metadata, registered.Metadata)
+		metadataEqual(existing.Metadata, registered.Metadata)
 }
 
 func attemptAdmissionMatches(existing, admitted runs.RunAttempt) bool {
@@ -525,5 +524,5 @@ func attemptAdmissionMatches(existing, admitted runs.RunAttempt) bool {
 		existing.OwnershipClaimID == admitted.OwnershipClaimID &&
 		existing.ClaimedAt.Equal(admitted.ClaimedAt) &&
 		!existing.HeartbeatAt.Before(admitted.HeartbeatAt) &&
-		reflect.DeepEqual(existing.Metadata, admitted.Metadata)
+		metadataEqual(existing.Metadata, admitted.Metadata)
 }

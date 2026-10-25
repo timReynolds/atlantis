@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/runatlantis/atlantis/server/core/config/valid"
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/core/terraform/ansi"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/jobs"
@@ -201,7 +202,7 @@ func (s *ShellCommandRunner) RunCommandAsync(ctx command.ProjectContext) (chan<-
 				message := scanner.Text()
 				outCh <- Line{Line: message}
 				if s.streamOutput {
-					s.outputHandler.Send(ctx, message, false)
+					s.sendOutput(ctx, message, name)
 				}
 			}
 			if err := scanner.Err(); err != nil {
@@ -214,7 +215,7 @@ func (s *ShellCommandRunner) RunCommandAsync(ctx command.ProjectContext) (chan<-
 				}
 				outCh <- Line{Line: message}
 				if s.streamOutput {
-					s.outputHandler.Send(ctx, message, false)
+					s.sendOutput(ctx, message, name)
 				}
 				if errors.Is(err, bufio.ErrTooLong) {
 					// The reader is still usable after an oversized token;
@@ -249,4 +250,17 @@ func (s *ShellCommandRunner) RunCommandAsync(ctx command.ProjectContext) (chan<-
 	}()
 
 	return inCh, outCh
+}
+
+func (s *ShellCommandRunner) sendOutput(ctx command.ProjectContext, message string, name string) {
+	handler, ok := s.outputHandler.(jobs.StreamProjectCommandOutputHandler)
+	if !ok {
+		s.outputHandler.Send(ctx, message, false)
+		return
+	}
+	stream := runs.OutputStdout
+	if name == "stderr" {
+		stream = runs.OutputStderr
+	}
+	handler.SendStream(ctx, message, stream, false)
 }

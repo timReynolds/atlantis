@@ -5,7 +5,9 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/google/go-github/v88/github"
@@ -37,6 +39,7 @@ func (g *Client) QueueCanWrite(ctx context.Context, repo models.Repo, actor stri
 
 // QueueComment reconciles an uncertain create by finding the stable entry marker.
 func (g *Client) QueueComment(ctx context.Context, repo models.Repo, pull int, id int64, marker, body string) (int64, error) {
+	persistedID := id
 	if id == 0 {
 		opts := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: 100}}
 		for {
@@ -65,6 +68,12 @@ func (g *Client) QueueComment(ctx context.Context, repo models.Repo, pull int, i
 		result, _, err = g.client.Issues.EditComment(ctx, repo.Owner, repo.Name, id, comment)
 	}
 	if err != nil {
+		var response *github.ErrorResponse
+		if persistedID != 0 && errors.As(err, &response) && response.Response != nil && response.Response.StatusCode == http.StatusNotFound {
+			// A deleted persisted comment must not strand reporting. Search the marker
+			// again before creating; the zero-ID call bounds this recovery to one try.
+			return g.QueueComment(ctx, repo, pull, 0, marker, body)
+		}
 		return 0, err
 	}
 	return result.GetID(), nil

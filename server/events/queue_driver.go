@@ -504,7 +504,9 @@ func (d *QueueDriver) Plan(ctx context.Context, e queue.Entry) (plans []queue.Pl
 		plans = append(plans, queue.Plan{Project: project, Artifact: artifact, State: before, SemanticDigest: fingerprint, Summary: summary, Destructive: destructive})
 	}
 	e.Plans = plans
-	if err = d.Validate(ctx, e); err != nil {
+	// Publish deferred plan checks only after the engine saves these plans.
+	// Required checks are enforced again before apply, after that publication.
+	if err = d.validate(ctx, e, false); err != nil {
 		return nil, err
 	}
 	return plans, nil
@@ -540,6 +542,10 @@ func (d *QueueDriver) applyContext(c *command.Context, e queue.Entry, i int) (co
 	return project, nil
 }
 func (d *QueueDriver) Validate(ctx context.Context, e queue.Entry) error {
+	return d.validate(ctx, e, true)
+}
+
+func (d *QueueDriver) validate(ctx context.Context, e queue.Entry, requirements bool) error {
 	if err := d.Store.CheckClaim(ctx, e); err != nil {
 		return err
 	}
@@ -553,8 +559,13 @@ func (d *QueueDriver) Validate(ctx context.Context, e queue.Entry) error {
 	if raw.GetBase().GetSHA() != e.Prepared.BaseSHA || e.Prepared.Configuration != queueHash(d.Global) {
 		return queue.ErrReplan
 	}
-	if err = d.validateApplyRequirements(c); err != nil {
-		return err
+	if requirements {
+		if err = d.updatePlannedStatuses(c.Pull.BaseRepo, e); err != nil {
+			return err
+		}
+		if err = d.validateApplyRequirements(c); err != nil {
+			return err
+		}
 	}
 	return d.validateStates(ctx, c, e)
 }
@@ -692,6 +703,12 @@ func (d *QueueDriver) Merge(ctx context.Context, e queue.Entry) (queue.MergeResu
 		if !queueApplyComplete(e) {
 			return queue.MergeResult{}, errors.New("queue merge requires every project to be applied")
 		}
+		// Successful project checks are deferred by the normal project runner.
+		// Recreate them from durable checkpoints, including after a restart,
+		// before making the final queue check successful or requesting merge.
+		if err = d.updateAppliedStatuses(c.Pull.BaseRepo, e); err != nil {
+			return queue.MergeResult{}, err
+		}
 		// A required queue check must succeed before GitHub can merge. The
 		// durable entry remains MERGING, and reservations remain held.
 		if err = d.updateQueueStatus(c.Pull.BaseRepo, e, models.SuccessCommitStatus); err != nil {
@@ -772,6 +789,14 @@ func (d *QueueDriver) Report(ctx context.Context, e queue.Entry) {
 	if err != nil {
 		reported = false
 	} else if current.ID == e.ID {
+		if err = d.updatePlannedStatuses(repo, e); err != nil {
+			reported = false
+			d.Log.Warn("updating queued plan statuses %v", err)
+		}
+		if err = d.updateAppliedStatuses(repo, e); err != nil {
+			reported = false
+			d.Log.Warn("updating queued apply statuses %v", err)
+		}
 		if err = d.updateQueueStatus(repo, e, queueCommitStatus(e)); err != nil {
 			reported = false
 			d.Log.Warn("updating queue status %v", err)
@@ -797,6 +822,81 @@ func queueCommitStatus(e queue.Entry) models.CommitStatus {
 	}
 	return models.PendingCommitStatus
 }
+
+// updatePlannedStatuses completes deferred project checks only for the saved
+// generation. Old or incomplete plans cannot make a refreshed plan successful.
+func (d *QueueDriver) updatePlannedStatuses(repo models.Repo, e queue.Entry) error {
+	// Retry retains old plans in QUEUED, and a failed preparation can leave
+	// them in BLOCKED. Only a saved-plan phase or started apply proves freshness.
+	switch e.State {
+	case queue.AwaitingApproval, queue.Ready:
+	case queue.Applying, queue.Merging, queue.Completed, queue.PartiallyApplied, queue.ApplyOutcomeUnknown, queue.AppliedUnmerged, queue.RecoveryRequired:
+		if !e.ApplyStarted {
+			return nil
+		}
+	default:
+		return nil
+	}
+	if e.Prepared.HeadSHA != e.HeadSHA || len(e.Plans) == 0 || len(e.Plans) != len(e.Prepared.Projects) || e.Prepared.ArtifactGeneration == "" {
+		return nil
+	}
+	for _, plan := range e.Plans {
+		if plan.Artifact.RunID == "" || !strings.Contains(plan.Artifact.Artifact.Key, "generations/"+string(e.Prepared.ArtifactGeneration)+"/") {
+			return nil
+		}
+	}
+	updater := DefaultCommitStatusUpdater{Client: d.VCS, StatusName: d.StatusName}
+	pull := models.PullRequest{Num: e.PullNumber, BaseRepo: repo, HeadCommit: e.HeadSHA}
+	for _, plan := range e.Plans {
+		project := command.ProjectContext{Log: d.Log, BaseRepo: repo, Pull: pull,
+			ProjectName: plan.Project.Name, RepoRelDir: plan.Project.Directory, Workspace: plan.Project.Workspace}
+		url := strings.TrimRight(d.URL, "/") + "/runs/" + string(plan.Artifact.RunID)
+		if err := updater.UpdateProject(project, command.Plan, models.SuccessCommitStatus, url, nil); err != nil {
+			return fmt.Errorf("publishing queued project plan status: %w", err)
+		}
+	}
+	// The engine only saves a complete generation after all plan and policy
+	// executions succeed. Preserve policy-specific checks; complete only plan.
+	if err := updater.UpdateCombined(d.Log, repo, pull, models.SuccessCommitStatus, command.Plan); err != nil {
+		return fmt.Errorf("publishing queued plan status: %w", err)
+	}
+	return nil
+}
+
+// updateAppliedStatuses publishes only successful apply checkpoints. It does
+// not depend on checkout state or in-memory command results, so PendingReports
+// can retry publication after a crash without executing Terraform again.
+func (d *QueueDriver) updateAppliedStatuses(repo models.Repo, e queue.Entry) error {
+	if !e.ApplyStarted {
+		return nil
+	}
+	updater := DefaultCommitStatusUpdater{Client: d.VCS, StatusName: d.StatusName}
+	pull := models.PullRequest{Num: e.PullNumber, BaseRepo: repo, HeadCommit: e.HeadSHA}
+	for _, plan := range e.Plans {
+		if !plan.Applied {
+			continue
+		}
+		if plan.ResultState == nil {
+			return errors.New("queued apply has no durable state checkpoint")
+		}
+		project := command.ProjectContext{Log: d.Log, BaseRepo: repo, Pull: pull,
+			ProjectName: plan.Project.Name, RepoRelDir: plan.Project.Directory, Workspace: plan.Project.Workspace}
+		url := strings.TrimRight(d.URL, "/") + "/queue/" + string(e.ID)
+		if plan.ApplyRunID != "" {
+			url = strings.TrimRight(d.URL, "/") + "/runs/" + string(plan.ApplyRunID)
+		}
+		if err := updater.UpdateProject(project, command.Apply, models.SuccessCommitStatus, url, nil); err != nil {
+			return fmt.Errorf("publishing queued project apply status: %w", err)
+		}
+	}
+	if queueApplyComplete(e) {
+		if err := updater.UpdateCombined(d.Log, repo, pull, models.SuccessCommitStatus, command.Apply); err != nil {
+			return fmt.Errorf("publishing queued apply status: %w", err)
+		}
+	}
+	return nil
+}
+
 func (d *QueueDriver) updateQueueStatus(repo models.Repo, e queue.Entry, status models.CommitStatus) error {
 	url := strings.TrimRight(d.URL, "/") + "/queue/" + string(e.ID)
 	return d.VCS.UpdateStatus(d.Log, repo, models.PullRequest{Num: e.PullNumber, BaseRepo: repo, HeadCommit: e.HeadSHA}, status, truncateContext(d.StatusName+"/queue"), "Apply queue: "+string(e.State), url)

@@ -44,6 +44,7 @@ const en: SidebarItem[] = [
           { text: "Overview", link: "/docs/configuring-atlantis" },
           { text: "Server Configuration", link: "/docs/server-configuration" },
           { text: "Server Side Repo Config", link: "/docs/server-side-repo-config" },
+          { text: "Durable Apply Queue", link: "/docs/apply-queue" },
           { text: "Pre Workflow Hooks", link: "/docs/pre-workflow-hooks" },
           { text: "Post Workflow Hooks", link: "/docs/post-workflow-hooks" },
           { text: "Conftest Policy Checking", link: "/docs/policy-checking" },

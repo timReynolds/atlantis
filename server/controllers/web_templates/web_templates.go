@@ -73,6 +73,7 @@ type IndexData struct {
 
 	ApplyLock           ApplyLockData
 	AtlantisVersion     string
+	QueueEnabled        bool
 	RunHistoryEnabled   bool
 	DriftHistoryEnabled bool
 	// CleanedBasePath is the path Atlantis is accessible at externally. If

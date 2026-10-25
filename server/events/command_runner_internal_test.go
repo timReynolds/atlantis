@@ -721,3 +721,74 @@ func (m *MockCSU) UpdatePreWorkflowHook(_ logging.SimpleLogging, _ models.PullRe
 func (m *MockCSU) UpdatePostWorkflowHook(_ logging.SimpleLogging, _ models.PullRequest, _ models.CommitStatus, _ string, _ string, _ string) error {
 	return nil
 }
+
+type queueAuthorizationVCSClient struct {
+	*childTeamVCSClient
+	teams []string
+}
+
+func (c *queueAuthorizationVCSClient) GetTeamNamesForUser(logging.SimpleLogging, models.Repo, models.User) ([]string, error) {
+	return append([]string(nil), c.teams...), nil
+}
+
+func TestQueueCommandsRequireApplyPermission(t *testing.T) {
+	for _, cmd := range []CommentCommand{
+		{Name: command.Queue},
+		{Name: command.Queue, SubName: "approve", Flags: []string{"1"}},
+		{Name: command.Queue, SubName: "recover"},
+		{Name: command.Dequeue},
+	} {
+		for _, allowApply := range []bool{false, true} {
+			rule := "operators:queue,operators:dequeue"
+			if allowApply {
+				rule = "operators:apply"
+			}
+			checker, err := command.NewTeamAllowlistChecker(rule)
+			Ok(t, err)
+			logger := logging.NewNoopLogger(t)
+			client := &queueAuthorizationVCSClient{childTeamVCSClient: &childTeamVCSClient{}, teams: []string{"operators"}}
+			runner := &DefaultCommandRunner{Logger: logger, VCSClient: client, TeamAllowlistChecker: checker}
+			ctx := &command.Context{Log: logger}
+			allowed := runner.validateCommentCommand(ctx, models.Repo{Owner: "org"}, 1, models.User{Username: "alice"}, &cmd, false)
+			Equals(t, allowApply, allowed)
+		}
+	}
+}
+
+func TestQueueAuthorizePreservesInheritedProjectPermissions(t *testing.T) {
+	checker, err := command.NewTeamAllowlistChecker("apply-parent:apply,plan-parent:plan,policy-parent:policy_check")
+	Ok(t, err)
+	logger := logging.NewNoopLogger(t)
+	client := &queueAuthorizationVCSClient{
+		childTeamVCSClient: &childTeamVCSClient{children: map[string][]string{
+			"apply-parent":  {"apply-child"},
+			"plan-parent":   {"plan-child"},
+			"policy-parent": {"policy-child"},
+		}},
+		teams: []string{"apply-child", "plan-child", "policy-child"},
+	}
+	runner := &DefaultCommandRunner{Logger: logger, VCSClient: client, TeamAllowlistChecker: checker}
+	repo := models.Repo{Owner: "org"}
+	user := models.User{Username: "alice", Teams: []string{"stale-team"}}
+	allowed, err := runner.QueueAuthorize(repo, &user, command.Apply.String())
+	Ok(t, err)
+	Assert(t, allowed, "apply permission should be inherited")
+	Equals(t, []string{"apply-child", "plan-child", "policy-child", "apply-parent", "plan-parent", "policy-parent"}, user.Teams)
+	var projects []command.ProjectContext
+	for _, name := range []command.Name{command.Plan, command.PolicyCheck, command.Apply} {
+		projects = append(projects, command.ProjectContext{CommandName: name, User: user, BaseRepo: repo, Log: logger, TeamAllowlistChecker: checker})
+	}
+	filtered, err := filterProjectContextsByTeamAllowlist(projects, "repo", true)
+	Ok(t, err)
+	Equals(t, 3, len(filtered))
+
+	// A grant to the apply parent cannot stand in for a real policy membership.
+	client.teams = []string{"apply-child", "plan-child"}
+	user = models.User{Username: "alice"}
+	allowed, err = runner.QueueAuthorize(repo, &user, command.Apply.String())
+	Ok(t, err)
+	Assert(t, allowed, "requester still has apply permission")
+	projects[1].User = user
+	_, err = filterProjectContextsByTeamAllowlist(projects, "repo", true)
+	Assert(t, errors.Is(err, ErrTeamAllowlistDenied), "missing policy permission must still fail closed")
+}

@@ -41,6 +41,7 @@ import (
 	"github.com/runatlantis/atlantis/server/core/drift"
 	driftpostgres "github.com/runatlantis/atlantis/server/core/drift/postgres"
 	"github.com/runatlantis/atlantis/server/core/ownership"
+	"github.com/runatlantis/atlantis/server/core/queue"
 	"github.com/runatlantis/atlantis/server/core/redis"
 	"github.com/runatlantis/atlantis/server/core/runs"
 	runspostgres "github.com/runatlantis/atlantis/server/core/runs/postgres"
@@ -105,6 +106,10 @@ const (
 
 // Server runs the Atlantis web server.
 type Server struct {
+	QueueController *controllers.QueueController
+	queueService    *events.QueueService
+	queueCancel     context.CancelFunc
+
 	AtlantisVersion                string
 	AtlantisURL                    *url.URL
 	Router                         *mux.Router
@@ -240,6 +245,8 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 
 	var supportedVCSHosts []models.VCSHostType
 	var githubClient github.IGithubClient
+	var queueGithub events.QueueGithub
+	var queueMergeability events.QueueMergeabilityClient
 	var githubAppEnabled bool
 	var githubConfig github.Config
 	var githubCredentials github.Credentials
@@ -277,6 +284,32 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		if err != nil {
 			return nil, fmt.Errorf("parsing --%s: %w", config.RepoConfigJSONFlag, err)
 		}
+	}
+	executionDeploymentID := strings.TrimSpace(userConfig.ReplicaDeploymentID)
+	executionHeartbeat := time.Duration(userConfig.OwnershipTTLSeconds) * time.Second / 3
+	if globalCfg.Queue.Enabled {
+		if !userConfig.EnableExternalStores {
+			return nil, errors.New("apply queue requires --enable-external-stores")
+		}
+		if userConfig.RunStoreType != RunStorePostgres || globalCfg.ExternalStores.PlanStore.Type != "s3" || userConfig.CheckoutStrategy != "merge" || !userConfig.WebBasicAuth || disableApply {
+			return nil, errors.New("apply queue requires PostgreSQL run storage, S3 plans, merge checkout, authenticated web access, and apply commands")
+		}
+		if replicaRoutingEnabled {
+			return nil, errors.New("apply queue currently requires a single Atlantis execution instance")
+		}
+		for _, key := range []string{"TF_CLI_ARGS", "TF_CLI_ARGS_init", "TF_CLI_ARGS_plan", "TF_CLI_ARGS_apply", "TF_DATA_DIR", "TF_WORKSPACE"} {
+			if os.Getenv(key) != "" {
+				return nil, fmt.Errorf("apply queue cannot validate implicit Terraform override %q", key)
+			}
+		}
+		executionDeploymentID = "apply-queue"
+		executionHeartbeat = 10 * time.Second
+		executionInstanceID, err = runs.NewID()
+		if err != nil {
+			return nil, err
+		}
+		replicaID = "apply-queue"
+		allowCommands = append(allowCommands, command.Queue, command.Dequeue)
 	}
 	if durableHAEnabled && globalCfg.ExternalStores.PlanStore.Type != "s3" {
 		return nil, errors.New("--replica-deployment-id requires an S3 external_stores.plan_store")
@@ -332,6 +365,8 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		}
 
 		githubClient = github.NewInstrumentedGithubClient(rawGithubClient, statsScope, logger)
+		queueGithub = rawGithubClient
+		queueMergeability = rawGithubClient
 	}
 	if userConfig.GitlabUser != "" {
 		supportedVCSHosts = append(supportedVCSHosts, models.Gitlab)
@@ -509,17 +544,31 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 			runStoreCloser.Close() // nolint: errcheck
 		}
 	}()
+	if store, ok := runStore.(*runspostgres.Store); ok && !globalCfg.Queue.Enabled {
+		queueStore := runspostgres.NewQueueStore(store)
+		active, err := queueStore.List(context.Background(), 1)
+		if err != nil {
+			return nil, fmt.Errorf("checking persisted queue entries: %w", err)
+		}
+		mutations, err := queueStore.ListMutations(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("checking persisted mutation reservations: %w", err)
+		}
+		if len(active) > 0 || len(mutations) > 0 {
+			return nil, errors.New("apply queue has unresolved entries or mutation reservations; re-enable the queue to reconcile them before disabling it")
+		}
+	}
 	runStoreRetention := newRunStoreRetentionService(runStore, userConfig, logger)
 	var executionInstance executionInstanceLifecycle
-	if durableHAEnabled {
+	if durableHAEnabled || globalCfg.Queue.Enabled {
 		startedAt := time.Now().UTC()
 		executionInstance = newExecutionInstanceService(runStore, runs.ExecutionInstance{
 			ID: executionInstanceID, ReplicaID: replicaID,
-			DeploymentID: strings.TrimSpace(userConfig.ReplicaDeploymentID),
+			DeploymentID: executionDeploymentID,
 			AdvertiseURL: userConfig.ReplicaAdvertiseURL,
 			StartedAt:    startedAt, HeartbeatAt: startedAt,
 			Version: config.AtlantisVersion, Commit: config.AtlantisCommit,
-		}, time.Duration(userConfig.OwnershipTTLSeconds)*time.Second/3, logger)
+		}, executionHeartbeat, logger)
 	}
 	var runHistory *events.RunHistory
 	if userConfig.RunStoreType == RunStorePostgres {
@@ -1186,6 +1235,28 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		KeyGenerator:             controllers.JobIDKeyGenerator{},
 		StatsScope:               statsScope.SubScope("api"),
 	}
+	var queueService *events.QueueService
+	if globalCfg.Queue.Enabled {
+		if queueGithub == nil {
+			return nil, errors.New("apply queue requires GitHub configuration")
+		}
+		queueStore := runspostgres.NewQueueStore(runStore.(*runspostgres.Store))
+		driver := &events.QueueDriver{TeamAllowlistChecker: teamAllowlistChecker, PlanStore: planStore, Store: queueStore, Github: queueGithub, VCS: vcsClient, Parser: eventParser, Builder: projectCommandBuilder, Runner: instrumentedProjectCmdRunner, History: runHistory, WorkingDir: workingDir, Init: projectCommandRunner.InitStepRunner, Terraform: terraformClient, Distribution: defaultTfDistribution, Version: defaultTfVersion, DB: dbUpdater, Status: events.NewQueuePullReqStatusFetcher(vcsClient, queueMergeability, userConfig.VCSStatusName), Global: globalCfg, Log: logger, Scope: statsScope.SubScope("queue"), Instance: executionInstanceID, Deployment: executionDeploymentID, URL: parsedURL.String(), StatusName: userConfig.VCSStatusName}
+		driver.Authorize = commandRunner.QueueAuthorize
+		driver.ApplyAllowed = func() error {
+			locked, err := applyCommandRunner.IsLocked()
+			if err != nil {
+				return err
+			}
+			if locked {
+				return errors.New("global apply lock is active")
+			}
+			return nil
+		}
+		queueService = &events.QueueService{Driver: driver, Drainer: drainer, Engine: &queue.Engine{Store: queueStore, Driver: driver, Worker: string(executionInstanceID), Lease: 30 * time.Second, Observe: driver.ObserveQueue, MaxTransientAttempts: globalCfg.Queue.MaxTransientAttempts}}
+		projectCommandRunner.MutationGuard = driver.MutationGuard
+		commandRunner.QueueService = queueService
+	}
 	var runHistoryController *controllers.RunHistoryController
 	if userConfig.RunStoreType == RunStorePostgres {
 		runHistoryController = &controllers.RunHistoryController{
@@ -1334,6 +1405,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		GithubOrg:           userConfig.GithubOrg,
 	}
 	server := &Server{
+		queueService:                   queueService,
 		AtlantisVersion:                config.AtlantisVersion,
 		AtlantisURL:                    parsedURL,
 		Router:                         underlyingRouter,
@@ -1394,6 +1466,9 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		return nil, err
 	} else {
 		closeRunStoreOnError = false
+		if queueService != nil {
+			server.QueueController = &controllers.QueueController{History: runHistoryController, Store: queueService.Driver.Store}
+		}
 		return server, nil
 	}
 }
@@ -1429,6 +1504,13 @@ func (s *Server) SetupRoutes() {
 		Queries(LockViewRouteIDQueryParam, fmt.Sprintf("{%s}", LockViewRouteIDQueryParam)).Name(LockViewRouteName)
 	s.Router.HandleFunc("/jobs/{job-id}", s.JobsController.GetProjectJobs).Methods("GET").Name(ProjectJobsViewRouteName)
 	s.Router.HandleFunc("/jobs/{job-id}/ws", s.JobsController.GetProjectJobsWS).Methods("GET")
+	if s.QueueController != nil {
+		s.Router.HandleFunc("/queue", s.QueueController.List).Methods("GET")
+		s.Router.HandleFunc("/queue/mutations", s.QueueController.Mutations).Methods("GET")
+		s.Router.HandleFunc("/queue/mutations/{claim}/reconcile", s.QueueController.Mutations).Methods("POST")
+		s.Router.HandleFunc("/queue/{queue-id}", s.QueueController.Detail).Methods("GET")
+		s.Router.HandleFunc("/queue/{queue-id}/reconcile", s.QueueController.Reconcile).Methods("POST")
+	}
 	if s.RunHistoryController != nil {
 		s.Router.HandleFunc("/runs", s.RunHistoryController.ListRuns).Methods("GET")
 		s.Router.HandleFunc("/repos/{repository:.+}", s.RunHistoryController.ListRuns).Methods("GET")
@@ -1471,6 +1553,12 @@ func (s *Server) Start() error {
 		if err := s.executionInstance.Start(context.Background()); err != nil {
 			return err
 		}
+	}
+	if s.queueService != nil {
+		queueCtx, cancel := context.WithCancel(context.Background())
+		s.queueCancel = cancel
+		defer cancel()
+		go s.queueService.Run(queueCtx)
 	}
 	s.SetupRoutes()
 
@@ -1569,6 +1657,9 @@ func (s *Server) shutdown(server httpShutdowner, timeout time.Duration) error {
 
 	commandsDrained := waitForAcceptedCommands(ctx, s.commandExecutorWaiter)
 	operationsDrained := s.waitForDrain(ctx)
+	if s.queueCancel != nil {
+		s.queueCancel()
+	}
 	historyDrained := s.runHistory == nil || !s.runHistory.HasActiveExecutions()
 	executionDrained := commandsDrained && operationsDrained && historyDrained
 
@@ -1742,6 +1833,7 @@ func (s *Server) Index(w http.ResponseWriter, _ *http.Request) {
 		PullToJobMapping:    preparePullToJobMappings(s),
 		ApplyLock:           applyLockData,
 		AtlantisVersion:     s.AtlantisVersion,
+		QueueEnabled:        s.QueueController != nil && s.WebAuthentication,
 		RunHistoryEnabled:   s.RunHistoryController != nil && s.WebAuthentication,
 		DriftHistoryEnabled: s.DriftHistoryController != nil && s.WebAuthentication,
 		CleanedBasePath:     s.AtlantisURL.Path,

@@ -35,6 +35,8 @@ const (
 	State
 	// Cancel is a command to cancel running plan or apply operations
 	Cancel
+	Queue
+	Dequeue
 	// Adding more? Don't forget to update String() below
 )
 
@@ -53,6 +55,7 @@ var AllCommentCommands = []Name{
 	ApprovePolicies,
 	Import,
 	State,
+	Queue, Dequeue,
 }
 
 // TitleString returns the string representation in title form.
@@ -64,6 +67,10 @@ func (c Name) TitleString() string {
 // String returns the string representation of c.
 func (c Name) String() string {
 	switch c {
+	case Queue:
+		return "queue"
+	case Dequeue:
+		return "dequeue"
 	case Apply:
 		return "apply"
 	case Plan, Autoplan:
@@ -141,6 +148,10 @@ func (a ArgCount) IsMatchCount(count int) bool {
 // ParseCommandName parses raw name into a command name.
 func ParseCommandName(name string) (Name, error) {
 	switch name {
+	case "queue":
+		return Queue, nil
+	case "dequeue":
+		return Dequeue, nil
 	case "apply":
 		return Apply, nil
 	case "plan":

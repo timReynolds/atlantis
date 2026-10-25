@@ -362,6 +362,9 @@ func errorWithStepOutput(err error, outputs []string) error {
 
 // DefaultProjectCommandRunner implements ProjectCommandRunner.
 type DefaultProjectCommandRunner struct {
+	// MutationGuard holds canonical state admission for the entire mutating workflow.
+	MutationGuard func(command.ProjectContext, string) (func(), error)
+
 	VcsClient                 vcs.Client
 	Locker                    ProjectLocker
 	LockURLGenerator          LockURLGenerator
@@ -1317,11 +1320,26 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 	}
 
 	envs := make(map[string]string)
+	if ctx.QueueEntryID != "" {
+		// Restarted checkouts may not retain .terraform/environment. The saved
+		// plan and its queue reservation identify the execution workspace.
+		envs["TF_WORKSPACE"] = ctx.Workspace
+	}
+	guarded := false
 	for _, step := range steps {
 		// A preceding step can outlive the ownership lease. Re-admit before
 		// starting another subprocess, including custom and environment steps.
 		if err := p.admitExecution(ctx); err != nil {
 			return outputs, err
+		}
+		mutating := stepRunsCustomCommand(step) || step.StepName == "apply" || step.StepName == "import" || step.StepName == "state_rm"
+		if !guarded && p.MutationGuard != nil && mutating {
+			release, err := p.MutationGuard(ctx, absPath)
+			if err != nil {
+				return outputs, err
+			}
+			defer release()
+			guarded = true
 		}
 		var out string
 		var err error

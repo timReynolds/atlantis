@@ -9,6 +9,8 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/runatlantis/atlantis/server/core/queue"
+
 	version "github.com/hashicorp/go-version"
 	"github.com/runatlantis/atlantis/server/logging"
 )
@@ -46,6 +48,7 @@ var NonOverridableApplyReqs = []string{PoliciesPassedCommandReq}
 
 // GlobalCfg is the final parsed version of server-side repo config.
 type GlobalCfg struct {
+	Queue          queue.Config
 	Repos          []Repo
 	Workflows      map[string]Workflow
 	PolicySets     PolicySets

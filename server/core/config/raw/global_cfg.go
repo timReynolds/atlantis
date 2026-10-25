@@ -10,12 +10,15 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/runatlantis/atlantis/server/core/queue"
+
 	validation "github.com/go-ozzo/ozzo-validation"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 )
 
 // GlobalCfg is the raw schema for server-side repo config.
 type GlobalCfg struct {
+	Queue          queue.Config        `yaml:"queue" json:"queue"`
 	Repos          []Repo              `yaml:"repos" json:"repos"`
 	Workflows      map[string]Workflow `yaml:"workflows" json:"workflows"`
 	PolicySets     PolicySets          `yaml:"policies" json:"policies"`
@@ -114,6 +117,9 @@ func (g GlobalCfg) Validate() error {
 		return err
 	}
 
+	if err := g.Queue.Validate(); err != nil {
+		return err
+	}
 	if err := g.ExternalStores.Validate(); err != nil {
 		return err
 	}
@@ -223,6 +229,7 @@ func (g GlobalCfg) ToValid(defaultCfg valid.GlobalCfg) valid.GlobalCfg {
 	repos = append(defaultCfg.Repos, repos...)
 
 	return valid.GlobalCfg{
+		Queue:          g.Queue,
 		Repos:          repos,
 		Workflows:      workflows,
 		PolicySets:     g.PolicySets.ToValid(),

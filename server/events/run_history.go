@@ -1261,7 +1261,7 @@ func marshalMetadata(value any) runs.Metadata {
 		return runs.Metadata(`{}`)
 	}
 	metadata, err := json.Marshal(value)
-	if err != nil {
+	if err != nil || string(metadata) == "null" {
 		return runs.Metadata(`{}`)
 	}
 	return runs.Metadata(metadata)

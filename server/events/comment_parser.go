@@ -265,6 +265,10 @@ func (e *CommentParser) Parse(rawComment string, vcsHost models.VCSHostType) Com
 
 	// Set up the flag parsing depending on the command.
 	switch cmd {
+	case command.Queue.String(), command.Dequeue.String():
+		name, _ = command.ParseCommandName(cmd)
+		flagSet = pflag.NewFlagSet(cmd, pflag.ContinueOnError)
+		flagSet.SetOutput(io.Discard)
 	case command.Plan.String():
 		name = command.Plan
 		flagSet = pflag.NewFlagSet(command.Plan.String(), pflag.ContinueOnError)
@@ -375,6 +379,26 @@ func (e *CommentParser) Parse(rawComment string, vcsHost models.VCSHostType) Com
 }
 
 func (e *CommentParser) parseArgs(name command.Name, args []string, flagSet *pflag.FlagSet) (string, []string, string) {
+	if name == command.Queue || name == command.Dequeue {
+		values := args[2:]
+		if name == command.Dequeue {
+			if len(values) != 0 {
+				return "", nil, "dequeue accepts no arguments"
+			}
+			return "", nil, ""
+		}
+		if len(values) == 0 {
+			return "", nil, ""
+		}
+		action := values[0]
+		if action == "approve" && len(values) == 2 {
+			return action, values[1:], ""
+		}
+		if slices.Contains([]string{"status", "retry", "recover"}, action) && len(values) == 1 {
+			return action, nil, ""
+		}
+		return "", nil, "use queue, queue status, queue retry, queue approve GENERATION, or queue recover"
+	}
 	// Now parse the flags.
 	// It's safe to use [2:] because we know there's at least 2 elements in args.
 	err := flagSet.Parse(args[2:])

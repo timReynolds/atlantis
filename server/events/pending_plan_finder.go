@@ -157,6 +157,11 @@ func (p *DefaultPendingPlanFinder) findInGitWorkspaces(pullDir string) ([]Pendin
 				if err != nil {
 					return nil, nil, err
 				}
+				// Custom workflows own arbitrary .tfplan filenames. Only discover
+				// artifacts whose name round-trips Atlantis's naming convention.
+				if filepath.Base(file) != runtime.GetPlanFilename(workspace, projectName) {
+					continue
+				}
 				plans = append(plans, PendingPlan{
 					RepoDir:     repoDir,
 					RepoRelDir:  filepath.Dir(file),
@@ -261,6 +266,9 @@ func (p *DefaultPendingPlanFinder) findInPlanStore(clonePullDir string, planPull
 			projectName, err := runtime.ProjectNameFromPlanfile(workspace, filepath.Base(relFile))
 			if err != nil {
 				return err
+			}
+			if filepath.Base(relFile) != runtime.GetPlanFilename(workspace, projectName) {
+				return nil
 			}
 			plans = append(plans, PendingPlan{
 				RepoDir:     cloneRepoDir,

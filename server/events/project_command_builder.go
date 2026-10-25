@@ -1329,7 +1329,38 @@ func (p *DefaultProjectCommandBuilder) buildAllProjectCommandsByPlan(ctx *comman
 		plans = filteredPlans
 	}
 
+	customPlanKeys := make(map[applyPlanKey]bool)
 	if commentCmd.Name == command.Apply {
+		// Run-only workflows own their artifacts and may not create any file
+		// with Atlantis's convention name. Schedule those projects from their
+		// recorded status; the usual head/base/status validation still applies.
+		if ctx.PullStatus != nil {
+			for _, project := range ctx.PullStatus.Projects {
+				if !statusRequiresPlanFileForGenericApply(project.Status) {
+					continue
+				}
+				matching, config, err := p.getCfg(ctx, project.ProjectName, project.RepoRelDir, project.Workspace, defaultRepoDir, true, true)
+				if err != nil {
+					return nil, err
+				}
+				cfg := p.GlobalCfg.DefaultProjCfg(ctx.Log, ctx.Pull.BaseRepo.ID(), project.RepoRelDir, project.Workspace)
+				if len(matching) == 1 {
+					cfg = p.GlobalCfg.MergeProjectCfg(ctx.Log, ctx.Pull.BaseRepo.ID(), matching[0], *config)
+				} else if len(matching) > 1 {
+					continue
+				}
+				if requiresAtlantisManagedPlanFile(cfg.Workflow) {
+					continue
+				}
+				key := newApplyPlanKey(project.Workspace, project.RepoRelDir, project.ProjectName)
+				customPlanKeys[key] = true
+				if !slices.ContainsFunc(plans, func(plan PendingPlan) bool {
+					return newApplyPlanKey(plan.Workspace, plan.RepoRelDir, plan.ProjectName) == key
+				}) {
+					plans = append(plans, PendingPlan{RepoRelDir: project.RepoRelDir, Workspace: project.Workspace, ProjectName: project.ProjectName})
+				}
+			}
+		}
 		hasActivePlan := false
 		if p.WorkingDirLocker != nil {
 			hasActivePlan = p.WorkingDirLocker.HasCommandLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, command.Plan)
@@ -1351,7 +1382,7 @@ func (p *DefaultProjectCommandBuilder) buildAllProjectCommandsByPlan(ctx *comman
 		if err != nil {
 			return nil, fmt.Errorf("building command for dir '%s': %w", plan.RepoRelDir, err)
 		}
-		if commentCmd.Name == command.Apply {
+		if commentCmd.Name == command.Apply && !customPlanKeys[newApplyPlanKey(plan.Workspace, plan.RepoRelDir, plan.ProjectName)] {
 			planBasePath := filepath.Join(plan.planRepoDir(), plan.RepoRelDir)
 			planPath, err := pendingPlanFilePath(plan)
 			if err != nil {

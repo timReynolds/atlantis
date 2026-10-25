@@ -611,6 +611,12 @@ func (r *RunHistoryProjectCommandRunner) run(
 	return result
 }
 
+func (r *RunHistoryProjectCommandRunner) PublishDeferredPlanStatuses(projectCmds []command.ProjectContext, result command.Result, status models.CommitStatus) {
+	if publisher, ok := r.ProjectCommandRunner.(DeferredPlanStatusPublisher); ok {
+		publisher.PublishDeferredPlanStatuses(projectCmds, result, status)
+	}
+}
+
 func (r *RunHistoryProjectCommandRunner) PublishDeferredApplyStatuses(projectCmds []command.ProjectContext, result command.Result, status models.CommitStatus) {
 	publisher, ok := r.ProjectCommandRunner.(DeferredApplyStatusPublisher)
 	if ok {
@@ -622,6 +628,7 @@ var _ CommentCommandRunner = (*runHistoryCommandRunner)(nil)
 var _ PreWorkflowHooksSkipper = (*runHistoryCommandRunner)(nil)
 var _ ProjectCommandRunner = (*RunHistoryProjectCommandRunner)(nil)
 var _ DeferredApplyStatusPublisher = (*RunHistoryProjectCommandRunner)(nil)
+var _ DeferredPlanStatusPublisher = (*RunHistoryProjectCommandRunner)(nil)
 
 func writeRunHistory(operation func(context.Context) error) error {
 	ctx, cancel := context.WithTimeout(context.Background(), runHistoryWriteTimeout)

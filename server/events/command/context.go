@@ -18,10 +18,23 @@ type ExecutionLease interface {
 	Admit(context.Context) error
 }
 
+// SideEffectMarker durably records that a command is crossing from retryable
+// preparation into infrastructure mutation. Implementations must fail closed.
+type SideEffectMarker interface {
+	MarkSideEffectStarted(context.Context) error
+}
+
 // RoutingContext carries owner-local execution state through command runners.
 type RoutingContext struct {
 	Lease                ExecutionLease
 	RecoverExternalPlans bool
+	// InvalidateOwnership releases the exact Redis claim when durable attempt
+	// admission cannot be cleaned up safely.
+	InvalidateOwnership func() error
+	InstanceID          runs.ID
+	DeploymentID        string
+	ConcurrencyKey      string
+	OwnershipClaimID    string
 }
 
 // Trigger represents the how the command was triggered
@@ -41,6 +54,8 @@ type Context struct {
 	// RunID links this command to optional durable run history. It is empty
 	// when durable history is disabled or the command is outside its scope.
 	RunID runs.ID
+	// AttemptID identifies this process attempt when durable HA is enabled.
+	AttemptID runs.ID
 	// HeadRepo is the repository that is getting merged into the BaseRepo.
 	// If the pull request branch is from the same repository then HeadRepo will
 	// be the same as BaseRepo.
@@ -150,4 +165,12 @@ type Context struct {
 
 	// RecoverExternalPlans marks a newly prepared local ownership generation.
 	RecoverExternalPlans bool
+
+	// HA execution identity is populated only for owner-routed commands.
+	ExecutionInstanceID   runs.ID
+	ExecutionDeploymentID string
+	ConcurrencyKey        string
+	OwnershipClaimID      string
+	SideEffectMarker      SideEffectMarker
+	InvalidateOwnership   func() error
 }

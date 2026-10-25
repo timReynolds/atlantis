@@ -5,6 +5,8 @@ package planstore
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -49,6 +51,17 @@ type S3PlanStore struct {
 	bucket string
 	prefix string
 	logger logging.SimpleLogging
+}
+
+var planIdentityMetadataKeys = []string{
+	"head-commit",
+	"atlantis-repository",
+	"atlantis-pull-number",
+	"atlantis-project",
+	"atlantis-directory",
+	"atlantis-workspace",
+	"atlantis-repo-config-version",
+	"atlantis-workflow-checksum",
 }
 
 // NewS3PlanStore creates an S3PlanStore using the AWS SDK default credential chain.
@@ -120,10 +133,17 @@ func (s *S3PlanStore) Save(ctx command.ProjectContext, planPath string) error {
 		return fmt.Errorf("opening plan file for S3 upload: %w", err)
 	}
 	defer f.Close()
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return fmt.Errorf("hashing plan file for S3 upload: %w", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewinding plan file for S3 upload: %w", err)
+	}
 
-	metadata := map[string]string{}
-	if ctx.Pull.HeadCommit != "" {
-		metadata["head-commit"] = ctx.Pull.HeadCommit
+	metadata, err := planObjectMetadata(ctx, "sha256:"+hex.EncodeToString(hasher.Sum(nil)))
+	if err != nil {
+		return err
 	}
 	if ctx.User.Username != "" {
 		metadata["planned-by"] = ctx.User.Username
@@ -160,24 +180,27 @@ func (s *S3PlanStore) Load(ctx command.ProjectContext, planPath string) error {
 	}
 	defer resp.Body.Close()
 
-	// Reject stale plans: the plan must have been created at the same commit
-	// the PR currently points to. This prevents applying outdated plans after
-	// new commits are pushed (e.g. across container restarts).
-	// Note: different S3/S3-compatible implementations may return user-defined
-	// metadata keys with different casing, so we look up "head-commit"
-	// case-insensitively.
-	var planCommit string
-	for k, v := range resp.Metadata {
-		if strings.EqualFold(k, "head-commit") {
-			planCommit = v
-			break
+	expectedMetadata, err := planObjectMetadata(ctx, "")
+	if err != nil {
+		return err
+	}
+	metadata := normalizeObjectMetadata(resp.Metadata)
+	for _, name := range planIdentityMetadataKeys {
+		expected := expectedMetadata[name]
+		actual, ok := metadata[name]
+		if !ok {
+			return fmt.Errorf("plan in S3 has no %s metadata (key=%s); run plan again", name, key)
+		}
+		if actual != expected {
+			if name == "head-commit" {
+				return fmt.Errorf("plan was created at commit %.8s but PR is now at %.8s; run plan again", actual, expected)
+			}
+			return fmt.Errorf("plan %s metadata does not match current project (key=%s); run plan again", name, key)
 		}
 	}
-	if planCommit == "" {
-		return fmt.Errorf("plan in S3 has no head-commit metadata (key=%s) — run plan again", key)
-	}
-	if ctx.Pull.HeadCommit != "" && planCommit != ctx.Pull.HeadCommit {
-		return fmt.Errorf("plan was created at commit %.8s but PR is now at %.8s — run plan again", planCommit, ctx.Pull.HeadCommit)
+	expectedChecksum, ok := metadata["atlantis-plan-sha256"]
+	if !ok || !validPlanChecksum(expectedChecksum) {
+		return fmt.Errorf("plan in S3 has no valid atlantis-plan-sha256 metadata (key=%s); run plan again", key)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(planPath), 0o700); err != nil {
@@ -190,12 +213,66 @@ func (s *S3PlanStore) Load(ctx command.ProjectContext, planPath string) error {
 	}
 	defer f.Close()
 
-	if _, err := io.Copy(f, resp.Body); err != nil {
+	hasher := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(f, hasher), resp.Body); err != nil {
+		_ = os.Remove(planPath)
 		return fmt.Errorf("writing plan file from S3: %w", err)
+	}
+	actualChecksum := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
+	if actualChecksum != expectedChecksum {
+		_ = f.Close()
+		_ = os.Remove(planPath)
+		return fmt.Errorf("plan body checksum does not match S3 metadata (key=%s); run plan again", key)
 	}
 
 	s.logger.Debug("downloaded plan from s3://%s/%s", s.bucket, key)
 	return nil
+}
+
+func planObjectMetadata(ctx command.ProjectContext, checksum string) (map[string]string, error) {
+	if ctx.Pull.Num == 0 || ctx.RepoConfigVersion < 0 || !validPlanChecksum(ctx.WorkflowIdentity) {
+		return nil, fmt.Errorf("external plan execution identity is invalid")
+	}
+	values := map[string]string{
+		"head-commit":                  strings.TrimSpace(ctx.Pull.HeadCommit),
+		"atlantis-repository":          strings.TrimSpace(ctx.BaseRepo.ID()),
+		"atlantis-pull-number":         strconv.Itoa(ctx.Pull.Num),
+		"atlantis-project":             ctx.ProjectID(),
+		"atlantis-directory":           ctx.RepoRelDir,
+		"atlantis-workspace":           ctx.Workspace,
+		"atlantis-repo-config-version": strconv.Itoa(ctx.RepoConfigVersion),
+		"atlantis-workflow-checksum":   strings.TrimSpace(ctx.WorkflowIdentity),
+	}
+	for name, value := range values {
+		if strings.TrimSpace(value) == "" {
+			return nil, fmt.Errorf("external plan requires %s identity", name)
+		}
+	}
+	if checksum != "" {
+		if !validPlanChecksum(checksum) {
+			return nil, fmt.Errorf("external plan checksum is invalid")
+		}
+		values["atlantis-plan-sha256"] = checksum
+	} else {
+		values["atlantis-plan-sha256"] = ""
+	}
+	return values, nil
+}
+
+func normalizeObjectMetadata(metadata map[string]string) map[string]string {
+	result := make(map[string]string, len(metadata))
+	for key, value := range metadata {
+		result[strings.ToLower(key)] = value
+	}
+	return result
+}
+
+func validPlanChecksum(checksum string) bool {
+	if !strings.HasPrefix(checksum, "sha256:") || len(checksum) != len("sha256:")+64 {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(checksum, "sha256:"))
+	return err == nil
 }
 
 // Remove deletes the plan file from S3 and locally.

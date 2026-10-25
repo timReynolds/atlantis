@@ -1325,6 +1325,11 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 		}
 		var out string
 		var err error
+		if stepRunsCustomCommand(step) {
+			if err := markInfrastructureSideEffect(ctx); err != nil {
+				return outputs, err
+			}
+		}
 		switch step.StepName {
 		case "init":
 			out, err = p.InitStepRunner.Run(ctx, step.ExtraArgs, absPath, envs)
@@ -1343,12 +1348,21 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 					return outputs, err
 				}
 			}
+			if err := markInfrastructureSideEffect(ctx); err != nil {
+				return outputs, err
+			}
 			out, err = p.ApplyStepRunner.Run(ctx, step.ExtraArgs, absPath, envs)
 		case "version":
 			out, err = p.VersionStepRunner.Run(ctx, step.ExtraArgs, absPath, envs)
 		case "import":
+			if err := markInfrastructureSideEffect(ctx); err != nil {
+				return outputs, err
+			}
 			out, err = p.ImportStepRunner.Run(ctx, step.ExtraArgs, absPath, envs)
 		case "state_rm":
+			if err := markInfrastructureSideEffect(ctx); err != nil {
+				return outputs, err
+			}
 			out, err = p.StateRmStepRunner.Run(ctx, step.ExtraArgs, absPath, envs)
 		case "run":
 			out, err = p.RunStepRunner.Run(ctx, step.RunShell, step.RunCommand, absPath, envs, !ctx.SuppressJobOutput, step.Output, step.FilterRegexes)
@@ -1372,6 +1386,35 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 		}
 	}
 	return outputs, nil
+}
+
+func markInfrastructureSideEffect(ctx command.ProjectContext) error {
+	return markCommandSideEffect(ctx.SideEffectMarker)
+}
+
+func markCommandSideEffect(marker command.SideEffectMarker) error {
+	if marker == nil {
+		return nil
+	}
+	if err := marker.MarkSideEffectStarted(context.Background()); err != nil {
+		return fmt.Errorf("recording infrastructure side effect start: %w", err)
+	}
+	return nil
+}
+
+func stepRunsCustomCommand(step valid.Step) bool {
+	// Arbitrary workflow commands can mutate infrastructure even in a plan or
+	// policy stage, including commands used to compute environment variables.
+	// Fence them conservatively; literal env values and built-in plan/init steps
+	// remain available for read-only reconciliation of an unknown mutation.
+	switch step.StepName {
+	case "run", "multienv":
+		return true
+	case "env":
+		return step.EnvVarValue == ""
+	default:
+		return false
+	}
 }
 
 // getMissingPolicySetNames returns the names of policy sets that don't have corresponding outputs

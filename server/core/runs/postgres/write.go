@@ -4,11 +4,13 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"reflect"
 	"time"
 
@@ -54,6 +56,9 @@ func (s *Store) CreateRun(ctx context.Context, run runs.Run) error {
 			return fmt.Errorf("creating run: %w", runs.ErrConflict)
 		}
 		return err
+	}
+	if metadataEqual(existing.Metadata, run.Metadata) {
+		existing.Metadata = run.Metadata
 	}
 	if !reflect.DeepEqual(existing, run) {
 		return fmt.Errorf("creating run %s: %w", run.ID, runs.ErrConflict)
@@ -174,6 +179,9 @@ func (s *Store) CreateProjectRun(ctx context.Context, projectRun runs.ProjectRun
 			return fmt.Errorf("creating project run: %w", runs.ErrConflict)
 		}
 		return err
+	}
+	if metadataEqual(existing.Metadata, projectRun.Metadata) {
+		existing.Metadata = projectRun.Metadata
 	}
 	if !reflect.DeepEqual(existing, projectRun) {
 		return fmt.Errorf("creating project run %s: %w", projectRun.ID, runs.ErrConflict)
@@ -367,6 +375,9 @@ func (s *Store) AppendAuditEvent(ctx context.Context, event runs.AuditEvent) err
 		}
 		return err
 	}
+	if metadataEqual(existing.Metadata, event.Metadata) {
+		existing.Metadata = event.Metadata
+	}
 	if !reflect.DeepEqual(existing, event) {
 		return fmt.Errorf("appending audit event %s: %w", event.ID, runs.ErrConflict)
 	}
@@ -382,6 +393,46 @@ func mapLookupError(action string, err error) error {
 		return fmt.Errorf("%s: %w", action, runs.ErrNotFound)
 	}
 	return fmt.Errorf("%s: %w", action, err)
+}
+
+// metadataEqual compares the JSON value that PostgreSQL JSONB stores, including
+// nested key order and numeric notation. UseNumber preserves large integers.
+func metadataEqual(left, right runs.Metadata) bool {
+	decode := func(metadata runs.Metadata) (any, error) {
+		if len(metadata) == 0 {
+			metadata = runs.Metadata(`{}`)
+		}
+		decoder := json.NewDecoder(bytes.NewReader(metadata))
+		decoder.UseNumber()
+		var value any
+		err := decoder.Decode(&value)
+		return comparableMetadata(value), err
+	}
+	l, leftErr := decode(left)
+	r, rightErr := decode(right)
+	return leftErr == nil && rightErr == nil && reflect.DeepEqual(l, r)
+}
+
+func comparableMetadata(value any) any {
+	switch value := value.(type) {
+	case map[string]any:
+		for key, child := range value {
+			value[key] = comparableMetadata(child)
+		}
+		return value
+	case []any:
+		for i, child := range value {
+			value[i] = comparableMetadata(child)
+		}
+		return value
+	case json.Number:
+		if number, ok := new(big.Rat).SetString(string(value)); ok {
+			return number
+		}
+		return value
+	default:
+		return value
+	}
 }
 
 func normalizeMetadata(metadata runs.Metadata) runs.Metadata {
@@ -488,5 +539,5 @@ func projectCompletionMatches(projectRun runs.ProjectRun, completion runs.Projec
 		projectRun.CompletedAt != nil && projectRun.CompletedAt.Equal(completion.CompletedAt) &&
 		projectRun.ErrorSummary == completion.ErrorSummary &&
 		reflect.DeepEqual(projectRun.PlanArtifact, completion.PlanArtifact) &&
-		reflect.DeepEqual(projectRun.Metadata, completion.Metadata)
+		metadataEqual(projectRun.Metadata, completion.Metadata)
 }

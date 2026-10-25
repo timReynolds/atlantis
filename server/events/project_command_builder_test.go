@@ -4640,22 +4640,22 @@ func TestDefaultProjectCommandBuilder_BuildVersionCommand(t *testing.T) {
 	tmpDir := DirStructure(t, map[string]any{
 		"workspace1": map[string]any{
 			"project1": map[string]any{
-				"main.tf":          nil,
-				"workspace.tfplan": nil,
+				"main.tf":           nil,
+				"workspace1.tfplan": nil,
 			},
 			"project2": map[string]any{
-				"main.tf":          nil,
-				"workspace.tfplan": nil,
+				"main.tf":           nil,
+				"workspace1.tfplan": nil,
 			},
 		},
 		"workspace2": map[string]any{
 			"project1": map[string]any{
-				"main.tf":          nil,
-				"workspace.tfplan": nil,
+				"main.tf":           nil,
+				"workspace2.tfplan": nil,
 			},
 			"project2": map[string]any{
-				"main.tf":          nil,
-				"workspace.tfplan": nil,
+				"main.tf":           nil,
+				"workspace2.tfplan": nil,
 			},
 		},
 	})

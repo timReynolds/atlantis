@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Drift detection {{ .Detection.ID }} · atlantis</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/normalize.css">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/skeleton.css">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/custom.css">
+</head>
+<body>
+<div class="container history-page">
+  <nav class="history-nav"><a href="{{ .CleanedBasePath }}/">Atlantis</a><a href="{{ .CleanedBasePath }}/runs">Runs</a><a href="{{ .CleanedBasePath }}/audit">Audit</a><a class="active" href="{{ .CleanedBasePath }}/drift">Drift</a></nav>
+  <header class="history-header"><p class="history-eyebrow">{{ .Detection.Repository }} · {{ .Detection.Ref }}</p><h2>Drift detection</h2><p class="history-id-full">{{ .Detection.ID }}</p><span class="history-status history-status-{{ .Detection.Status }}">{{ .Detection.Status }}</span></header>
+  <section class="history-summary-grid">
+    <div><strong>{{ .Detection.TotalProjects }}</strong><span>Projects</span></div><div><strong>{{ .Detection.ProjectsWithDrift }}</strong><span>Drifted</span></div><div><strong>{{ .Detection.FailedProjects }}</strong><span>Failed</span></div><div><strong>{{ .Detection.LockedProjects }}</strong><span>Locked</span></div><div><strong>{{ .Detection.SkippedProjects }}</strong><span>Skipped</span></div>
+  </section>
+  <section class="history-facts"><div><span>Resolved commit</span><strong><code>{{ .Detection.ResolvedCommit }}</code></strong></div><div><span>Completed</span><strong>{{ .Detection.CompletedAt }}</strong></div></section>
+  {{ if .Detection.RunPath }}<p><a class="button button-primary" href="{{ .CleanedBasePath }}{{ .Detection.RunPath }}">Open run and command output</a></p>{{ end }}
+  {{ if .Projects }}<div class="history-table-wrap"><table class="u-full-width history-table">
+    <thead><tr><th>Project</th><th>Changes</th><th>Outcome</th><th>Checked</th><th>Artifact</th></tr></thead>
+    <tbody>{{ range .Projects }}<tr>
+      <td><strong>{{ if .ProjectName }}{{ .ProjectName }}{{ else }}unnamed{{ end }}</strong><br><code>{{ .Directory }}</code> · <code>{{ .Workspace }}</code>{{ if .Error }}<br><span class="history-error">{{ .Error }}</span>{{ end }}</td>
+      <td><span class="history-change-add">+{{ .Additions }}</span> <span class="history-change-update">~{{ .Changes }}</span> <span class="history-change-destroy">-{{ .Destructions }}</span>{{ if .Summary }}<br><span class="history-muted">{{ .Summary }}</span>{{ end }}</td>
+      <td><span class="history-status history-status-{{ .Outcome }}">{{ .Outcome }}</span></td><td class="history-nowrap">{{ .LastChecked }}</td><td>{{ if .ArtifactKey }}<code>{{ .ArtifactKey }}</code>{{ if .ArtifactChecksum }}<br><code>{{ .ArtifactChecksum }}</code>{{ end }}{{ else }}—{{ end }}</td>
+    </tr>{{ end }}</tbody>
+  </table></div>{{ else }}<div class="history-empty">No project results on this page.</div>{{ end }}
+  <p>{{ if .PreviousPath }}<a class="button" href="{{ .CleanedBasePath }}{{ .PreviousPath }}">Previous</a>{{ end }} {{ if .NextPath }}<a class="button" href="{{ .CleanedBasePath }}{{ .NextPath }}">Next 100 projects</a>{{ end }}</p>
+</div>
+<footer>{{ .AtlantisVersion }}</footer>
+</body>
+</html>

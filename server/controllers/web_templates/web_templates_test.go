@@ -120,6 +120,9 @@ func TestRunHistoryTemplates(t *testing.T) {
 		{"list", RunHistoryListTemplate, RunHistoryListData{Title: "Run history", Runs: []RunHistoryRun{run}}},
 		{"detail", RunHistoryDetailTemplate, RunHistoryDetailData{Run: run, Summary: runs.ProjectRunSummary{Total: 1, Failed: 1}, Projects: []RunHistoryProject{project}}},
 		{"audit", RunAuditListTemplate, RunAuditListData{Events: []RunAuditEvent{{Repository: "org/repo", EventType: "plan.completed"}}}},
+		{"drift list", DriftHistoryListTemplate, DriftHistoryListData{Projects: []DriftCurrentProject{{Repository: "org/repo", ProjectName: "network", Outcome: "drifted"}}}},
+		{"drift detection", DriftDetectionTemplate, DriftDetectionDetailData{Detection: DriftDetectionRun{ID: run.ID, Repository: "org/repo", Status: "partial"}, Projects: []DriftDetectionProject{{ProjectName: "network", Error: "unsafe <value>"}}}},
+		{"drift remediation", DriftRemediationTemplate, DriftRemediationDetailData{ID: run.ID, Repository: "org/repo", Status: "success", Projects: []DriftRemediationProject{{ProjectName: "network", Before: `{"summary":"unsafe <value>"}`}}}},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
@@ -136,4 +139,13 @@ func TestRunHistoryTemplates(t *testing.T) {
 	Ok(t, err)
 	Assert(t, strings.Contains(output.String(), "sensitive &lt;value&gt;"), "output must be HTML escaped")
 	Assert(t, !strings.Contains(output.String(), "sensitive <value>"), "raw output must not be injected into HTML")
+
+	output.Reset()
+	err = DriftDetectionTemplate.Execute(&output, DriftDetectionDetailData{
+		Detection: DriftDetectionRun{ID: run.ID, Repository: "org/repo", Status: "failed"},
+		Projects:  []DriftDetectionProject{{ProjectName: "network", Error: "sensitive <value>"}},
+	})
+	Ok(t, err)
+	Assert(t, strings.Contains(output.String(), "sensitive &lt;value&gt;"), "drift errors must be HTML escaped")
+	Assert(t, !strings.Contains(output.String(), "sensitive <value>"), "raw drift errors must not be injected into HTML")
 }

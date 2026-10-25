@@ -356,15 +356,16 @@ func TestSetupRoutes_APIRoutesRegistered(t *testing.T) {
 	t.Log("All API routes should be registered after SetupRoutes()")
 
 	s := server.Server{
-		Router:               mux.NewRouter(),
-		APIController:        &controllers.APIController{},
-		StatusController:     &controllers.StatusController{},
-		LocksController:      &controllers.LocksController{},
-		GithubAppController:  &controllers.GithubAppController{},
-		JobsController:       &controllers.JobsController{},
-		RunHistoryController: &controllers.RunHistoryController{},
-		VCSEventsController:  &events_controllers.VCSEventsController{},
-		Logger:               logging.NewNoopLogger(t),
+		Router:                 mux.NewRouter(),
+		APIController:          &controllers.APIController{},
+		StatusController:       &controllers.StatusController{},
+		LocksController:        &controllers.LocksController{},
+		GithubAppController:    &controllers.GithubAppController{},
+		JobsController:         &controllers.JobsController{},
+		RunHistoryController:   &controllers.RunHistoryController{},
+		DriftHistoryController: &controllers.DriftHistoryController{},
+		VCSEventsController:    &events_controllers.VCSEventsController{},
+		Logger:                 logging.NewNoopLogger(t),
 	}
 
 	s.SetupRoutes()
@@ -401,6 +402,9 @@ func TestSetupRoutes_APIRoutesRegistered(t *testing.T) {
 		{"GET", "/repos/group/subgroup/infrastructure?pull=42"},
 		{"GET", "/repos/group/pulls/42"},
 		{"GET", "/audit"},
+		{"GET", "/drift"},
+		{"GET", "/drift/detections/019c0000-0000-7000-8000-000000000000"},
+		{"GET", "/drift/remediations/019c0000-0000-7000-8000-000000000001"},
 	}
 
 	for _, c := range cases {

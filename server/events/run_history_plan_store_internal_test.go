@@ -19,32 +19,43 @@ import (
 )
 
 func TestRunHistoryPlanStoreRecordsExternalArtifactMetadata(t *testing.T) {
-	writer := &recordingRunWriter{}
-	history := newTestRunHistory(t, writer)
-	runCtx := testRunContext(t)
-	lifecycle := history.Begin(runCtx, runs.CommandPlan, runs.TriggerComment)
-	projectCtx := history.beginProject(command.ProjectContext{
-		RunID: runCtx.RunID, ProjectName: "network", RepoRelDir: "terraform/network",
-		Workspace: "production", Log: runCtx.Log,
-	})
-	planContent := []byte("opaque terraform plan")
-	planPath := filepath.Join(t.TempDir(), "network.tfplan")
-	require.NoError(t, os.WriteFile(planPath, planContent, 0o600))
-	delegate := &externalPlanStore{key: "plans/org/repo/42/production/network.tfplan"}
-	store := NewRunHistoryPlanStore(delegate, history, logging.NewNoopLogger(t))
-	store.(*RunHistoryPlanStore).now = func() time.Time { return testHistoryTime }
+	for _, testCase := range []struct {
+		name    string
+		command runs.Command
+		trigger runs.Trigger
+	}{
+		{name: "comment plan", command: runs.CommandPlan, trigger: runs.TriggerComment},
+		{name: "drift detection", command: runs.CommandDriftDetection, trigger: runs.TriggerAPI},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			writer := &recordingRunWriter{}
+			history := newTestRunHistory(t, writer)
+			runCtx := testRunContext(t)
+			lifecycle := history.Begin(runCtx, testCase.command, testCase.trigger)
+			projectCtx := history.beginProject(command.ProjectContext{
+				RunID: runCtx.RunID, ProjectName: "network", RepoRelDir: "terraform/network",
+				Workspace: "production", Log: runCtx.Log,
+			})
+			planContent := []byte("opaque terraform plan")
+			planPath := filepath.Join(t.TempDir(), "network.tfplan")
+			require.NoError(t, os.WriteFile(planPath, planContent, 0o600))
+			delegate := &externalPlanStore{key: "plans/org/repo/42/production/network.tfplan"}
+			store := NewRunHistoryPlanStore(delegate, history, logging.NewNoopLogger(t))
+			store.(*RunHistoryPlanStore).now = func() time.Time { return testHistoryTime }
 
-	require.NoError(t, store.Save(projectCtx, planPath))
-	history.recordProject(projectCtx, command.Plan, command.ProjectCommandOutput{})
-	lifecycle.Finish()
+			require.NoError(t, store.Save(projectCtx, planPath))
+			history.recordProject(projectCtx, command.Plan, command.ProjectCommandOutput{})
+			lifecycle.Finish()
 
-	require.True(t, delegate.saved)
-	require.Len(t, writer.projectsCompleted, 1)
-	reference := writer.projectsCompleted[0].PlanArtifact
-	require.NotNil(t, reference)
-	require.Equal(t, delegate.key, reference.Key)
-	require.Equal(t, fmt.Sprintf("sha256:%x", sha256.Sum256(planContent)), reference.Checksum)
-	require.Equal(t, testHistoryTime, reference.CreatedAt)
+			require.True(t, delegate.saved)
+			require.Len(t, writer.projectsCompleted, 1)
+			reference := writer.projectsCompleted[0].PlanArtifact
+			require.NotNil(t, reference)
+			require.Equal(t, delegate.key, reference.Key)
+			require.Equal(t, fmt.Sprintf("sha256:%x", sha256.Sum256(planContent)), reference.Checksum)
+			require.Equal(t, testHistoryTime, reference.CreatedAt)
+		})
+	}
 }
 
 func TestRunHistoryPlanStoreLeavesLocalStoreUnwrapped(t *testing.T) {

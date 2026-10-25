@@ -33,6 +33,9 @@ var templateFileNames = map[string]string{
 	"run-history-detail": "run-history-detail.html.tmpl",
 	"run-project-detail": "run-project-detail.html.tmpl",
 	"run-audit-list":     "run-audit-list.html.tmpl",
+	"drift-history-list": "drift-history-list.html.tmpl",
+	"drift-detection":    "drift-detection.html.tmpl",
+	"drift-remediation":  "drift-remediation.html.tmpl",
 }
 
 // TemplateWriter is an interface over html/template that's used to enable
@@ -68,9 +71,10 @@ type IndexData struct {
 	Locks            []LockIndexData
 	PullToJobMapping []jobs.PullInfoWithJobIDs
 
-	ApplyLock         ApplyLockData
-	AtlantisVersion   string
-	RunHistoryEnabled bool
+	ApplyLock           ApplyLockData
+	AtlantisVersion     string
+	RunHistoryEnabled   bool
+	DriftHistoryEnabled bool
 	// CleanedBasePath is the path Atlantis is accessible at externally. If
 	// not using a path-based proxy, this will be an empty string. Never ends
 	// in a '/' (hence "cleaned").
@@ -266,3 +270,133 @@ type RunAuditListData struct {
 }
 
 var RunAuditListTemplate = templates.Lookup(templateFileNames["run-audit-list"])
+
+// DriftCurrentProject renders authoritative latest-state drift status.
+type DriftCurrentProject struct {
+	Repository            string
+	ProjectName           string
+	Directory             string
+	Workspace             string
+	Ref                   string
+	ResolvedCommit        string
+	Outcome               string
+	Stale                 bool
+	LastChecked           string
+	LastSuccessfulChecked string
+	Additions             int
+	Changes               int
+	Destructions          int
+	Imports               int
+	Forgets               int
+	Summary               string
+	Error                 string
+	DetectionPath         string
+	LastRemediationID     string
+	LastRemediationPath   string
+	LastRemediationStatus string
+	LastRemediationAt     string
+}
+
+// DriftDetectionRun renders one append-only detection summary.
+type DriftDetectionRun struct {
+	ID                string
+	RunPath           string
+	DetailPath        string
+	Repository        string
+	Ref               string
+	ResolvedCommit    string
+	Status            string
+	CompletedAt       string
+	TotalProjects     int
+	ProjectsWithDrift int
+	FailedProjects    int
+	LockedProjects    int
+	SkippedProjects   int
+}
+
+// DriftFilter preserves filter inputs in the current-status view.
+type DriftFilter struct {
+	Repository string
+	Ref        string
+	Outcome    string
+	Project    string
+	Directory  string
+	Workspace  string
+}
+
+// DriftHistoryListData renders current status and recent detections.
+type DriftHistoryListData struct {
+	AtlantisVersion       string
+	CleanedBasePath       string
+	Projects              []DriftCurrentProject
+	Detections            []DriftDetectionRun
+	Filter                DriftFilter
+	NextPath              string
+	PreviousPath          string
+	DetectionNextPath     string
+	DetectionPreviousPath string
+}
+
+var DriftHistoryListTemplate = templates.Lookup(templateFileNames["drift-history-list"])
+
+// DriftDetectionProject renders one immutable project detection outcome.
+type DriftDetectionProject struct {
+	ProjectName      string
+	Directory        string
+	Workspace        string
+	Outcome          string
+	LastChecked      string
+	Additions        int
+	Changes          int
+	Destructions     int
+	Imports          int
+	Forgets          int
+	Summary          string
+	Error            string
+	ArtifactKey      string
+	ArtifactChecksum string
+}
+
+// DriftDetectionDetailData renders one detection and its project page.
+type DriftDetectionDetailData struct {
+	AtlantisVersion string
+	CleanedBasePath string
+	Detection       DriftDetectionRun
+	Projects        []DriftDetectionProject
+	NextPath        string
+	PreviousPath    string
+}
+
+var DriftDetectionTemplate = templates.Lookup(templateFileNames["drift-detection"])
+
+// DriftRemediationProject renders one durable remediation project summary.
+type DriftRemediationProject struct {
+	ProjectName string
+	Directory   string
+	Workspace   string
+	Status      string
+	Error       string
+	Before      string
+	After       string
+}
+
+// DriftRemediationDetailData renders one remediation and links its Run output.
+type DriftRemediationDetailData struct {
+	AtlantisVersion string
+	CleanedBasePath string
+	ID              string
+	RunPath         string
+	Repository      string
+	Ref             string
+	Action          string
+	Status          string
+	StartedAt       string
+	CompletedAt     string
+	TotalProjects   int
+	SuccessCount    int
+	FailureCount    int
+	Error           string
+	Projects        []DriftRemediationProject
+}
+
+var DriftRemediationTemplate = templates.Lookup(templateFileNames["drift-remediation"])

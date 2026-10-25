@@ -8,9 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events/command"
@@ -155,6 +157,71 @@ func TestRunHistoryRecordsPartialRun(t *testing.T) {
 	lifecycle.Finish()
 
 	require.Equal(t, runs.StatusPartial, writer.runsCompleted[0].Status)
+}
+
+func TestRunHistoryPersistsSuppressedResultOutputWithoutPublicStream(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandDriftRemediation, runs.TriggerAPI)
+	projectCtx := history.beginProject(command.ProjectContext{
+		RunID: ctx.RunID, ProjectName: "network", RepoRelDir: "terraform/network",
+		Workspace: "production", Log: ctx.Log, SuppressJobOutput: true,
+	})
+	longOutput := strings.Repeat("é", resultOutputChunkBytes)
+	history.recordProject(projectCtx, command.Plan, command.ProjectCommandOutput{
+		PlanSuccess: &models.PlanSuccess{TerraformOutput: longOutput + "\x00"},
+	})
+	history.recordProject(projectCtx, command.Apply, command.ProjectCommandOutput{
+		ApplySuccess: "Apply complete! Resources: 1 added.",
+	})
+	lifecycle.Finish()
+
+	require.Len(t, writer.output, 4)
+	for i, chunk := range writer.output {
+		require.Equal(t, projectCtx.ProjectRunID, chunk.ProjectRunID)
+		require.Equal(t, int64(i), chunk.Sequence)
+		require.LessOrEqual(t, len(chunk.Content), resultOutputChunkBytes)
+		require.True(t, utf8.ValidString(chunk.Content))
+	}
+	require.Equal(t, runs.OutputStdout, writer.output[0].Stream)
+	require.Contains(t, writer.output[2].Content, "�")
+	require.Equal(t, "Apply complete! Resources: 1 added.\n", writer.output[3].Content)
+}
+
+func TestRunHistoryLeavesRunIncompleteWhenSuppressedOutputCannotPersist(t *testing.T) {
+	writer := &recordingRunWriter{appendOutputErr: errors.New("store unavailable")}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandDriftDetection, runs.TriggerAPI)
+	projectCtx := history.beginProject(command.ProjectContext{
+		RunID: ctx.RunID, ProjectName: "network", RepoRelDir: "terraform/network",
+		Workspace: "production", Log: ctx.Log, SuppressJobOutput: true,
+	})
+	history.recordProject(projectCtx, command.Plan, command.ProjectCommandOutput{
+		PlanSuccess: &models.PlanSuccess{TerraformOutput: "only durable copy"},
+	})
+
+	lifecycle.Finish()
+
+	require.Empty(t, writer.runsCompleted, "the running record must remain visibly incomplete")
+}
+
+func TestRunHistoryDoesNotDuplicateNormalStreamedOutput(t *testing.T) {
+	writer := &recordingRunWriter{}
+	history := newTestRunHistory(t, writer)
+	ctx := testRunContext(t)
+	lifecycle := history.Begin(ctx, runs.CommandPlan, runs.TriggerComment)
+	projectCtx := history.beginProject(command.ProjectContext{
+		RunID: ctx.RunID, ProjectName: "network", RepoRelDir: "terraform/network",
+		Workspace: "production", Log: ctx.Log,
+	})
+	history.recordProject(projectCtx, command.Plan, command.ProjectCommandOutput{
+		PlanSuccess: &models.PlanSuccess{TerraformOutput: "Plan: 1 to add."},
+	})
+	lifecycle.Finish()
+
+	require.Empty(t, writer.output)
 }
 
 func TestRunHistoryRecordsSkippedRunWithoutProjects(t *testing.T) {
@@ -312,6 +379,7 @@ type recordingRunWriter struct {
 	createProjectErr     error
 	completeProjectErr   error
 	completeProjectCalls int
+	appendOutputErr      error
 }
 
 func (w *recordingRunWriter) CreateRun(_ context.Context, run runs.Run) error {
@@ -366,6 +434,9 @@ func (incompleteOutputFinalizer) RunOutputComplete(runs.ID) bool { return false 
 var _ RunOutputFinalizer = incompleteOutputFinalizer{}
 
 func (w *recordingRunWriter) AppendOutput(_ context.Context, chunks []runs.OutputChunk) error {
+	if w.appendOutputErr != nil {
+		return w.appendOutputErr
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.output = append(w.output, chunks...)

@@ -11,8 +11,8 @@ Atlantis execution instance. Replica routing cannot be enabled with the queue.
 
 ## Configuration
 
-Configure PostgreSQL run storage, S3 plan storage, `--checkout-strategy=merge`,
-and authenticated web access before enabling the queue. Add this to the
+Configure PostgreSQL run storage, S3 plan storage with `--enable-external-stores`,
+`--checkout-strategy=merge`, and authenticated web access before enabling the queue. Add this to the
 [server-side repository configuration](server-side-repo-config.md):
 
 ```yaml

@@ -288,6 +288,9 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	executionDeploymentID := strings.TrimSpace(userConfig.ReplicaDeploymentID)
 	executionHeartbeat := time.Duration(userConfig.OwnershipTTLSeconds) * time.Second / 3
 	if globalCfg.Queue.Enabled {
+		if !userConfig.EnableExternalStores {
+			return nil, errors.New("apply queue requires --enable-external-stores")
+		}
 		if userConfig.RunStoreType != RunStorePostgres || globalCfg.ExternalStores.PlanStore.Type != "s3" || userConfig.CheckoutStrategy != "merge" || !userConfig.WebBasicAuth || disableApply {
 			return nil, errors.New("apply queue requires PostgreSQL run storage, S3 plans, merge checkout, authenticated web access, and apply commands")
 		}

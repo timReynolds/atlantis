@@ -1649,6 +1649,16 @@ ATLANTIS_SHARE_PLAN_DIR="path/to/local/plan/dir"
 
 Directory where Atlantis will store local Terraform plan files. If unset, this defaults to the resolved `--data-dir` value so existing installations keep the same on-disk layout. When set to a different directory, checked out repositories remain under `--data-dir` and generated `.tfplan` files use the same repo, pull request, workspace, and project path layout under `--share-plan-dir`.
 
+### `--shutdown-grace-period-seconds`
+
+```bash
+atlantis server --shutdown-grace-period-seconds=540
+# or
+ATLANTIS_SHUTDOWN_GRACE_PERIOD_SECONDS=540
+```
+
+Maximum time Atlantis allows accepted executable work to drain after SIGTERM. The default is `5` seconds. Configure this below the platform termination grace period so Atlantis retains time to persist final attempt and process state and stop Redis lease renewal. If work exceeds the deadline, an incomplete plan becomes `interrupted`; an execution with a recorded infrastructure-side-effect marker becomes `unknown` and is not automatically retried.
+
 ### `--silence-allowlist-errors` <Badge text="v0.28.0+" type="info"/>
 
 ```bash

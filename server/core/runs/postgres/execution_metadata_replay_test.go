@@ -42,14 +42,14 @@ func TestExecutionMetadataReplayJSONB(t *testing.T) {
 			run := runs.Run{ID: mustID(t), Repository: "org/infra", Command: runs.CommandPlan, Trigger: runs.TriggerComment, Status: runs.StatusPending, CreatedAt: now}
 			require.NoError(t, store.CreateRun(ctx, run))
 			attempt := runs.RunAttempt{ID: mustID(t), RunID: run.ID, InstanceID: instance.ID, DeploymentID: instance.DeploymentID, ConcurrencyKey: string(run.ID), OwnershipClaimID: "claim", Status: runs.AttemptClaimed, ClaimedAt: now, HeartbeatAt: now, Metadata: runs.Metadata(tc.metadata)}
-			require.NoError(t, store.CreateAttempt(ctx, attempt))
+			require.NoError(t, store.CreateAttempt(ctx, attempt, now.Add(-time.Hour)))
 			t.Run("admission", func(t *testing.T) {
-				require.NoError(t, store.CreateAttempt(ctx, attempt), "identical attempt replay after JSONB round trip")
+				require.NoError(t, store.CreateAttempt(ctx, attempt, now.Add(-time.Hour)), "identical attempt replay after JSONB round trip")
 				replay := attempt
 				replay.Metadata = runs.Metadata(tc.equivalent)
-				require.NoError(t, store.CreateAttempt(ctx, replay))
+				require.NoError(t, store.CreateAttempt(ctx, replay, now.Add(-time.Hour)))
 				replay.Metadata = runs.Metadata(tc.different)
-				require.ErrorIs(t, store.CreateAttempt(ctx, replay), runs.ErrConflict)
+				require.ErrorIs(t, store.CreateAttempt(ctx, replay, now.Add(-time.Hour)), runs.ErrConflict)
 			})
 			// Completion carries no metadata; its own replay contract must keep
 			// working for attempts whose metadata was normalized by PostgreSQL.

@@ -223,8 +223,11 @@ func (r AttemptTakeoverRequest) Validate() error {
 	if strings.TrimSpace(r.Repository) == "" {
 		return fmt.Errorf("takeover repository is required")
 	}
-	if r.PullNumber == nil || *r.PullNumber <= 0 {
+	if r.PullNumber != nil && *r.PullNumber <= 0 {
 		return fmt.Errorf("takeover pull number must be positive")
+	}
+	if r.PullNumber == nil && r.Trigger != TriggerAPI {
+		return fmt.Errorf("takeover pull number is required outside API execution")
 	}
 	if !r.Command.valid() {
 		return fmt.Errorf("invalid takeover command %q", r.Command)
@@ -261,7 +264,14 @@ type ExecutionWriter interface {
 	RegisterInstance(ctx context.Context, instance ExecutionInstance) error
 	HeartbeatInstance(ctx context.Context, id ID, heartbeatAt time.Time) error
 	StopInstance(ctx context.Context, id ID, stoppedAt time.Time) error
-	CreateAttempt(ctx context.Context, attempt RunAttempt) error
+	// supersedeStaleBefore bounds which existing attempt an admitted claim may
+	// steal: an active attempt under the same concurrency key with a different
+	// ownership claim is only superseded if its heartbeat predates this time.
+	// A claim mismatch alone is not proof of a legitimate takeover for callers
+	// (e.g. API-triggered work) whose claim IDs are not arbitrated by a single
+	// distributed lease, so a fresh, still-heartbeating attempt must block
+	// admission instead of being silently evicted.
+	CreateAttempt(ctx context.Context, attempt RunAttempt, supersedeStaleBefore time.Time) error
 	StartAttempt(ctx context.Context, id ID, startedAt time.Time) error
 	HeartbeatAttempt(ctx context.Context, id ID, heartbeatAt time.Time) error
 	MarkAttemptSideEffectStarted(ctx context.Context, id ID, startedAt time.Time) error

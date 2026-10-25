@@ -150,6 +150,7 @@ const (
 	RunStorePostgresURLFlag          = "run-store-postgres-url" // nolint: gosec
 	RunStoreRetentionDaysFlag        = "run-store-retention-days"
 	RunStoreTypeFlag                 = "run-store-type"
+	ShutdownGracePeriodSecondsFlag   = "shutdown-grace-period-seconds"
 	SilenceNoProjectsFlag            = "silence-no-projects"
 	SilenceForkPRErrorsFlag          = "silence-fork-pr-errors"
 	SilenceVCSStatusNoPlans          = "silence-vcs-status-no-plans"
@@ -217,6 +218,7 @@ const (
 	DefaultRunStoreOutputRetentionDays  = 90
 	DefaultRunStoreType                 = server.RunStoreNoop
 	DefaultOwnershipTTLSeconds          = 30
+	DefaultShutdownGracePeriodSeconds   = 5
 	DefaultTFDistribution               = TFDistributionTerraform
 	DefaultTFDownloadURL                = "https://releases.hashicorp.com"
 	DefaultTFDownload                   = true
@@ -766,6 +768,10 @@ var intFlags = map[string]intFlag{
 		description:  "TTL in seconds for renewable pull request ownership leases. This setting does not activate replica routing by itself.",
 		defaultValue: DefaultOwnershipTTLSeconds,
 	},
+	ShutdownGracePeriodSecondsFlag: {
+		description:  "Maximum seconds to drain executable work after SIGTERM before classifying unfinished attempts and stopping.",
+		defaultValue: DefaultShutdownGracePeriodSeconds,
+	},
 	PortFlag: {
 		description:  "Port to bind to.",
 		defaultValue: DefaultPort,
@@ -1124,6 +1130,9 @@ func (s *ServerCmd) setDefaults(c *server.UserConfig, v *viper.Viper) {
 	}
 	if c.OwnershipTTLSeconds == 0 {
 		c.OwnershipTTLSeconds = DefaultOwnershipTTLSeconds
+	}
+	if c.ShutdownGracePeriodSeconds == 0 {
+		c.ShutdownGracePeriodSeconds = DefaultShutdownGracePeriodSeconds
 	}
 	if c.TFDistribution != "" && c.DefaultTFDistribution == "" {
 		c.DefaultTFDistribution = c.TFDistribution

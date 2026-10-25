@@ -38,6 +38,10 @@ func TestStoreConformance(t *testing.T) {
 	defer cleanup()
 
 	createdAt := time.Now().UTC().Truncate(time.Microsecond)
+	// farFuture disables the takeover staleness gate for scenarios in this test
+	// that are not specifically exercising it; TestCreateAttemptRejectsFreshConflictingClaim
+	// covers the gate itself.
+	farFuture := createdAt.Add(24 * time.Hour)
 	runID := mustID(t)
 	projectRunID := mustID(t)
 	auditID := mustID(t)
@@ -76,14 +80,14 @@ func TestStoreConformance(t *testing.T) {
 		ConcurrencyKey: "sha256:conformance-pull", OwnershipClaimID: "claim-1",
 		Status: runs.AttemptClaimed, ClaimedAt: createdAt, HeartbeatAt: createdAt,
 	}
-	require.NoError(t, store.CreateAttempt(ctx, attempt))
-	require.NoError(t, store.CreateAttempt(ctx, attempt), "attempt replay must be idempotent")
+	require.NoError(t, store.CreateAttempt(ctx, attempt, farFuture))
+	require.NoError(t, store.CreateAttempt(ctx, attempt, farFuture), "attempt replay must be idempotent")
 	takeoverAttempt := attempt
 	takeoverAttempt.ID = mustID(t)
 	takeoverAttempt.OwnershipClaimID = "claim-2"
 	takeoverAttempt.ClaimedAt = createdAt.Add(500 * time.Millisecond)
 	takeoverAttempt.HeartbeatAt = takeoverAttempt.ClaimedAt
-	require.NoError(t, store.CreateAttempt(ctx, takeoverAttempt), "a new lease generation must retire its predecessor")
+	require.NoError(t, store.CreateAttempt(ctx, takeoverAttempt, farFuture), "a new lease generation must retire its predecessor")
 	interruptedAttempt, err := store.GetAttempt(ctx, attemptID)
 	require.NoError(t, err)
 	require.Equal(t, runs.AttemptInterrupted, interruptedAttempt.Status)
@@ -99,7 +103,7 @@ func TestStoreConformance(t *testing.T) {
 	otherAttempt.ID = mustID(t)
 	otherAttempt.InstanceID = otherInstance.ID
 	otherAttempt.DeploymentID = otherInstance.DeploymentID
-	require.NoError(t, store.CreateAttempt(ctx, otherAttempt), "another deployment may use the same concurrency key")
+	require.NoError(t, store.CreateAttempt(ctx, otherAttempt, farFuture), "another deployment may use the same concurrency key")
 	require.NoError(t, store.CompleteAttempt(ctx, runs.AttemptCompletion{
 		ID: otherAttempt.ID, Status: runs.AttemptInterrupted, CompletedAt: startedAt,
 		FailureReason: "conformance cleanup before execution",
@@ -116,14 +120,14 @@ func TestStoreConformance(t *testing.T) {
 	replacementAttempt := attempt
 	replacementAttempt.ID = mustID(t)
 	replacementAttempt.OwnershipClaimID = "claim-2"
-	require.ErrorIs(t, store.CreateAttempt(ctx, replacementAttempt), runs.ErrConflict,
+	require.ErrorIs(t, store.CreateAttempt(ctx, replacementAttempt, farFuture), runs.ErrConflict,
 		"unreconciled unknown apply must retain the durable admission fence")
 	reconciledAt := startedAt.Add(900 * time.Millisecond)
 	require.NoError(t, store.ReconcileAttempt(ctx, runs.AttemptReconciliation{
 		ID: attemptID, AuditEventID: mustID(t), At: reconciledAt, Actor: "operator",
 		Summary: "state inspected; fresh plan required",
 	}))
-	require.NoError(t, store.CreateAttempt(ctx, replacementAttempt),
+	require.NoError(t, store.CreateAttempt(ctx, replacementAttempt, farFuture),
 		"operator reconciliation must release the durable admission fence")
 	storedAttempt, err := store.GetAttempt(ctx, attemptID)
 	require.NoError(t, err)
@@ -242,6 +246,91 @@ func TestStoreConformance(t *testing.T) {
 	require.Len(t, auditPage.Events, 1)
 	require.NoError(t, store.StopInstance(ctx, instanceID, completedAt))
 
+	// A process that exits after durable claim admission but before command
+	// start leaves a claimed attempt. It is interrupted and the exact plan may
+	// reuse the logical Run.
+	claimedRunID := mustID(t)
+	claimedPull := 19
+	claimedRun := runs.Run{
+		ID: claimedRunID, Repository: "example/infrastructure", PullNumber: &claimedPull,
+		Command: runs.CommandPlan, Trigger: runs.TriggerComment, Actor: "operator",
+		BaseRef: "main", HeadRef: "claimed-plan", HeadSHA: "a11ce",
+		Status: runs.StatusRunning, CreatedAt: completedAt, StartedAt: &completedAt,
+	}
+	require.NoError(t, store.CreateRun(ctx, claimedRun))
+	claimedInstanceID := mustID(t)
+	require.NoError(t, store.RegisterInstance(ctx, runs.ExecutionInstance{
+		ID: claimedInstanceID, ReplicaID: "atlantis-claimed", DeploymentID: "conformance",
+		StartedAt: completedAt, HeartbeatAt: completedAt,
+	}))
+	claimedAttemptID := mustID(t)
+	require.NoError(t, store.CreateAttempt(ctx, runs.RunAttempt{
+		ID: claimedAttemptID, RunID: claimedRunID, InstanceID: claimedInstanceID,
+		DeploymentID:   "conformance",
+		ConcurrencyKey: "sha256:claimed-plan", OwnershipClaimID: "claimed-old",
+		Status: runs.AttemptClaimed, ClaimedAt: completedAt, HeartbeatAt: completedAt,
+	}, farFuture))
+	duplicateAttemptErr := store.CreateAttempt(ctx, runs.RunAttempt{
+		ID: mustID(t), RunID: claimedRunID, InstanceID: claimedInstanceID,
+		DeploymentID:   "conformance",
+		ConcurrencyKey: "sha256:claimed-plan", OwnershipClaimID: "claimed-old",
+		Status: runs.AttemptClaimed, ClaimedAt: completedAt, HeartbeatAt: completedAt,
+	}, farFuture)
+	require.ErrorIs(t, duplicateAttemptErr, runs.ErrConflict,
+		"a duplicate delivery cannot create overlapping active work")
+	claimedRecoveredAt := completedAt.Add(2 * time.Minute)
+	claimedTakeover, err := store.PrepareAttemptTakeover(ctx, runs.AttemptTakeoverRequest{
+		DeploymentID: "conformance", ConcurrencyKey: "sha256:claimed-plan", OwnershipClaimID: "claimed-new",
+		HeartbeatBefore: claimedRecoveredAt.Add(-time.Minute), RecoveredAt: claimedRecoveredAt,
+		Repository: claimedRun.Repository, PullNumber: &claimedPull, Command: claimedRun.Command,
+		Trigger: claimedRun.Trigger, Actor: claimedRun.Actor, BaseRef: claimedRun.BaseRef,
+		HeadRef: claimedRun.HeadRef, HeadSHA: claimedRun.HeadSHA,
+	})
+	require.NoError(t, err)
+	require.Equal(t, runs.AttemptInterrupted, claimedTakeover.RecoveredAttempt.Status)
+	require.Equal(t, claimedRunID, claimedTakeover.RetryRun.ID)
+
+	// An apply interrupted before the durable mutation marker is not unknown,
+	// but it is also never converted into an automatic retry of the same Run.
+	preApplyRunID := mustID(t)
+	preApplyPull := 21
+	preApplyCreatedAt := claimedRecoveredAt.Add(time.Second)
+	preApplyRun := runs.Run{
+		ID: preApplyRunID, Repository: "example/infrastructure", PullNumber: &preApplyPull,
+		Command: runs.CommandApply, Trigger: runs.TriggerComment, Actor: "operator",
+		BaseRef: "main", HeadRef: "pre-apply", HeadSHA: "b4apply",
+		Status: runs.StatusRunning, CreatedAt: preApplyCreatedAt, StartedAt: &preApplyCreatedAt,
+	}
+	require.NoError(t, store.CreateRun(ctx, preApplyRun))
+	preApplyInstanceID := mustID(t)
+	require.NoError(t, store.RegisterInstance(ctx, runs.ExecutionInstance{
+		ID: preApplyInstanceID, ReplicaID: "atlantis-pre-apply", DeploymentID: "conformance",
+		StartedAt: preApplyCreatedAt, HeartbeatAt: preApplyCreatedAt,
+	}))
+	preApplyAttemptID := mustID(t)
+	require.NoError(t, store.CreateAttempt(ctx, runs.RunAttempt{
+		ID: preApplyAttemptID, RunID: preApplyRunID, InstanceID: preApplyInstanceID,
+		DeploymentID:   "conformance",
+		ConcurrencyKey: "sha256:pre-apply", OwnershipClaimID: "pre-apply-old",
+		Status: runs.AttemptClaimed, ClaimedAt: preApplyCreatedAt, HeartbeatAt: preApplyCreatedAt,
+	}, farFuture))
+	require.NoError(t, store.StartAttempt(ctx, preApplyAttemptID, preApplyCreatedAt))
+	preApplyRecoveredAt := preApplyCreatedAt.Add(2 * time.Minute)
+	preApplyTakeover, err := store.PrepareAttemptTakeover(ctx, runs.AttemptTakeoverRequest{
+		DeploymentID: "conformance", ConcurrencyKey: "sha256:pre-apply", OwnershipClaimID: "pre-apply-new",
+		HeartbeatBefore: preApplyRecoveredAt.Add(-time.Minute), RecoveredAt: preApplyRecoveredAt,
+		Repository: preApplyRun.Repository, PullNumber: &preApplyPull, Command: preApplyRun.Command,
+		Trigger: preApplyRun.Trigger, Actor: preApplyRun.Actor, BaseRef: preApplyRun.BaseRef,
+		HeadRef: preApplyRun.HeadRef, HeadSHA: preApplyRun.HeadSHA,
+	})
+	require.NoError(t, err)
+	require.Equal(t, runs.AttemptInterrupted, preApplyTakeover.RecoveredAttempt.Status)
+	require.Nil(t, preApplyTakeover.RetryRun)
+	require.Nil(t, preApplyTakeover.UnreconciledUnknown)
+	storedPreApplyRun, err := store.GetRun(ctx, preApplyRunID)
+	require.NoError(t, err)
+	require.Equal(t, runs.StatusFailed, storedPreApplyRun.Status)
+
 	// A stale plan attempt under an older Redis claim is interrupted and a
 	// duplicate delivery reuses the same logical Run while preserving both
 	// attempts and both sets of project results.
@@ -267,7 +356,7 @@ func TestStoreConformance(t *testing.T) {
 		DeploymentID:   "conformance",
 		ConcurrencyKey: "sha256:retry-plan", OwnershipClaimID: "old-plan-claim",
 		Status: runs.AttemptClaimed, ClaimedAt: retryCreatedAt, HeartbeatAt: retryCreatedAt,
-	}))
+	}, farFuture))
 	require.NoError(t, store.StartAttempt(ctx, staleAttemptID, retryStartedAt))
 	staleProjectID := mustID(t)
 	require.NoError(t, store.CreateProjectRun(ctx, runs.ProjectRun{
@@ -275,6 +364,17 @@ func TestStoreConformance(t *testing.T) {
 		ProjectName: "network", Directory: "terraform/network", Workspace: "production",
 		Status: runs.StatusRunning, StartedAt: &retryStartedAt,
 	}))
+	liveTakeover, err := store.PrepareAttemptTakeover(ctx, runs.AttemptTakeoverRequest{
+		DeploymentID: "conformance", ConcurrencyKey: "sha256:retry-plan", OwnershipClaimID: "premature-plan-claim",
+		HeartbeatBefore: retryStartedAt.Add(-time.Second), RecoveredAt: retryStartedAt.Add(time.Second),
+		Repository: retryRun.Repository, PullNumber: &retryPull, Command: retryRun.Command,
+		Trigger: retryRun.Trigger, Actor: retryRun.Actor, BaseRef: retryRun.BaseRef,
+		HeadRef: retryRun.HeadRef, HeadSHA: retryRun.HeadSHA,
+	})
+	require.NoError(t, err)
+	require.Equal(t, staleAttemptID, liveTakeover.ActiveAttempt.ID,
+		"Redis lease movement alone must not overlap a process with a fresh PostgreSQL heartbeat")
+	require.Nil(t, liveTakeover.RecoveredAttempt)
 	recoveredAt := retryStartedAt.Add(2 * time.Minute)
 	takeover, err := store.PrepareAttemptTakeover(ctx, runs.AttemptTakeoverRequest{
 		DeploymentID: "conformance", ConcurrencyKey: "sha256:retry-plan", OwnershipClaimID: "new-plan-claim",
@@ -291,6 +391,17 @@ func TestStoreConformance(t *testing.T) {
 	staleProject, err := store.GetProjectRun(ctx, staleProjectID)
 	require.NoError(t, err)
 	require.Equal(t, runs.StatusFailed, staleProject.Status)
+	gracefulRetry, err := store.PrepareAttemptTakeover(ctx, runs.AttemptTakeoverRequest{
+		DeploymentID: "conformance", ConcurrencyKey: "sha256:retry-plan", OwnershipClaimID: "newer-plan-claim",
+		HeartbeatBefore: recoveredAt.Add(-time.Minute), RecoveredAt: recoveredAt.Add(time.Second),
+		Repository: retryRun.Repository, PullNumber: &retryPull, Command: retryRun.Command,
+		Trigger: retryRun.Trigger, Actor: retryRun.Actor, BaseRef: retryRun.BaseRef,
+		HeadRef: retryRun.HeadRef, HeadSHA: retryRun.HeadSHA,
+	})
+	require.NoError(t, err)
+	require.Equal(t, retryRunID, gracefulRetry.RetryRun.ID,
+		"an already interrupted graceful-shutdown plan must retain its logical Run")
+	require.Equal(t, staleAttemptID, gracefulRetry.RecoveredAttempt.ID)
 
 	replacementInstanceID := mustID(t)
 	require.NoError(t, store.RegisterInstance(ctx, runs.ExecutionInstance{
@@ -303,7 +414,7 @@ func TestStoreConformance(t *testing.T) {
 		DeploymentID:   "conformance",
 		ConcurrencyKey: "sha256:retry-plan", OwnershipClaimID: "new-plan-claim",
 		Status: runs.AttemptClaimed, ClaimedAt: recoveredAt, HeartbeatAt: recoveredAt,
-	}))
+	}, farFuture))
 	require.NoError(t, store.StartAttempt(ctx, replacementAttemptID, recoveredAt))
 	replacementProjectID := mustID(t)
 	require.NoError(t, store.CreateProjectRun(ctx, runs.ProjectRun{
@@ -328,6 +439,46 @@ func TestStoreConformance(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, retryProjects.ProjectRuns, 2)
 
+	// A preserved interrupted plan can only retain its logical Run when the
+	// replacement request is the exact same operation. A newer ref must
+	// terminalize the old Run before creating a different logical operation.
+	mismatchCreatedAt := retryCompletedAt.Add(500 * time.Millisecond)
+	mismatchRunID := mustID(t)
+	mismatchPull := 24
+	mismatchRun := runs.Run{
+		ID: mismatchRunID, Repository: "example/infrastructure", PullNumber: &mismatchPull,
+		Command: runs.CommandPlan, Trigger: runs.TriggerComment, Actor: "operator",
+		BaseRef: "main", HeadRef: "interrupted-plan", HeadSHA: "old-commit",
+		Status: runs.StatusRunning, CreatedAt: mismatchCreatedAt, StartedAt: &mismatchCreatedAt,
+	}
+	require.NoError(t, store.CreateRun(ctx, mismatchRun))
+	mismatchAttemptID := mustID(t)
+	require.NoError(t, store.CreateAttempt(ctx, runs.RunAttempt{
+		ID: mismatchAttemptID, RunID: mismatchRunID, InstanceID: staleInstanceID,
+		DeploymentID: "conformance", ConcurrencyKey: "sha256:mismatched-plan",
+		OwnershipClaimID: "old-mismatch-claim", Status: runs.AttemptClaimed,
+		ClaimedAt: mismatchCreatedAt, HeartbeatAt: mismatchCreatedAt,
+	}, farFuture))
+	require.NoError(t, store.StartAttempt(ctx, mismatchAttemptID, mismatchCreatedAt))
+	mismatchInterruptedAt := mismatchCreatedAt.Add(time.Second)
+	require.NoError(t, store.CompleteAttempt(ctx, runs.AttemptCompletion{
+		ID: mismatchAttemptID, Status: runs.AttemptInterrupted, CompletedAt: mismatchInterruptedAt,
+		FailureReason: "graceful shutdown deadline expired before a side effect",
+	}))
+	mismatchRecovery, err := store.PrepareAttemptTakeover(ctx, runs.AttemptTakeoverRequest{
+		DeploymentID: "conformance", ConcurrencyKey: "sha256:mismatched-plan", OwnershipClaimID: "new-mismatch-claim",
+		HeartbeatBefore: mismatchInterruptedAt, RecoveredAt: mismatchInterruptedAt.Add(time.Second),
+		Repository: mismatchRun.Repository, PullNumber: &mismatchPull, Command: mismatchRun.Command,
+		Trigger: mismatchRun.Trigger, Actor: mismatchRun.Actor, BaseRef: mismatchRun.BaseRef,
+		HeadRef: mismatchRun.HeadRef, HeadSHA: "new-commit",
+	})
+	require.NoError(t, err)
+	require.Nil(t, mismatchRecovery.RetryRun)
+	require.Equal(t, mismatchAttemptID, mismatchRecovery.RecoveredAttempt.ID)
+	storedMismatchRun, err := store.GetRun(ctx, mismatchRunID)
+	require.NoError(t, err)
+	require.Equal(t, runs.StatusFailed, storedMismatchRun.Status)
+
 	// Older releases completed the Run before terminalizing its attempt. A
 	// takeover repairs that ordering idempotently instead of blocking forever.
 	terminalCreatedAt := retryCompletedAt.Add(time.Second)
@@ -351,7 +502,7 @@ func TestStoreConformance(t *testing.T) {
 		DeploymentID: "conformance", ConcurrencyKey: "sha256:terminal-parent",
 		OwnershipClaimID: "old-terminal-claim", Status: runs.AttemptClaimed,
 		ClaimedAt: terminalCreatedAt, HeartbeatAt: terminalCreatedAt,
-	}))
+	}, farFuture))
 	require.NoError(t, store.StartAttempt(ctx, terminalAttemptID, terminalCreatedAt))
 	terminalCompletedAt := terminalCreatedAt.Add(time.Minute)
 	require.NoError(t, store.CompleteRun(ctx, runs.RunCompletion{
@@ -396,7 +547,7 @@ func TestStoreConformance(t *testing.T) {
 		DeploymentID:   "conformance",
 		ConcurrencyKey: "sha256:unknown-apply", OwnershipClaimID: "old-apply-claim",
 		Status: runs.AttemptClaimed, ClaimedAt: unknownCreatedAt, HeartbeatAt: unknownCreatedAt,
-	}))
+	}, farFuture))
 	require.NoError(t, store.StartAttempt(ctx, unknownAttemptID, unknownCreatedAt))
 	require.NoError(t, store.MarkAttemptSideEffectStarted(ctx, unknownAttemptID, unknownCreatedAt))
 	unknownRecoveredAt := unknownCreatedAt.Add(2 * time.Minute)
@@ -430,7 +581,7 @@ func TestStoreConformance(t *testing.T) {
 		DeploymentID: "conformance", ConcurrencyKey: "sha256:unknown-apply",
 		OwnershipClaimID: "fresh-plan-claim", Status: runs.AttemptClaimed,
 		ClaimedAt: unknownRecoveredAt, HeartbeatAt: unknownRecoveredAt,
-	}))
+	}, farFuture))
 	require.NoError(t, store.CompleteAttempt(ctx, runs.AttemptCompletion{
 		ID: freshPlanAttemptID, Status: runs.AttemptInterrupted,
 		CompletedAt: unknownRecoveredAt.Add(time.Millisecond), FailureReason: "test plan admission completed",
@@ -447,7 +598,7 @@ func TestStoreConformance(t *testing.T) {
 		DeploymentID: "conformance", ConcurrencyKey: "sha256:unknown-apply",
 		OwnershipClaimID: "blocked-apply-claim", Status: runs.AttemptClaimed,
 		ClaimedAt: unknownRecoveredAt, HeartbeatAt: unknownRecoveredAt,
-	}), runs.ErrConflict)
+	}, farFuture), runs.ErrConflict)
 
 	stillBlocked, err := store.PrepareAttemptTakeover(ctx, unknownRequest)
 	require.NoError(t, err)
@@ -471,7 +622,7 @@ func TestStoreConformance(t *testing.T) {
 		RunMetadataBefore: &retentionCutoff,
 	})
 	require.NoError(t, err)
-	require.Equal(t, int64(3), retention.RunsDeleted)
+	require.Equal(t, int64(5), retention.RunsDeleted)
 	require.Equal(t, int64(2), retention.ProjectRunsDeleted)
 	require.Equal(t, int64(0), retention.OutputChunksDeleted)
 	_, err = store.GetRun(ctx, runID)
@@ -517,6 +668,7 @@ func TestAttemptTakeoverFinalizesSupersededRun(t *testing.T) {
 
 			createdAt := time.Now().UTC().Truncate(time.Microsecond)
 			startedAt := createdAt.Add(time.Second)
+			farFuture := createdAt.Add(24 * time.Hour)
 			oldRunID, newRunID := mustID(t), mustID(t)
 			for _, runID := range []runs.ID{oldRunID, newRunID} {
 				run := runs.Run{
@@ -538,7 +690,7 @@ func TestAttemptTakeoverFinalizesSupersededRun(t *testing.T) {
 				OwnershipClaimID: "claim-1", Status: runs.AttemptClaimed,
 				ClaimedAt: createdAt, HeartbeatAt: createdAt,
 			}
-			require.NoError(t, store.CreateAttempt(ctx, oldAttempt))
+			require.NoError(t, store.CreateAttempt(ctx, oldAttempt, farFuture))
 			require.NoError(t, store.StartAttempt(ctx, oldAttemptID, startedAt))
 			projectRunID := mustID(t)
 			require.NoError(t, store.CreateProjectRun(ctx, runs.ProjectRun{
@@ -556,7 +708,7 @@ func TestAttemptTakeoverFinalizesSupersededRun(t *testing.T) {
 				DeploymentID: "takeover-test", ConcurrencyKey: "sha256:pull",
 				OwnershipClaimID: "claim-2", Status: runs.AttemptClaimed,
 				ClaimedAt: takeoverAt, HeartbeatAt: takeoverAt,
-			})
+			}, farFuture)
 			expectedCompletedAt := startedAt
 			if test.sideEffectStarted {
 				require.ErrorIs(t, createErr, runs.ErrConflict)
@@ -584,7 +736,81 @@ func TestAttemptTakeoverFinalizesSupersededRun(t *testing.T) {
 	}
 }
 
-func newIsolatedStore(t *testing.T, ctx context.Context, rawURL string) (*postgres.Store, func()) {
+// TestCreateAttemptRejectsFreshConflictingClaim guards the durable admission
+// fence for callers whose ownership claim IDs are not arbitrated by a single
+// distributed lease (e.g. API-triggered work, which mints a fresh claim ID
+// per request). A claim mismatch alone must not be treated as proof of a
+// legitimate takeover: only a claim whose predecessor has gone stale (no
+// heartbeat inside the caller's recovery window) may supersede it. Otherwise
+// two concurrent requests for the same concurrency key could each believe
+// they hold the sole active attempt and both proceed into Terraform.
+func TestCreateAttemptRejectsFreshConflictingClaim(t *testing.T) {
+	if testing.Short() {
+		t.Skip("PostgreSQL conformance test is disabled in short mode")
+	}
+	testURL := os.Getenv("ATLANTIS_POSTGRES_TEST_URL")
+	if testURL == "" {
+		t.Skip("ATLANTIS_POSTGRES_TEST_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, cleanup := newIsolatedStore(t, ctx, testURL)
+	defer cleanup()
+
+	createdAt := time.Now().UTC().Truncate(time.Microsecond)
+	runID := mustID(t)
+	run := runs.Run{
+		ID: runID, Repository: "example/infrastructure", Command: runs.CommandApply,
+		Trigger: runs.TriggerAPI, Status: runs.StatusPending, CreatedAt: createdAt,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+	instanceID := mustID(t)
+	require.NoError(t, store.RegisterInstance(ctx, runs.ExecutionInstance{
+		ID: instanceID, ReplicaID: "atlantis-0", DeploymentID: "api-claim-test",
+		StartedAt: createdAt, HeartbeatAt: createdAt,
+	}))
+
+	firstAttemptID := mustID(t)
+	firstAttempt := runs.RunAttempt{
+		ID: firstAttemptID, RunID: runID, InstanceID: instanceID,
+		DeploymentID: "api-claim-test", ConcurrencyKey: "sha256:api-ref",
+		OwnershipClaimID: "api:first-request", Status: runs.AttemptClaimed,
+		ClaimedAt: createdAt, HeartbeatAt: createdAt,
+	}
+	require.NoError(t, store.CreateAttempt(ctx, firstAttempt, createdAt.Add(24*time.Hour)))
+
+	// A second, unrelated pseudo-claim for the same concurrency key arrives
+	// while the first attempt is still fresh (heartbeat not before the
+	// caller's recovery window). It must not be able to steal admission.
+	secondRunID := mustID(t)
+	require.NoError(t, store.CreateRun(ctx, runs.Run{
+		ID: secondRunID, Repository: "example/infrastructure", Command: runs.CommandApply,
+		Trigger: runs.TriggerAPI, Status: runs.StatusPending, CreatedAt: createdAt,
+	}))
+	secondAttempt := runs.RunAttempt{
+		ID: mustID(t), RunID: secondRunID, InstanceID: instanceID,
+		DeploymentID: "api-claim-test", ConcurrencyKey: "sha256:api-ref",
+		OwnershipClaimID: "api:second-request", Status: runs.AttemptClaimed,
+		ClaimedAt: createdAt.Add(time.Second), HeartbeatAt: createdAt.Add(time.Second),
+	}
+	require.ErrorIs(t, store.CreateAttempt(ctx, secondAttempt, createdAt), runs.ErrConflict,
+		"a fresh conflicting claim must not be able to supersede a still-healthy attempt")
+
+	stillActive, err := store.GetAttempt(ctx, firstAttemptID)
+	require.NoError(t, err)
+	require.Equal(t, runs.AttemptClaimed, stillActive.Status,
+		"the first attempt must remain the sole active attempt when the rejection fires")
+
+	// Once the first attempt has genuinely gone stale (its heartbeat predates
+	// the caller's recovery window), a new claim may legitimately take over.
+	require.NoError(t, store.CreateAttempt(ctx, secondAttempt, createdAt.Add(time.Hour)))
+	superseded, err := store.GetAttempt(ctx, firstAttemptID)
+	require.NoError(t, err)
+	require.Equal(t, runs.AttemptInterrupted, superseded.Status,
+		"a genuinely stale attempt remains eligible for takeover")
+}
+
+func newIsolatedStore(t testing.TB, ctx context.Context, rawURL string) (*postgres.Store, func()) {
 	t.Helper()
 	parsed, err := url.Parse(rawURL)
 	require.NoError(t, err)

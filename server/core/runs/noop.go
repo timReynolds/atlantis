@@ -34,7 +34,7 @@ func (NoopStore) HeartbeatInstance(context.Context, ID, time.Time) error { retur
 
 func (NoopStore) StopInstance(context.Context, ID, time.Time) error { return nil }
 
-func (NoopStore) CreateAttempt(context.Context, RunAttempt) error { return nil }
+func (NoopStore) CreateAttempt(context.Context, RunAttempt, time.Time) error { return nil }
 
 func (NoopStore) StartAttempt(context.Context, ID, time.Time) error { return nil }
 

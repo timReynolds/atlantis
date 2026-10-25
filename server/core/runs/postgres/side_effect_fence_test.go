@@ -21,7 +21,7 @@ func TestPlanSideEffectRequiresUnknownAttemptReconciliation(t *testing.T) {
 			ctx, store := sideEffectFenceStore(t)
 			now := time.Now().UTC().Truncate(time.Microsecond)
 			old := sideEffectFenceAttempt(t, ctx, store, runs.CommandApply, "deployment", "pull", now)
-			require.NoError(t, store.CreateAttempt(ctx, old))
+			require.NoError(t, store.CreateAttempt(ctx, old, now))
 			require.NoError(t, store.StartAttempt(ctx, old.ID, now))
 			require.NoError(t, store.MarkAttemptSideEffectStarted(ctx, old.ID, now))
 			require.NoError(t, store.MarkAttemptSideEffectStarted(ctx, old.ID, now), "same-attempt marker replay is idempotent")
@@ -33,7 +33,7 @@ func TestPlanSideEffectRequiresUnknownAttemptReconciliation(t *testing.T) {
 			}
 
 			plan := sideEffectFenceAttempt(t, ctx, store, runs.CommandPlan, "deployment", "pull", now.Add(2*time.Second))
-			require.NoError(t, store.CreateAttempt(ctx, plan), "read-only plans remain available for reconciliation")
+			require.NoError(t, store.CreateAttempt(ctx, plan, now.Add(time.Second)), "read-only plans remain available for reconciliation")
 			require.NoError(t, store.StartAttempt(ctx, plan.ID, plan.ClaimedAt))
 			markerAt := now.Add(3 * time.Second)
 			require.ErrorIs(t, store.MarkAttemptSideEffectStarted(ctx, plan.ID, markerAt), runs.ErrConflict)
@@ -46,7 +46,7 @@ func TestPlanSideEffectRequiresUnknownAttemptReconciliation(t *testing.T) {
 
 			for _, scope := range []struct{ deployment, key string }{{"deployment", "other-pull"}, {"other-deployment", "pull"}} {
 				other := sideEffectFenceAttempt(t, ctx, store, runs.CommandPlan, scope.deployment, scope.key, markerAt)
-				require.NoError(t, store.CreateAttempt(ctx, other))
+				require.NoError(t, store.CreateAttempt(ctx, other, now))
 				require.NoError(t, store.StartAttempt(ctx, other.ID, markerAt))
 				require.NoError(t, store.MarkAttemptSideEffectStarted(ctx, other.ID, markerAt), "unknown fence is scoped to deployment and concurrency key")
 			}
@@ -69,7 +69,7 @@ func TestSideEffectMarkerSerializesWithAttemptTakeover(t *testing.T) {
 	for i := range 20 {
 		key := fmt.Sprintf("pull-%d", i)
 		old := sideEffectFenceAttempt(t, ctx, store, runs.CommandPlan, "deployment", key, now)
-		require.NoError(t, store.CreateAttempt(ctx, old))
+		require.NoError(t, store.CreateAttempt(ctx, old, now))
 		require.NoError(t, store.StartAttempt(ctx, old.ID, now))
 		replacement := sideEffectFenceAttempt(t, ctx, store, runs.CommandPlan, "deployment", key, now.Add(time.Minute))
 		start := make(chan struct{})
@@ -81,7 +81,7 @@ func TestSideEffectMarkerSerializesWithAttemptTakeover(t *testing.T) {
 		}()
 		go func() {
 			<-start
-			admitted <- store.CreateAttempt(ctx, replacement)
+			admitted <- store.CreateAttempt(ctx, replacement, now.Add(time.Minute))
 		}()
 		close(start)
 		markErr, admitErr := <-marked, <-admitted

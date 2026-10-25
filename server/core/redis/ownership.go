@@ -76,8 +76,14 @@ type OwnerStore struct {
 	renewalFailureSince time.Time
 	lastRenewalErr      error
 
-	cancel context.CancelFunc
-	done   chan struct{}
+	renewalCtx context.Context
+	cancel     context.CancelFunc
+	done       chan struct{}
+
+	// admissionMu fences synchronous renewals as well as the background loop.
+	// Stop waits for admitted requests before allowing durable classification.
+	admissionMu sync.RWMutex
+	stopped     bool
 
 	closeOnce sync.Once
 	closeErr  error
@@ -123,6 +129,7 @@ func NewOwnerStoreWithClient(client redislib.Cmdable, config OwnerStoreConfig, l
 		logger:     logger,
 		instanceID: instanceID,
 		owned:      make(map[string]ownedRecord),
+		renewalCtx: loopCtx,
 		cancel:     cancel,
 		done:       make(chan struct{}),
 	}
@@ -180,6 +187,11 @@ func (s *OwnerStore) Claim(ctx context.Context, key ownership.Key) (ownership.Re
 
 // Admit renews the exact local claim only when Redis still contains it.
 func (s *OwnerStore) Admit(ctx context.Context, key ownership.Key, claimID string) (bool, error) {
+	s.admissionMu.RLock()
+	defer s.admissionMu.RUnlock()
+	if s.stopped {
+		return false, nil
+	}
 	redisKey, err := redisOwnershipKey(s.config.DeploymentID, key)
 	if err != nil {
 		return false, err
@@ -190,7 +202,17 @@ func (s *OwnerStore) Admit(ctx context.Context, key ownership.Key, claimID strin
 	if !ok || owned.record.InstanceID != s.instanceID || owned.record.ClaimID != claimID {
 		return false, nil
 	}
-	return s.renewSerialized(ctx, redisKey, owned.serialized)
+	// Link command-driven renewals to the same lifetime as the background
+	// loop. Shutdown must cancel an in-flight Redis request before waiting
+	// for its admission lock, even when the caller has no deadline.
+	renewalCtx, cancel := context.WithCancel(ctx)
+	stopCancel := context.AfterFunc(s.renewalCtx, cancel)
+	defer stopCancel()
+	defer cancel()
+	if err := s.renewalCtx.Err(); err != nil {
+		return false, err
+	}
+	return s.renewSerialized(renewalCtx, redisKey, owned.serialized)
 }
 
 // Current returns the current live ownership record, if one exists.
@@ -268,10 +290,27 @@ func (s *OwnerStore) Ready(ctx context.Context) error {
 
 // Close stops renewal and releases claims still owned by this process.
 func (s *OwnerStore) Close() error {
+	return s.stop(true)
+}
+
+// Abandon stops renewal without releasing claims. Shutdown uses this when
+// Terraform did not drain before the termination deadline, so another replica
+// cannot begin until the existing leases expire naturally.
+func (s *OwnerStore) Abandon() error {
+	return s.stop(false)
+}
+
+func (s *OwnerStore) stop(release bool) error {
 	s.closeOnce.Do(func() {
 		s.BeginDrain()
 		s.cancel()
+		s.admissionMu.Lock()
+		s.stopped = true
+		s.admissionMu.Unlock()
 		<-s.done
+		if !release {
+			return
+		}
 
 		s.mu.RLock()
 		owned := make(map[string]ownedRecord, len(s.owned))

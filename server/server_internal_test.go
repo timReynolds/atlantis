@@ -14,7 +14,10 @@ import (
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/db/mocks"
 	"github.com/runatlantis/atlantis/server/core/ownership"
+	"github.com/runatlantis/atlantis/server/core/runs"
 	"github.com/runatlantis/atlantis/server/events"
+	"github.com/runatlantis/atlantis/server/events/command"
+	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/logging"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
@@ -61,6 +64,49 @@ func TestServer_ShutdownCompletesCleanupAfterHTTPTimeout(t *testing.T) {
 	assert.Equal(t, []string{"begin-drain", "http-shutdown", "command-wait", "owner-close"}, calls)
 }
 
+func TestServer_ShutdownAbandonsClaimsWhenAcceptedCommandMissesDeadline(t *testing.T) {
+	var calls []string
+	owners := &shutdownOwnerStore{calls: &calls}
+	waiter := &blockingCommandWaiter{started: make(chan struct{}), release: make(chan struct{})}
+	s := &Server{
+		OwnerStore:            owners,
+		commandExecutorWaiter: waiter,
+		executionInstance:     &recordingExecutionInstanceLifecycle{calls: &calls},
+		Drainer:               &events.Drainer{},
+		Logger:                logging.NewNoopLogger(t),
+	}
+
+	assert.NoError(t, s.shutdown(&recordingHTTPShutdowner{calls: &calls}, 10*time.Millisecond))
+	<-waiter.started
+	close(waiter.release)
+	assert.Equal(t, []string{"begin-drain", "http-shutdown", "owner-abandon", "instance-stop"}, calls)
+}
+
+func TestServer_ShutdownAbandonsClaimsForActiveAPILifecycle(t *testing.T) {
+	var calls []string
+	logger := logging.NewNoopLogger(t)
+	history := events.NewRunHistory(runs.NoopStore{}, logger)
+	ctx := &command.Context{
+		Log: logger, User: models.User{Username: "operator"},
+		Pull: models.PullRequest{
+			Num: 42, BaseBranch: "main", HeadBranch: "feature", HeadCommit: "abc123",
+			BaseRepo: models.Repo{FullName: "org/repo", Owner: "org", Name: "repo"},
+		},
+	}
+	lifecycle := history.Begin(ctx, runs.CommandApply, runs.TriggerAPI)
+	assert.True(t, history.HasActiveExecutions())
+
+	owners := &shutdownOwnerStore{calls: &calls}
+	s := &Server{
+		OwnerStore: owners, Drainer: &events.Drainer{}, Logger: logger, runHistory: history,
+	}
+	assert.NoError(t, s.shutdown(&recordingHTTPShutdowner{calls: &calls, err: context.DeadlineExceeded}, time.Second))
+	lifecycle.Finish()
+
+	assert.False(t, history.HasActiveExecutions())
+	assert.Equal(t, []string{"begin-drain", "http-shutdown", "owner-abandon"}, calls)
+}
+
 type recordingHTTPShutdowner struct {
 	calls *[]string
 	err   error
@@ -72,6 +118,16 @@ type recordingCommandWaiter struct {
 
 type recordingExecutionInstanceLifecycle struct {
 	calls *[]string
+}
+
+type blockingCommandWaiter struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (w *blockingCommandWaiter) Wait() {
+	close(w.started)
+	<-w.release
 }
 
 func (s *recordingExecutionInstanceLifecycle) Start(context.Context) error { return nil }
@@ -113,6 +169,10 @@ func (s *shutdownOwnerStore) BeginDrain() {
 func (s *shutdownOwnerStore) Ready(context.Context) error { return nil }
 func (s *shutdownOwnerStore) Close() error {
 	*s.calls = append(*s.calls, "owner-close")
+	return nil
+}
+func (s *shutdownOwnerStore) Abandon() error {
+	*s.calls = append(*s.calls, "owner-abandon")
 	return nil
 }
 

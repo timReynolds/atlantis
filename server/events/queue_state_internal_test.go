@@ -27,9 +27,13 @@ type queueStateTerraform struct {
 	output string
 	err    error
 	envs   map[string]string
+	onRun  func()
 }
 
 func (f *queueStateTerraform) RunCommandWithVersion(_ command.ProjectContext, _ string, _ []string, envs map[string]string, _ terraform.Distribution, _ *version.Version, _ string) (string, error) {
+	if f.onRun != nil {
+		f.onRun()
+	}
 	f.envs = envs
 	return f.output, f.err
 }
@@ -49,13 +53,17 @@ func TestQueueStateUsesProjectWorkspaceAndAcceptsNewBackend(t *testing.T) {
 
 type queueMutationRecorder struct {
 	queue.Store
-	states   []string
-	released bool
-	err      error
+	states    []string
+	released  bool
+	err       error
+	onAcquire func()
 }
 
 func (s *queueMutationRecorder) AcquireMutation(_ context.Context, states []string, _ runs.ID, _ runs.ID, _ int64, _ string) (runs.ID, error) {
 	s.states = states
+	if s.onAcquire != nil {
+		s.onAcquire()
+	}
 	return "mutation", s.err
 }
 func (s *queueMutationRecorder) ReleaseMutation(context.Context, runs.ID) error {
@@ -136,4 +144,53 @@ func TestQueuePlanReceivesCurrentPullRequirements(t *testing.T) {
 	driver.Status = queuePlanStatus{err: errors.New("status unavailable")}
 	_, err = driver.planContexts(&command.Context{})
 	Assert(t, err != nil && !builder.called, "status failures must block planning")
+}
+
+func TestQueueMutationGuardRechecksStateAfterAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name, before, after string
+		readErr             error
+		rejected            bool
+	}{
+		{name: "empty state acquires lineage before admission", after: `{"lineage":"created-by-queue","serial":1}`, rejected: true},
+		{name: "existing state changes before admission", before: `{"lineage":"existing","serial":1}`, after: `{"lineage":"existing","serial":2}`, rejected: true},
+		{name: "state reread fails", readErr: errors.New("backend unavailable"), rejected: true},
+		{name: "unchanged empty state"},
+		{name: "unchanged existing state", before: `{"lineage":"existing","serial":1}`, after: `{"lineage":"existing","serial":1}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			Ok(t, os.Mkdir(filepath.Join(root, ".terraform"), 0700))
+			Ok(t, os.WriteFile(filepath.Join(root, ".terraform", "terraform.tfstate"), []byte(`{"backend":{"type":"s3","config":{"bucket":"states","key":"alias.tfstate"}}}`), 0600))
+			tf := &queueStateTerraform{output: tc.before}
+			store := &queueMutationRecorder{}
+			reads := 0
+			tf.onRun = func() {
+				reads++
+				if reads > 1 {
+					Assert(t, store.states != nil && !store.released, "reread must hold mutation reservation")
+				}
+			}
+			// Model a queue first apply completing after the guard's initial state
+			// read but before this alias's admission transaction starts.
+			store.onAcquire = func() { tf.output = tc.after; tf.err = tc.readErr }
+			driver := &QueueDriver{Terraform: tf, Store: store, Log: logging.NewNoopLogger(t)}
+			release, err := driver.MutationGuard(command.ProjectContext{Workspace: "default"}, root)
+			Equals(t, 2, reads)
+			if tc.rejected {
+				Assert(t, err != nil && release == nil, "changed or unreadable state must reject mutation")
+				Assert(t, store.released, "rejected admission must release ordinary token")
+				if tc.readErr != nil {
+					Assert(t, errors.Is(err, tc.readErr), "preserve read failure")
+				} else {
+					Assert(t, errors.Is(err, queue.ErrReplan), "state change requires fresh admission")
+				}
+			} else {
+				Ok(t, err)
+				Assert(t, !store.released, "successful admission keeps token until mutation ends")
+				release()
+				Assert(t, store.released, "completion releases token")
+			}
+		})
+	}
 }

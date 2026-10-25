@@ -4,6 +4,7 @@
 package queue_test
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/runatlantis/atlantis/server/core/queue"
@@ -80,4 +81,30 @@ func TestSemanticPlanRejectsIncompleteExecution(t *testing.T) {
 	}
 	_, _, _, err := queue.SemanticPlan([]byte(`{"format_version":"1.2","complete":true,"errored":false,"applyable":false}`))
 	require.NoError(t, err, "a successful no-op is valid")
+}
+
+func TestCanonicalS3EndpointAliases(t *testing.T) {
+	identity := func(endpoint string) string {
+		t.Helper()
+		encoded, err := json.Marshal(map[string]any{"backend": map[string]any{"type": "s3", "config": map[string]string{"bucket": "states", "key": "terraform.tfstate", "endpoint": endpoint}}})
+		require.NoError(t, err)
+		id, err := queue.BackendStateID(encoded, "default")
+		require.NoError(t, err)
+		return id
+	}
+	for _, aliases := range [][]string{
+		{"http://storage.example", "http://STORAGE.EXAMPLE:80/", "http://storage.example./"},
+		{"https://storage.example", "https://STORAGE.EXAMPLE:443/", "https://storage.example./"},
+		{"http://[::1]", "http://[0:0:0:0:0:0:0:1]:80/"},
+		{"http://storage.example:9000/prefix", "http://STORAGE.EXAMPLE:9000/prefix/"},
+	} {
+		for _, alias := range aliases[1:] {
+			require.Equal(t, identity(aliases[0]), identity(alias))
+		}
+	}
+	require.NotEqual(t, identity("http://storage.example:9000"), identity("http://storage.example:9001"))
+	require.NotEqual(t, identity("http://storage.example/one"), identity("http://storage.example/two"))
+	require.Equal(t, "backend", queue.StateIdentity("backend", queue.StateVersion{}))
+	require.Equal(t, queue.StateIdentity("one", queue.StateVersion{Lineage: "same", Serial: 1}), queue.StateIdentity("two", queue.StateVersion{Lineage: "same", Serial: 2}))
+	require.NotEqual(t, queue.StateIdentity("one", queue.StateVersion{Lineage: "same"}), queue.StateIdentity("one", queue.StateVersion{Lineage: "different"}))
 }

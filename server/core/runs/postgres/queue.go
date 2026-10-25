@@ -417,6 +417,12 @@ func (s *QueueStore) Save(ctx context.Context, old, next queue.Entry, event stri
 		if err = checkQueueClaim(current, old); err != nil {
 			return err
 		}
+		if err = updateQueueFirstApplyFence(ctx, tx, current, next); err != nil {
+			return err
+		}
+		if err = reserveQueueResultStates(ctx, tx, current, next); err != nil {
+			return err
+		}
 		next.HeartbeatAt = current.HeartbeatAt
 		next.CommentID = current.CommentID
 		next.ReportedVersion = current.ReportedVersion
@@ -428,11 +434,111 @@ func (s *QueueStore) Save(ctx context.Context, old, next queue.Entry, event stri
 	})
 	return next, err
 }
+
+// Backend configuration cannot prove that two endpoints are aliases before a
+// state has a lineage. Persist a global fence before that first apply crosses
+// the Terraform/database boundary; a lost result checkpoint must not open it.
+const firstApplyFence = "queue:first-apply-unknown-lineage"
+
+func checkQueueFirstApplyFence(ctx context.Context, tx *sql.Tx, entryID runs.ID) error {
+	var owner string
+	err := tx.QueryRowContext(ctx, `SELECT entry_id::text FROM apply_queue_reservations WHERE state_id=$1`, firstApplyFence).Scan(&owner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if owner != string(entryID) {
+		return fmt.Errorf("%w: first apply has an uncheckpointed state lineage", queue.ErrReserved)
+	}
+	return nil
+}
+
+func updateQueueFirstApplyFence(ctx context.Context, tx *sql.Tx, current, next queue.Entry) error {
+	if !next.ApplyStarted {
+		return nil
+	}
+	if !current.ApplyStarted {
+		if err := checkQueueFirstApplyFence(ctx, tx, current.ID); err != nil {
+			return err
+		}
+	}
+	needsFence := false
+	for _, plan := range next.Plans {
+		if plan.State.Lineage == "" && (!plan.Applied || plan.ResultState == nil || plan.ResultState.Lineage == "") {
+			needsFence = true
+		}
+	}
+	if !current.ApplyStarted && needsFence {
+		// Transactions share the scheduler advisory lock, so a mutation cannot
+		// slip between this check and the durable apply intent.
+		var busy bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM apply_queue_reservations WHERE entry_id IS NULL) OR EXISTS (SELECT 1 FROM apply_queue_entries WHERE state='APPLYING' AND id<>$1)`, current.ID).Scan(&busy); err != nil {
+			return err
+		}
+		if busy {
+			return fmt.Errorf("%w: first apply must wait for active mutations", queue.ErrReserved)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO apply_queue_reservations(state_id,entry_id,claim,generation) VALUES($1,$2,$3,$4)`, firstApplyFence, current.ID, string(current.Claim), current.Generation); err != nil {
+			return err
+		}
+	}
+	if !needsFence {
+		_, err := tx.ExecContext(ctx, `DELETE FROM apply_queue_reservations WHERE state_id=$1 AND entry_id=$2`, firstApplyFence, current.ID)
+		return err
+	}
+	return nil
+}
+
+// A first apply can create a lineage that was absent from the prepared state.
+// Claim it in the same transaction as its result checkpoint so backend aliases
+// cannot mutate the now-initialized state while this entry waits for merge.
+func reserveQueueResultStates(ctx context.Context, tx *sql.Tx, current, next queue.Entry) error {
+	if !current.ApplyStarted {
+		return nil
+	}
+	states := []string{}
+	for _, plan := range next.Plans {
+		if !plan.Applied || plan.ResultState == nil || plan.ResultState.Lineage == "" {
+			continue
+		}
+		previous := slices.IndexFunc(current.Plans, func(p queue.Plan) bool { return p.Project.Key() == plan.Project.Key() })
+		if previous >= 0 && current.Plans[previous].Applied {
+			continue
+		}
+		states = append(states, queue.StateIdentity(plan.Project.BackendID, *plan.ResultState))
+	}
+	slices.Sort(states)
+	states = slices.Compact(states)
+	for _, state := range states {
+		result, err := tx.ExecContext(ctx, `INSERT INTO apply_queue_reservations(state_id,entry_id,claim,generation) VALUES($1,$2,$3,$4) ON CONFLICT(state_id) DO UPDATE SET claim=excluded.claim,generation=excluded.generation WHERE apply_queue_reservations.entry_id=excluded.entry_id`, state, current.ID, string(current.Claim), current.Generation)
+		if err != nil {
+			return err
+		}
+		updated, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if updated != 1 {
+			return fmt.Errorf("%w: applied state lineage %s", queue.ErrReserved, state)
+		}
+	}
+	if len(states) == 0 {
+		return nil
+	}
+	return queueAuditMetadata(ctx, tx, next, "result_states_reserved", current.Worker, map[string]any{"states": states})
+}
+
 func (s *QueueStore) Reserve(ctx context.Context, e queue.Entry, states []string) error {
 	states = slices.Clone(states)
 	slices.Sort(states)
 	states = slices.Compact(states)
-	return s.transaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
+	if len(states) == 0 || states[0] == "" {
+		return errors.New("complete canonical state set is required")
+	}
+	var contention error
+	err := s.transaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		current, err := scanQueue(tx.QueryRowContext(ctx, queueSelect+`WHERE id=$1 FOR UPDATE`, e.ID))
 		if err != nil {
 			return err
@@ -440,24 +546,62 @@ func (s *QueueStore) Reserve(ctx context.Context, e queue.Entry, states []string
 		if err = checkQueueClaim(current, e); err != nil {
 			return err
 		}
+		if current.ApplyStarted || (current.State != queue.Preparing && current.State != queue.Ready) {
+			return queue.ErrConflict
+		}
+		// Both callers supply the complete prepared/approved state set. Inspect
+		// it before inserting anything so contention never acquires a partial set.
 		for _, state := range states {
-			if state == "" {
-				return errors.New("empty canonical state identity")
-			}
 			var owner string
 			err = tx.QueryRowContext(ctx, `SELECT COALESCE(entry_id::text,claim) FROM apply_queue_reservations WHERE state_id=$1 FOR UPDATE`, state).Scan(&owner)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
 			if owner != "" && owner != string(e.ID) {
-				return fmt.Errorf("%w: %s", queue.ErrReserved, owner)
+				contention = fmt.Errorf("%w: %s", queue.ErrReserved, owner)
+				break
 			}
-			if _, err = tx.ExecContext(ctx, `INSERT INTO apply_queue_reservations(state_id,entry_id,claim,generation) VALUES($1,$2,$3,$4) ON CONFLICT(state_id) DO UPDATE SET claim=excluded.claim,generation=excluded.generation`, state, e.ID, string(e.Claim), e.Generation); err != nil {
+		}
+		// The current claim fences every older generation and apply has not
+		// started. Replace its old set atomically, including after a changed
+		// manifest. On contention, commit the release without acquiring anything:
+		// retaining old reservations lets two changed manifests deadlock forever.
+		rows, err := tx.QueryContext(ctx, `DELETE FROM apply_queue_reservations WHERE entry_id=$1 RETURNING state_id`, current.ID)
+		if err != nil {
+			return err
+		}
+		released := []string{}
+		for rows.Next() {
+			var state string
+			if err = rows.Scan(&state); err != nil {
+				rows.Close()
+				return err
+			}
+			released = append(released, state)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
+		}
+		slices.Sort(released)
+		if contention != nil {
+			if len(released) == 0 {
+				return nil
+			}
+			return queueAuditMetadata(ctx, tx, current, "states_released", current.Worker, map[string]any{"released_states": released, "requested_states": states})
+		}
+		for _, state := range states {
+			if _, err = tx.ExecContext(ctx, `INSERT INTO apply_queue_reservations(state_id,entry_id,claim,generation) VALUES($1,$2,$3,$4)`, state, current.ID, string(current.Claim), current.Generation); err != nil {
 				return err
 			}
 		}
-		return queueAuditMetadata(ctx, tx, e, "states_reserved", e.Worker, map[string]any{"states": states})
+		return queueAuditMetadata(ctx, tx, current, "states_reserved", current.Worker, map[string]any{"states": states, "released_states": released})
 	})
+	if err != nil {
+		return err
+	}
+	return contention
 }
 func (s *QueueStore) RecoverStale(ctx context.Context, ttl time.Duration) ([]queue.Entry, error) {
 	var recovered []queue.Entry
@@ -606,6 +750,9 @@ func (s *QueueStore) AcquireMutation(ctx context.Context, states []string, entry
 		return "", err
 	}
 	err = s.transaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		if err := checkQueueFirstApplyFence(ctx, tx, entryID); err != nil {
+			return err
+		}
 		if entryID != "" {
 			current, err := scanQueue(tx.QueryRowContext(ctx, queueSelect+`WHERE id=$1 FOR UPDATE`, entryID))
 			if err != nil {

@@ -90,7 +90,16 @@ Before planning, Atlantis creates the integration checkout and records its head,
 base, tree, resolved workflow identities, and project manifest. It reserves both
 resolved backend locations and Terraform state lineages, independent of project
 names and directories. New backends are reserved by location until their first
-apply creates a state lineage. State reads and restored applies use the project's
+apply creates a state lineage. Before applying an initially empty state, Atlantis
+also takes a temporary global mutation fence: other queued and ordinary applies
+are blocked while Terraform runs and the resulting lineages are checkpointed. Existing
+mutations must finish before this fence can be acquired. Preparation and planning
+can continue. A failed apply, lost checkpoint, or worker crash retains the fence
+through recovery; an operator must reconcile the state and release the entry.
+Successful checkpoints remove the global fence once all initially empty states
+have lineages, while retaining their individual reservations through merge. A
+successful apply that still has no lineage retains the fence until completion.
+State reads and restored applies use the project's
 recorded workspace. Multi-state acquisition is atomic, so opposite project
 orders cannot deadlock or acquire partial sets.
 

@@ -164,6 +164,9 @@ type Store interface {
 	CheckClaim(context.Context, Entry) error
 	RecoverStale(context.Context, time.Duration) ([]Entry, error)
 	Save(context.Context, Entry, Entry, string) (Entry, error)
+	// Reserve replaces the complete state set before apply. Contention releases
+	// the previous pre-apply set without acquiring a partial replacement.
+	// Reservations cannot be replaced after apply intent has been recorded.
 	Reserve(context.Context, Entry, []string) error
 	Action(context.Context, runs.ID, int64, string, string, string, string) (Entry, error)
 	SetComment(context.Context, runs.ID, int64) error

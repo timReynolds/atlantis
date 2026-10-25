@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"path"
 	"sort"
@@ -143,6 +144,24 @@ func BackendStateID(data []byte, workspace string) (string, error) {
 			if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 				return "", errors.New("cannot canonicalize S3 endpoint")
 			}
+			u.Scheme = strings.ToLower(u.Scheme)
+			if u.Scheme != "http" && u.Scheme != "https" {
+				return "", errors.New("cannot canonicalize S3 endpoint scheme")
+			}
+			host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+			if address := net.ParseIP(host); address != nil {
+				host = address.String()
+			}
+			port := u.Port()
+			if (u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443") {
+				port = ""
+			}
+			u.Host = host
+			if port != "" {
+				u.Host = net.JoinHostPort(host, port)
+			} else if strings.Contains(host, ":") {
+				u.Host = "[" + host + "]"
+			}
 			endpoint = strings.TrimSuffix(u.String(), "/")
 		}
 		key := str("key")
@@ -178,6 +197,15 @@ func BackendStateID(data []byte, workspace string) (string, error) {
 	default:
 		return "", fmt.Errorf("backend %q has no safe canonical state identity for the apply queue", metadata.Backend.Type)
 	}
+}
+
+// StateIdentity fences initialized state lineages across backend aliases. Before
+// the first state snapshot exists, only its canonical backend location is known.
+func StateIdentity(backend string, state StateVersion) string {
+	if state.Lineage == "" {
+		return backend
+	}
+	return "lineage:" + digest(state.Lineage)
 }
 
 func ParseStateVersion(data []byte) (StateVersion, error) {

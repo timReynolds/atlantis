@@ -69,7 +69,7 @@ func TestQueueConcurrentAdmissionAndReservations(t *testing.T) {
 	Ok(t, store.Reserve(ctx, first, []string{"state-b", "state-a"}))
 	Assert(t, errors.Is(store.Reserve(ctx, other, []string{"state-c", "state-a"}), queue.ErrReserved), "expected error matching %v", queue.ErrReserved)
 	// The losing all-or-nothing acquisition must not hold state-c.
-	Ok(t, store.Reserve(ctx, first, []string{"state-c"}))
+	Ok(t, store.Reserve(ctx, first, []string{"state-a", "state-b", "state-c"}))
 	_, err = store.AcquireMutation(ctx, []string{"state-a"}, "", "", 0, "normal-apply")
 	Assert(t, errors.Is(err, queue.ErrReserved), "expected error matching %v", queue.ErrReserved)
 	token, err := store.AcquireMutation(ctx, []string{"external"}, "", "", 0, "normal-apply")
@@ -93,6 +93,7 @@ type queueTestDriver struct {
 	projects            []queue.Project
 	applies, merges     int
 	applyErr, mergeErr  error
+	stateLineage        string
 	failAt, changeAfter int
 	changed             bool
 	equivalent          bool
@@ -104,7 +105,7 @@ func (d *queueTestDriver) Prepare(context.Context, queue.Entry) (queue.PreparedP
 func (d *queueTestDriver) Plan(context.Context, queue.Entry) ([]queue.Plan, error) {
 	var plans []queue.Plan
 	for _, p := range d.projects {
-		plans = append(plans, queue.Plan{Project: p, SemanticDigest: "approved-plan"})
+		plans = append(plans, queue.Plan{Project: p, State: queue.StateVersion{Lineage: d.stateLineage}, SemanticDigest: "approved-plan"})
 	}
 	return plans, nil
 }
@@ -129,10 +130,13 @@ func (d *queueTestDriver) Merge(context.Context, queue.Entry) (queue.MergeResult
 	return queue.MergeResult{SHA: "merged", Equivalent: d.equivalent}, d.mergeErr
 }
 func (d *queueTestDriver) Report(context.Context, queue.Entry) {}
-func queuedEngine(t *testing.T, ctx context.Context, store *postgres.QueueStore) (*queue.Engine, *queueTestDriver, queue.Entry) {
+func queuedEngine(t *testing.T, ctx context.Context, store *postgres.QueueStore, lineage ...string) (*queue.Engine, *queueTestDriver, queue.Entry) {
 	e, err := store.Enqueue(ctx, queueRequest(1, "main"))
 	Ok(t, err)
 	driver := &queueTestDriver{store: store, equivalent: true, projects: []queue.Project{{Name: "a", Directory: "a", Workspace: "default", StateID: "state-a"}, {Name: "b", Directory: "b", Workspace: "default", StateID: "state-b", DependsOn: []string{"a"}}}}
+	if len(lineage) > 0 {
+		driver.stateLineage = lineage[0]
+	}
 	engine := &queue.Engine{Store: store, Driver: driver, Worker: "worker", Lease: time.Minute, MaxTransientAttempts: 2}
 	Ok(t, engine.Tick(ctx))
 	e, err = store.Get(ctx, e.ID)
@@ -594,4 +598,379 @@ func TestQueueAuditRetainsIntegrationAndReservationsAfterInvalidation(t *testing
 	}
 	Assert(t, foundPlan, "expected true")
 	Assert(t, foundReservation, "expected true")
+}
+
+func queueReservationStates(t *testing.T, ctx context.Context, db *postgres.Store, id runs.ID) []string {
+	t.Helper()
+	rows, err := db.Database().QueryContext(ctx, `SELECT state_id FROM apply_queue_reservations WHERE entry_id=$1 ORDER BY state_id`, id)
+	Ok(t, err)
+	defer rows.Close()
+	states := []string{}
+	for rows.Next() {
+		var state string
+		Ok(t, rows.Scan(&state))
+		states = append(states, state)
+	}
+	Ok(t, rows.Err())
+	return states
+}
+
+func TestQueueChangedManifestReplacesReservations(t *testing.T) {
+	ctx, db, store := queueFixture(t)
+	driver := &queueTestDriver{store: store, projects: []queue.Project{{Name: "a", Directory: "a", Workspace: "default", StateID: "old-state"}}}
+	engine := &queue.Engine{Store: store, Driver: driver, Worker: "worker", Lease: time.Minute}
+	first, err := store.Enqueue(ctx, queueRequest(1, "main"))
+	Ok(t, err)
+	Ok(t, engine.Tick(ctx))
+	first, err = store.Get(ctx, first.ID)
+	Ok(t, err)
+	Equals(t, queue.AwaitingApproval, first.State)
+	changed := queueRequest(1, "main")
+	changed.HeadSHA, changed.DeliveryID = "new-head", "new-head"
+	_, err = store.Enqueue(ctx, changed)
+	Ok(t, err)
+	driver.projects[0].StateID = "new-state"
+	Ok(t, engine.Tick(ctx))
+	Equals(t, []string{"new-state"}, queueReservationStates(t, ctx, db, first.ID))
+
+	_, err = store.Enqueue(ctx, queueRequest(2, "main"))
+	Ok(t, err)
+	driver.projects[0].StateID = "old-state"
+	Ok(t, engine.Tick(ctx))
+	second, err := store.Find(ctx, first.Repository, 2)
+	Ok(t, err)
+	Equals(t, queue.AwaitingApproval, second.State)
+}
+
+func TestQueueReservationReplacementOnContention(t *testing.T) {
+	ctx, db, store := queueFixture(t)
+	_, err := store.Enqueue(ctx, queueRequest(1, "main"))
+	Ok(t, err)
+	first, err := store.ClaimNext(ctx, "first", time.Minute)
+	Ok(t, err)
+	Ok(t, store.Reserve(ctx, first, []string{"old", "shared"}))
+	_, err = store.Enqueue(ctx, queueRequest(2, "other"))
+	Ok(t, err)
+	other, err := store.ClaimNext(ctx, "other", time.Minute)
+	Ok(t, err)
+	Ok(t, store.Reserve(ctx, other, []string{"blocked"}))
+
+	Assert(t, errors.Is(store.Reserve(ctx, first, []string{"new", "shared", "blocked"}), queue.ErrReserved), "conflicting complete set must not be acquired")
+	Equals(t, []string{}, queueReservationStates(t, ctx, db, first.ID))
+	Equals(t, []string{"blocked"}, queueReservationStates(t, ctx, db, other.ID))
+	// Neither an obsolete reservation nor a partial new set survives contention.
+	token, err := store.AcquireMutation(ctx, []string{"old", "new", "shared"}, "", "", 0, "ordinary")
+	Ok(t, err)
+	Ok(t, store.ReleaseMutation(ctx, token))
+	_, err = store.Action(ctx, other.ID, other.Generation, "dequeue", "user", "", "")
+	Ok(t, err)
+	Ok(t, store.Reserve(ctx, first, []string{"new", "shared", "blocked"}))
+	Equals(t, []string{"blocked", "new", "shared"}, queueReservationStates(t, ctx, db, first.ID))
+}
+
+func TestQueueReciprocalManifestChangesDoNotDeadlock(t *testing.T) {
+	ctx, db, store := queueFixture(t)
+	driver := &queueTestDriver{store: store, projects: []queue.Project{{Name: "project", Directory: ".", Workspace: "default", StateID: "a"}}}
+	engine := &queue.Engine{Store: store, Driver: driver, Worker: "worker", Lease: time.Minute}
+	first, err := store.Enqueue(ctx, queueRequest(1, "main"))
+	Ok(t, err)
+	Ok(t, engine.Tick(ctx))
+	second, err := store.Enqueue(ctx, queueRequest(2, "main"))
+	Ok(t, err)
+	driver.projects[0].StateID = "b"
+	Ok(t, engine.Tick(ctx))
+	for _, pull := range []int{1, 2} {
+		request := queueRequest(pull, "main")
+		request.HeadSHA, request.DeliveryID = "changed", fmt.Sprintf("changed-%d", pull)
+		_, err = store.Enqueue(ctx, request)
+		Ok(t, err)
+	}
+	// PR 1 wants B, but PR 2 still reserves it. Giving up A must commit even
+	// though acquiring B fails, or neither PR can ever obtain its new manifest.
+	Ok(t, engine.Tick(ctx))
+	Equals(t, []string{}, queueReservationStates(t, ctx, db, first.ID))
+	driver.projects[0].StateID = "a"
+	Ok(t, engine.Tick(ctx))
+	Equals(t, []string{"a"}, queueReservationStates(t, ctx, db, second.ID))
+	_, err = db.Database().ExecContext(ctx, `UPDATE apply_queue_entries SET retry_at=now() WHERE id=$1`, first.ID)
+	Ok(t, err)
+	driver.projects[0].StateID = "b"
+	Ok(t, engine.Tick(ctx))
+	Equals(t, []string{"b"}, queueReservationStates(t, ctx, db, first.ID))
+	for _, id := range []runs.ID{first.ID, second.ID} {
+		entry, err := store.Get(ctx, id)
+		Ok(t, err)
+		Equals(t, queue.AwaitingApproval, entry.State)
+	}
+}
+
+func TestQueueReservationReplacementRejectsStaleAndCancelledWorkers(t *testing.T) {
+	ctx, db, store := queueFixture(t)
+	_, err := store.Enqueue(ctx, queueRequest(1, "main"))
+	Ok(t, err)
+	old, err := store.ClaimNext(ctx, "worker", time.Minute)
+	Ok(t, err)
+	Ok(t, store.Reserve(ctx, old, []string{"old"}))
+	changed := queueRequest(1, "main")
+	changed.HeadSHA, changed.DeliveryID = "changed", "changed"
+	_, err = store.Enqueue(ctx, changed)
+	Ok(t, err)
+	current, err := store.ClaimNext(ctx, "replacement", time.Minute)
+	Ok(t, err)
+	Ok(t, store.Reserve(ctx, current, []string{"current"}))
+	Assert(t, errors.Is(store.Reserve(ctx, old, []string{"stale"}), queue.ErrConflict), "old generation must not release the replacement's states")
+	Equals(t, []string{"current"}, queueReservationStates(t, ctx, db, current.ID))
+	_, err = store.Action(ctx, current.ID, current.Generation, "dequeue", "user", "", "")
+	Ok(t, err)
+	Assert(t, errors.Is(store.Reserve(ctx, current, []string{"cancelled"}), queue.ErrConflict), "cancelled worker must not reacquire reservations")
+	Equals(t, []string{}, queueReservationStates(t, ctx, db, current.ID))
+}
+
+func TestQueueReservationReplacementPreservesApplyFences(t *testing.T) {
+	for _, state := range []queue.State{queue.Applying, queue.Merging, queue.ApplyOutcomeUnknown, queue.PartiallyApplied, queue.AppliedUnmerged, queue.RecoveryRequired} {
+		t.Run(string(state), func(t *testing.T) {
+			ctx, db, store := queueFixture(t)
+			_, _, entry := queuedEngine(t, ctx, store)
+			current, err := store.ClaimNext(ctx, "worker", time.Minute)
+			Ok(t, err)
+			Equals(t, entry.ID, current.ID)
+			Ok(t, store.Reserve(ctx, current, []string{"state-a", "state-b"}))
+			next := current
+			next.State, next.ApplyStarted = queue.Applying, true
+			current, err = store.Save(ctx, current, next, "apply_intent")
+			Ok(t, err)
+			if state == queue.Merging || state == queue.AppliedUnmerged {
+				next = current
+				next.State = queue.Merging
+				current, err = store.Save(ctx, current, next, "merge_intent")
+				Ok(t, err)
+			}
+			if state != current.State {
+				next = current
+				next.State = state
+				current, err = store.Save(ctx, current, next, "stopped")
+				Ok(t, err)
+			}
+			// Trust the stored apply intent, even if a caller sends older data.
+			current.ApplyStarted = false
+			Assert(t, errors.Is(store.Reserve(ctx, current, []string{"replacement"}), queue.ErrConflict), "reservations after apply intent require explicit reconciliation")
+			Equals(t, []string{"queue:first-apply-unknown-lineage", "state-a", "state-b"}, queueReservationStates(t, ctx, db, current.ID))
+		})
+	}
+}
+
+func TestQueueReservationReplacementRollsBackOnPersistenceFailure(t *testing.T) {
+	ctx, db, store := queueFixture(t)
+	_, err := store.Enqueue(ctx, queueRequest(1, "main"))
+	Ok(t, err)
+	entry, err := store.ClaimNext(ctx, "worker", time.Minute)
+	Ok(t, err)
+	Ok(t, store.Reserve(ctx, entry, []string{"original"}))
+	for _, states := range [][]string{nil, {""}, {"valid", ""}} {
+		Assert(t, store.Reserve(ctx, entry, states) != nil, "an invalid complete set must not release reservations")
+		Equals(t, []string{"original"}, queueReservationStates(t, ctx, db, entry.ID))
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	Assert(t, store.Reserve(cancelled, entry, []string{"replacement"}) != nil, "cancelled replacement must not commit")
+	Equals(t, []string{"original"}, queueReservationStates(t, ctx, db, entry.ID))
+
+	// Fail the final audit write, after the old set was deleted and the new
+	// one inserted. The whole replacement must roll back together.
+	_, err = db.Database().ExecContext(ctx, `ALTER TABLE audit_events ADD CONSTRAINT reject_reservation_audit CHECK (event_type <> 'queue.states_reserved') NOT VALID`)
+	Ok(t, err)
+	Assert(t, store.Reserve(ctx, entry, []string{"replacement"}) != nil, "audit failure must reject the replacement")
+	Equals(t, []string{"original"}, queueReservationStates(t, ctx, db, entry.ID))
+	token, err := store.AcquireMutation(ctx, []string{"replacement"}, "", "", 0, "ordinary")
+	Ok(t, err)
+	Ok(t, store.ReleaseMutation(ctx, token))
+}
+
+func TestQueueReservationReplacementSurvivesLostPreparationCheckpoint(t *testing.T) {
+	ctx, db, store := queueFixture(t)
+	_, err := store.Enqueue(ctx, queueRequest(1, "main"))
+	Ok(t, err)
+	old, err := store.ClaimNext(ctx, "worker", time.Minute)
+	Ok(t, err)
+	Ok(t, store.Reserve(ctx, old, []string{"original"}))
+	Ok(t, store.Reserve(ctx, old, []string{"replacement"}))
+	// The process disappears after reservation commit but before Save(planning).
+	_, err = db.Database().ExecContext(ctx, `UPDATE apply_queue_entries SET heartbeat_at=now()-interval '10 minutes' WHERE id=$1`, old.ID)
+	Ok(t, err)
+	_, err = store.RecoverStale(ctx, time.Minute)
+	Ok(t, err)
+	Equals(t, []string{"replacement"}, queueReservationStates(t, ctx, db, old.ID))
+	Assert(t, errors.Is(store.Reserve(ctx, old, []string{"stale"}), queue.ErrConflict), "lost worker cannot change reservations")
+	current, err := store.ClaimNext(ctx, "replacement", time.Minute)
+	Ok(t, err)
+	Ok(t, store.Reserve(ctx, current, []string{"current"}))
+	Equals(t, []string{"current"}, queueReservationStates(t, ctx, db, old.ID))
+}
+
+func TestQueueAppliedResultsReserveNewLineagesThroughMergeRecovery(t *testing.T) {
+	ctx, db, store := queueFixture(t)
+	engine, driver, entry := queuedEngine(t, ctx, store)
+	driver.mergeErr = errors.New("merge not confirmed")
+	Ok(t, engine.Tick(ctx))
+	entry, err := store.Get(ctx, entry.ID)
+	Ok(t, err)
+	Equals(t, queue.AppliedUnmerged, entry.State)
+	identity := queue.StateIdentity("different-backend-endpoint", *entry.Plans[0].ResultState)
+	Equals(t, []string{identity, "state-a", "state-b"}, queueReservationStates(t, ctx, db, entry.ID))
+	_, err = store.AcquireMutation(ctx, []string{"different-backend-endpoint", identity}, "", "", 0, "ordinary")
+	Assert(t, errors.Is(err, queue.ErrReserved), "new lineage must remain reserved through merge recovery")
+	_, err = store.Action(ctx, entry.ID, entry.Generation, "release", "operator", "", "state and prior execution reconciled")
+	Ok(t, err)
+	token, err := store.AcquireMutation(ctx, []string{"different-backend-endpoint", identity}, "", "", 0, "ordinary")
+	Ok(t, err)
+	Ok(t, store.ReleaseMutation(ctx, token))
+}
+
+func TestQueueAppliedLineageConflictPreservesBothOwnersAndStopsMerge(t *testing.T) {
+	ctx, db, store := queueFixture(t)
+	engine, driver, entry := queuedEngine(t, ctx, store, "existing-lineage")
+	identity := queue.StateIdentity("alias", queue.StateVersion{Lineage: "lineage"})
+	token, err := store.AcquireMutation(ctx, []string{identity}, "", "", 0, "ordinary")
+	Ok(t, err)
+	Assert(t, errors.Is(engine.Tick(ctx), queue.ErrReserved), "a conflicting result lineage cannot be checkpointed as safely applied")
+	Equals(t, 1, driver.applies)
+	Equals(t, 0, driver.merges)
+	entry, err = store.Get(ctx, entry.ID)
+	Ok(t, err)
+	Equals(t, queue.Applying, entry.State)
+	Assert(t, entry.Plans[0].ApplyIntent && !entry.Plans[0].Applied, "uncertain result must keep its intent checkpoint")
+	Equals(t, []string{"state-a", "state-b"}, queueReservationStates(t, ctx, db, entry.ID))
+	mutations, err := store.ListMutations(ctx)
+	Ok(t, err)
+	Equals(t, 1, len(mutations))
+	Equals(t, token, mutations[0].Claim)
+	_, err = db.Database().ExecContext(ctx, `UPDATE apply_queue_entries SET heartbeat_at=now()-interval '10 minutes' WHERE id=$1`, entry.ID)
+	Ok(t, err)
+	_, err = store.RecoverStale(ctx, time.Minute)
+	Ok(t, err)
+	entry, err = store.Get(ctx, entry.ID)
+	Ok(t, err)
+	Equals(t, queue.ApplyOutcomeUnknown, entry.State)
+	Equals(t, []string{"state-a", "state-b"}, queueReservationStates(t, ctx, db, entry.ID))
+}
+
+func TestQueueAppliedLineageCheckpointIsAtomic(t *testing.T) {
+	ctx, db, store := queueFixture(t)
+	engine, driver, entry := queuedEngine(t, ctx, store)
+	// Fail audit persistence after inserting the newly observed lineage. The
+	// lineage and applied checkpoint must commit together or not at all.
+	_, err := db.Database().ExecContext(ctx, `ALTER TABLE audit_events ADD CONSTRAINT reject_result_reservation_audit CHECK (event_type <> 'queue.result_states_reserved') NOT VALID`)
+	Ok(t, err)
+	Assert(t, engine.Tick(ctx) != nil, "failed audit must prevent the applied checkpoint")
+	Equals(t, 1, driver.applies)
+	Equals(t, 0, driver.merges)
+	entry, err = store.Get(ctx, entry.ID)
+	Ok(t, err)
+	Equals(t, queue.Applying, entry.State)
+	Assert(t, entry.Plans[0].ApplyIntent && !entry.Plans[0].Applied, "lost checkpoint must retain apply intent")
+	Equals(t, []string{"queue:first-apply-unknown-lineage", "state-a", "state-b"}, queueReservationStates(t, ctx, db, entry.ID))
+	_, err = store.AcquireMutation(ctx, []string{"state-a"}, "", "", 0, "ordinary")
+	Assert(t, errors.Is(err, queue.ErrReserved), "original backend fence must survive checkpoint failure")
+}
+
+func TestQueueFirstApplyFenceAdmissionAndRelease(t *testing.T) {
+	ctx, _, store := queueFixture(t)
+	_, _, entry := queuedEngine(t, ctx, store)
+	entry, err := store.ClaimNext(ctx, "worker", time.Minute)
+	Ok(t, err)
+	Ok(t, store.Reserve(ctx, entry, []string{"state-a", "state-b"}))
+	next := entry
+	next.State, next.ApplyStarted = queue.Applying, true
+	token, err := store.AcquireMutation(ctx, []string{"unrelated-state"}, "", "", 0, "ordinary")
+	Ok(t, err)
+	_, err = store.Save(ctx, entry, next, "apply_intent")
+	Assert(t, errors.Is(err, queue.ErrReserved), "first apply must wait for existing ordinary mutations")
+	Ok(t, store.ReleaseMutation(ctx, token))
+	entry, err = store.Save(ctx, entry, next, "apply_intent")
+	Ok(t, err)
+	_, err = store.AcquireMutation(ctx, []string{"unrelated-state"}, "", "", 0, "ordinary")
+	Assert(t, errors.Is(err, queue.ErrReserved), "first apply intent must fence all ordinary mutations")
+	_, err = store.AcquireMutation(ctx, []string{"state-a"}, entry.ID, entry.Claim, entry.Generation, "queue")
+	Ok(t, err)
+	other, err := store.Enqueue(ctx, queueRequest(2, "other-branch"))
+	Ok(t, err)
+	other, err = store.ClaimNext(ctx, "other-worker", time.Minute)
+	Ok(t, err)
+	Ok(t, store.Reserve(ctx, other, []string{"other-state"}))
+	prepared := other
+	prepared.State = queue.Planning
+	other, err = store.Save(ctx, other, prepared, "planning")
+	Ok(t, err)
+	prepared = other
+	prepared.State = queue.Ready
+	other, err = store.Save(ctx, other, prepared, "plans_saved")
+	Ok(t, err)
+	otherNext := other
+	otherNext.State, otherNext.ApplyStarted = queue.Applying, true
+	otherNext.Plans = []queue.Plan{{Project: queue.Project{StateID: "other-state"}, State: queue.StateVersion{Lineage: "existing"}}}
+	_, err = store.Save(ctx, other, otherNext, "apply_intent")
+	Assert(t, errors.Is(err, queue.ErrReserved), "other queued applies must wait while preparation remains possible")
+	next = entry
+	next.Plans = append([]queue.Plan(nil), entry.Plans...)
+	for i := range next.Plans {
+		next.Plans[i].Applied = true
+		next.Plans[i].ResultState = &queue.StateVersion{Lineage: fmt.Sprintf("result-%d", i)}
+	}
+	entry, err = store.Save(ctx, entry, next, "project_applied")
+	Ok(t, err)
+	token, err = store.AcquireMutation(ctx, []string{"unrelated-state"}, "", "", 0, "ordinary")
+	Ok(t, err)
+	Ok(t, store.ReleaseMutation(ctx, token))
+	_, err = store.Save(ctx, other, otherNext, "apply_intent")
+	Ok(t, err)
+}
+
+func TestQueueFirstApplyWaitsForActiveQueueMutation(t *testing.T) {
+	ctx, _, store := queueFixture(t)
+	_, _, entry := queuedEngine(t, ctx, store, "existing")
+	entry, err := store.ClaimNext(ctx, "worker", time.Minute)
+	Ok(t, err)
+	next := entry
+	next.State, next.ApplyStarted = queue.Applying, true
+	_, err = store.Save(ctx, entry, next, "apply_intent")
+	Ok(t, err)
+	_, err = store.Enqueue(ctx, queueRequest(2, "other-branch"))
+	Ok(t, err)
+	other, err := store.ClaimNext(ctx, "other-worker", time.Minute)
+	Ok(t, err)
+	Ok(t, store.Reserve(ctx, other, []string{"other-state"}))
+	prepared := other
+	prepared.State = queue.Planning
+	other, err = store.Save(ctx, other, prepared, "planning")
+	Ok(t, err)
+	prepared = other
+	prepared.State = queue.Ready
+	other, err = store.Save(ctx, other, prepared, "plans_saved")
+	Ok(t, err)
+	next = other
+	next.State, next.ApplyStarted = queue.Applying, true
+	next.Plans = []queue.Plan{{Project: queue.Project{StateID: "other-state"}}}
+	_, err = store.Save(ctx, other, next, "apply_intent")
+	Assert(t, errors.Is(err, queue.ErrReserved), "first apply cannot overlap an already running queue mutation")
+}
+
+func TestQueuePartialApplyKeepsFirstApplyFenceAndResultLineage(t *testing.T) {
+	ctx, db, store := queueFixture(t)
+	engine, driver, entry := queuedEngine(t, ctx, store)
+	driver.failAt = 2
+	Ok(t, engine.Tick(ctx))
+	entry, err := store.Get(ctx, entry.ID)
+	Ok(t, err)
+	Equals(t, queue.PartiallyApplied, entry.State)
+	identity := queue.StateIdentity("alias", *entry.Plans[0].ResultState)
+	Equals(t, []string{identity, "queue:first-apply-unknown-lineage", "state-a", "state-b"}, queueReservationStates(t, ctx, db, entry.ID))
+	for _, states := range [][]string{{"alias", identity}, {"unrelated-state"}} {
+		_, err = store.AcquireMutation(ctx, states, "", "", 0, "ordinary")
+		Assert(t, errors.Is(err, queue.ErrReserved), "partial apply must retain lineage and global fences")
+	}
+	_, err = store.Action(ctx, entry.ID, entry.Generation, "release", "operator", "", "state and prior execution reconciled")
+	Ok(t, err)
+	token, err := store.AcquireMutation(ctx, []string{"alias", identity}, "", "", 0, "ordinary")
+	Ok(t, err)
+	Ok(t, store.ReleaseMutation(ctx, token))
 }

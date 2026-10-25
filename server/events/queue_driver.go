@@ -320,10 +320,7 @@ func queueStateID(p command.ProjectContext, path string) (string, error) {
 	return queue.BackendStateID(data, p.Workspace)
 }
 func queueStateIdentity(backend string, state queue.StateVersion) string {
-	if state.Lineage == "" {
-		return backend
-	}
-	return "lineage:" + queueHash(state.Lineage)
+	return queue.StateIdentity(backend, state)
 }
 func queueProject(p command.ProjectContext, state string) queue.Project {
 	return queue.Project{Name: p.ProjectName, Directory: p.RepoRelDir, Workspace: p.Workspace, Workflow: p.WorkflowIdentity, StateID: state, DependsOn: p.DependsOn}

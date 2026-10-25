@@ -209,11 +209,28 @@ func (d *QueueDriver) MutationGuard(p command.ProjectContext, path string) (func
 	if err != nil {
 		return nil, err
 	}
-	return func() {
+	release := func() {
 		if err := store.ReleaseMutation(context.Background(), token); err != nil {
 			d.Log.Err("releasing observed mutation reservation %q %v", token, err)
 		}
-	}, nil
+	}
+	if p.QueueEntryID == "" {
+		// A queue first apply may have created a lineage after our initial
+		// state read and released its global fence before admission. Recheck
+		// while holding this ordinary mutation's token, which prevents a new
+		// first apply from starting, so a stale backend alias cannot bypass
+		// the newly durable lineage reservation.
+		current, err := d.state(p, path)
+		if err != nil {
+			release()
+			return nil, err
+		}
+		if current != state {
+			release()
+			return nil, queue.ErrReplan
+		}
+	}
+	return release, nil
 }
 
 func (s *QueueService) refresh(ctx context.Context) error {

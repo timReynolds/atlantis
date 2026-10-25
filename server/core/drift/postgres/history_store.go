@@ -179,7 +179,7 @@ func (s *HistoryStore) ListCurrentStatus(ctx context.Context, filter drift.Curre
 	}
 	if filter.Repository != "" {
 		args = append(args, filter.Repository)
-		where = append(where, fmt.Sprintf("(ds.repository = $%d OR ds.repository LIKE '%%/' || $%d)", len(args), len(args)))
+		where = append(where, fmt.Sprintf("(ds.repository = $%d OR right(ds.repository, char_length($%d) + 1) = '/' || $%d)", len(args), len(args), len(args)))
 	}
 	if filter.Ref != "" {
 		appendFilter("ds.ref = $%d", filter.Ref)
@@ -278,7 +278,7 @@ func (s *HistoryStore) ListDetections(ctx context.Context, repository string, pa
 	query := detectionRunSelect
 	args := make([]any, 0, 3)
 	if repository != "" {
-		query += " WHERE repository = $1 OR display_repository = $1 OR repository LIKE '%/' || $1"
+		query += " WHERE repository = $1 OR display_repository = $1 OR right(repository, char_length($1) + 1) = '/' || $1"
 		args = append(args, repository)
 	}
 	args = append(args, limit+1, offset)
